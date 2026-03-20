@@ -95,8 +95,22 @@ export default function App() {
     setLocalError(null);
 
     try {
+      let payload: Record<string, unknown> = { type };
+      if (type === 'START') {
+        const prep = (await chrome.runtime.sendMessage({
+          type: 'PREPARE_START',
+        })) as { ok?: boolean; error?: string; snapshot?: RecordingSnapshot };
+        if (prep?.snapshot) {
+          setSnapshot(prep.snapshot);
+        }
+        if (!prep?.ok) {
+          setLocalError(prep?.error ?? 'Unable to prepare recording');
+          return;
+        }
+      }
+
       const result = (await chrome.runtime.sendMessage({
-        type,
+        ...payload,
       })) as { ok?: boolean; error?: string; snapshot?: RecordingSnapshot };
 
       if (result?.snapshot) {
@@ -139,7 +153,10 @@ export default function App() {
 
       {snapshot.validation && (
         <p style={{ margin: '0 0 8px' }}>
-          Validation: {snapshot.validation.passed ? 'passed' : 'failed'}
+          Validation: {snapshot.validation.passed ? 'passed' : 'failed'} (size:{' '}
+          {snapshot.validation.checks.size ? 'ok' : 'fail'}, header:{' '}
+          {snapshot.validation.checks.header ? 'ok' : 'fail'}, duration:{' '}
+          {snapshot.validation.checks.duration ? 'ok' : 'fail'})
         </p>
       )}
 

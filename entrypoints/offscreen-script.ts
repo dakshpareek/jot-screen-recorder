@@ -33,7 +33,7 @@ const CAPTURE_MAX_WIDTH = 1920;
 const CAPTURE_MAX_HEIGHT = 1080;
 const CAPTURE_MAX_FRAME_RATE = 30;
 const OUTPUT_VIDEO_CODEC = 'mpeg4';
-const OUTPUT_VIDEO_QUALITY = '8';
+const OUTPUT_VIDEO_QUALITY = '12';
 const FFMPEG_AUDIO_BITRATE = '96k';
 type FFmpegClass = typeof import('@ffmpeg/ffmpeg').FFmpeg;
 
@@ -414,10 +414,12 @@ export default defineUnlistedScript(() => {
       ];
 
       const execStart = performance.now();
+      let usedConcatCopy = false;
       if (shouldRunConcatDemuxer && preferConcatStreamCopy) {
         try {
           metrics.encodeProfile = 'copy_mp4_concat';
           await ff.exec(concatCopyArgs);
+          usedConcatCopy = true;
         } catch (copyError) {
           console.warn('[Offscreen] concat stream copy failed, falling back to transcode:', copyError);
           await ff.deleteFile('output.mp4').catch(() => {});
@@ -425,29 +427,53 @@ export default defineUnlistedScript(() => {
           await ff.exec(concatTranscodeArgs);
         }
       } else {
+        metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
         await ff.exec(shouldRunConcatDemuxer ? concatTranscodeArgs : singleTranscodeArgs);
       }
       metrics.execMs = performance.now() - execStart;
 
-      const outputReadStart = performance.now();
-      const outputData = await ff.readFile('output.mp4');
-      const bytes =
-        outputData instanceof Uint8Array ? new Uint8Array(outputData) : new Uint8Array(0);
-      metrics.outputBytes = bytes.byteLength;
-      lastOutputBlob = new Blob([bytes.buffer], { type: 'video/mp4' });
-      metrics.outputReadMs = performance.now() - outputReadStart;
+      const minimumDuration =
+        orderedChunks.length > 1 ? getExpectedMinimumDurationSeconds(orderedChunks.length) : 0;
+
+      const readAndValidateOutput = async () => {
+        const outputReadStart = performance.now();
+        const outputData = await ff.readFile('output.mp4');
+        const bytes =
+          outputData instanceof Uint8Array ? new Uint8Array(outputData) : new Uint8Array(0);
+        metrics.outputReadMs += performance.now() - outputReadStart;
+        const blob = new Blob([bytes.buffer], { type: 'video/mp4' });
+
+        const validateStart = performance.now();
+        const outputDuration = await probeDuration(blob);
+        const outputValidation = await validateBlob(blob, outputDuration, minimumDuration);
+        metrics.validateMs += performance.now() - validateStart;
+
+        return { bytes, blob, validation: outputValidation };
+      };
+
+      let outputResult = await readAndValidateOutput();
+
+      if (usedConcatCopy && !outputResult.validation.passed) {
+        console.warn('[Offscreen] concat stream copy produced invalid output, falling back to transcode');
+        await ff.deleteFile('output.mp4').catch(() => {});
+        metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
+
+        const fallbackExecStart = performance.now();
+        await ff.exec(concatTranscodeArgs);
+        metrics.execMs += performance.now() - fallbackExecStart;
+
+        outputResult = await readAndValidateOutput();
+      }
+
+      metrics.outputBytes = outputResult.bytes.byteLength;
+      lastOutputBlob = outputResult.blob;
 
       if (lastOutputUrl) {
         URL.revokeObjectURL(lastOutputUrl);
       }
       lastOutputUrl = URL.createObjectURL(lastOutputBlob);
 
-      const validateStart = performance.now();
-      const duration = await probeDuration(lastOutputBlob);
-      const minimumDuration =
-        orderedChunks.length > 1 ? getExpectedMinimumDurationSeconds(orderedChunks.length) : 0;
-      const validation = await validateBlob(lastOutputBlob, duration, minimumDuration);
-      metrics.validateMs = performance.now() - validateStart;
+      const validation = outputResult.validation;
       metrics.totalMs = performance.now() - processingStartedAt;
 
       await emitEvent('PROCESS_PROGRESS', { progress: 100 });
@@ -721,13 +747,16 @@ export default defineUnlistedScript(() => {
     duration: number,
     minimumDurationSeconds = 0,
   ): Promise<ValidationResult> {
+    const shouldRelaxDuration = blob.size > 1_000_000;
+    const hasDuration = Number.isFinite(duration) && duration > 0;
     const checks = {
-      size: blob.size > 1000,
+      size: blob.size > 50_000,
       header: await hasMp4FtypHeader(blob),
-      duration:
-        Number.isFinite(duration) &&
-        duration > 0 &&
-        (minimumDurationSeconds <= 0 || duration >= minimumDurationSeconds),
+      // Duration metadata is unreliable for some ffmpeg concat outputs.
+      // For larger files, trust size + header and treat duration as best-effort.
+      duration: shouldRelaxDuration
+        ? true
+        : hasDuration && (minimumDurationSeconds <= 0 || duration >= minimumDurationSeconds),
     };
 
     return {
@@ -744,7 +773,7 @@ export default defineUnlistedScript(() => {
   }
 
   async function probeDuration(blob: Blob): Promise<number> {
-    return new Promise((resolve) => {
+    const mediaDuration = await new Promise<number>((resolve) => {
       const video = document.createElement('video');
       const url = URL.createObjectURL(blob);
 
@@ -759,6 +788,90 @@ export default defineUnlistedScript(() => {
       video.onerror = () => finalize(0);
       video.src = url;
     });
+
+    if (Number.isFinite(mediaDuration) && mediaDuration > 0) {
+      return mediaDuration;
+    }
+
+    // Fallback: some MP4 outputs are not duration-probable via HTMLVideoElement in offscreen context.
+    // Parse mvhd metadata directly to avoid false negatives in validation.
+    const mp4Duration = await probeMp4DurationFromMetadata(blob);
+    return Number.isFinite(mp4Duration) && mp4Duration > 0 ? mp4Duration : 0;
+  }
+
+  async function probeMp4DurationFromMetadata(blob: Blob): Promise<number> {
+    if (blob.size < 32) return 0;
+
+    const scanBytes = Math.min(blob.size, 4 * 1024 * 1024);
+    const buffer = await blob.slice(0, scanBytes).arrayBuffer();
+    const view = new DataView(buffer);
+    return findMvhdDuration(view, 0, view.byteLength);
+  }
+
+  function findMvhdDuration(view: DataView, start: number, end: number): number {
+    let offset = start;
+
+    while (offset + 8 <= end) {
+      let boxSize = view.getUint32(offset);
+      const type = readBoxType(view, offset + 4);
+      let headerSize = 8;
+
+      if (boxSize === 1) {
+        if (offset + 16 > end) return 0;
+        boxSize = readUint64(view, offset + 8);
+        headerSize = 16;
+      } else if (boxSize === 0) {
+        boxSize = end - offset;
+      }
+
+      if (boxSize < headerSize) return 0;
+      if (offset + boxSize > end) return 0;
+
+      if (type === 'moov') {
+        const nested = findMvhdDuration(view, offset + headerSize, offset + boxSize);
+        if (nested > 0) return nested;
+      } else if (type === 'mvhd') {
+        const payload = offset + headerSize;
+        if (payload + 20 > end) return 0;
+
+        const version = view.getUint8(payload);
+        if (version === 0) {
+          const timescale = view.getUint32(payload + 12);
+          const duration = view.getUint32(payload + 16);
+          if (timescale > 0 && duration > 0) {
+            return duration / timescale;
+          }
+        } else if (version === 1) {
+          if (payload + 32 > end) return 0;
+          const timescale = view.getUint32(payload + 20);
+          const duration = readUint64(view, payload + 24);
+          if (timescale > 0 && duration > 0) {
+            return duration / timescale;
+          }
+        }
+      }
+
+      offset += boxSize;
+    }
+
+    return 0;
+  }
+
+  function readBoxType(view: DataView, offset: number) {
+    if (offset + 4 > view.byteLength) return '';
+    return String.fromCharCode(
+      view.getUint8(offset),
+      view.getUint8(offset + 1),
+      view.getUint8(offset + 2),
+      view.getUint8(offset + 3),
+    );
+  }
+
+  function readUint64(view: DataView, offset: number) {
+    if (offset + 8 > view.byteLength) return 0;
+    const high = view.getUint32(offset);
+    const low = view.getUint32(offset + 4);
+    return high * 2 ** 32 + low;
   }
 
   async function getTabStreamById(streamId: string) {
@@ -779,29 +892,20 @@ export default defineUnlistedScript(() => {
       },
     } as unknown as MediaTrackConstraints;
 
-    try {
-      return await navigator.mediaDevices.getUserMedia({
-        video,
-        audio,
-      });
-    } catch (error) {
-      console.warn('[Offscreen] tab audio capture fallback:', toNamedErrorMessage(error));
-    }
-
     return await navigator.mediaDevices.getUserMedia({
       video,
-      audio: false,
+      audio,
     });
   }
 
   function pickMimeType() {
     const preferred = [
-      'video/mp4;codecs=avc1.4D401E,mp4a.40.2',
-      'video/mp4;codecs=avc1.4D401E',
-      'video/mp4',
       'video/webm;codecs=vp9,opus',
       'video/webm;codecs=vp8,opus',
       'video/webm',
+      'video/mp4;codecs=avc1.4D401E,mp4a.40.2',
+      'video/mp4;codecs=avc1.4D401E',
+      'video/mp4',
     ];
 
     for (const mimeType of preferred) {

@@ -71,6 +71,7 @@ let validation: ValidationResult | null = null;
 let processingMetrics: ProcessingMetrics | null = null;
 let processingPipelineRunning = false;
 let offscreenReady = false;
+let recordingTabId: number | null = null;
 
 export default defineBackground(() => {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -83,6 +84,16 @@ export default defineBackground(() => {
 
     if (message.type === 'START') {
       void handleStart().then(sendResponse);
+      return true;
+    }
+
+    if (message.type === 'PREPARE_START') {
+      void handlePrepareStart().then(sendResponse);
+      return true;
+    }
+
+    if (message.type === 'CANCEL_START') {
+      void handleCancelStart().then(sendResponse);
       return true;
     }
 
@@ -198,6 +209,7 @@ function buildSnapshot(): RecordingSnapshot {
 function setState(next: RecordingState, options?: { force?: boolean }) {
   if (next === state) {
     updateBadge(next);
+    void syncRecordingBanner(next);
     void persistContext();
     void broadcastSnapshot();
     return;
@@ -210,6 +222,7 @@ function setState(next: RecordingState, options?: { force?: boolean }) {
 
   state = next;
   updateBadge(next);
+  void syncRecordingBanner(next);
   void persistContext();
   void broadcastSnapshot();
 }
@@ -256,6 +269,30 @@ async function broadcastSnapshot() {
   }
 }
 
+async function syncRecordingBanner(next: RecordingState) {
+  if (next === 'recording') {
+    if (recordingTabId === null) return;
+    await sendRecordingBanner(recordingTabId, true);
+    return;
+  }
+
+  if (recordingTabId === null) return;
+  const targetTabId = recordingTabId;
+  recordingTabId = null;
+  await sendRecordingBanner(targetTabId, false);
+}
+
+async function sendRecordingBanner(tabId: number, visible: boolean) {
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: 'RECORDING_BANNER',
+      visible,
+    });
+  } catch {
+    // Content script may be unavailable on browser-internal pages.
+  }
+}
+
 function resetSessionMetadata(nextSessionId: string) {
   sessionId = nextSessionId;
   recordingStartTime = null;
@@ -269,34 +306,23 @@ function resetSessionMetadata(nextSessionId: string) {
 }
 
 async function handleStart() {
-  if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
+  if (state !== 'armed') {
     return { ok: false, error: `Cannot start from state "${state}"`, snapshot: buildSnapshot() };
-  }
-
-  setState('preflight');
-
-  try {
-    await ensureOffscreenReadyWithRetry();
-  } catch (error) {
-    errorMessage = toErrorMessage(error);
-    setState('preflight_error');
-    return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
   }
 
   const nextSessionId = createSessionId();
   resetSessionMetadata(nextSessionId);
 
   try {
-    setState('armed');
     const targetTabId = await getStartTargetTabId();
     const streamId = await getTabCaptureStreamId(targetTabId);
-
     if (!streamId) {
-      errorMessage = 'Screen share was canceled.';
+      errorMessage = 'Failed to start tab capture.';
       setState('preflight_error');
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
     }
 
+    recordingTabId = targetTabId;
     const result = await sendToOffscreen<OffscreenResponse>({
       type: 'OFFSCREEN_START',
       sessionId: nextSessionId,
@@ -304,6 +330,7 @@ async function handleStart() {
     });
 
     if (!result?.ok) {
+      recordingTabId = null;
       errorMessage = result?.error ?? 'Failed to start recorder';
       setState('preflight_error');
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
@@ -315,10 +342,44 @@ async function handleStart() {
     setState('recording');
     return { ok: true, snapshot: buildSnapshot() };
   } catch (error) {
+    recordingTabId = null;
     errorMessage = toErrorMessage(error);
     setState('preflight_error');
     return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
   }
+}
+
+async function handlePrepareStart() {
+  if (state === 'armed') {
+    return { ok: true, snapshot: buildSnapshot() };
+  }
+
+  if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
+    return { ok: false, error: `Cannot prepare from state "${state}"`, snapshot: buildSnapshot() };
+  }
+
+  setState('preflight');
+  try {
+    await ensureOffscreenReadyWithRetry();
+    errorMessage = null;
+    setState('armed');
+    return { ok: true, snapshot: buildSnapshot() };
+  } catch (error) {
+    errorMessage = toErrorMessage(error);
+    setState('preflight_error');
+    return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
+  }
+}
+
+async function handleCancelStart() {
+  if (state === 'armed') {
+    errorMessage = null;
+    setState('idle');
+  } else if (state === 'preflight') {
+    errorMessage = null;
+    setState('idle', { force: true });
+  }
+  return { ok: true, snapshot: buildSnapshot() };
 }
 
 async function handleStop() {
@@ -506,16 +567,15 @@ async function ensureOffscreenReadyWithRetry() {
 }
 
 async function getStartTargetTabId() {
-  const activeTabs = await chrome.tabs.query({
+  const [activeTab] = await chrome.tabs.query({
     active: true,
     lastFocusedWindow: true,
   });
-  const targetTab = activeTabs[0];
 
-  if (!targetTab?.id) {
+  if (!activeTab?.id) {
     throw new Error('No active tab available for capture.');
   }
-  return targetTab.id;
+  return activeTab.id;
 }
 
 async function getTabCaptureStreamId(targetTabId: number): Promise<string> {
