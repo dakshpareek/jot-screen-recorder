@@ -5,7 +5,10 @@ export default defineConfig({
   manifest: {
     name: 'Screen Recorder',
     description: 'Local-first screen recorder with offscreen capture',
-    permissions: ['offscreen', 'storage', 'downloads', 'tabs', 'tabCapture'],
+    permissions: ['offscreen', 'storage', 'downloads', 'tabs', 'tabCapture', 'scripting'],
+    content_security_policy: {
+      extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
+    },
   },
   webExt: {
     chromiumArgs: ['--user-data-dir=./.wxt/chrome-data'],

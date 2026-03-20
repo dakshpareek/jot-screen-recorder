@@ -1,4 +1,10 @@
-import type { ProcessingMetrics, ValidationResult } from '@/lib/recording';
+import type {
+  OrphanedSession,
+  RecoveryChunkCheck,
+  RecoveryChunkStatus,
+  ProcessingMetrics,
+  ValidationResult,
+} from '@/lib/recording';
 import OpfsWorker from '../workers/opfs-worker.ts?worker';
 
 interface ManifestChunk {
@@ -24,6 +30,7 @@ interface WorkerResponse {
   data?: ArrayBuffer;
   found?: boolean;
   manifest?: SessionManifest;
+  sessions?: OrphanedSession[];
   message?: string;
 }
 
@@ -32,9 +39,11 @@ const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
 const CAPTURE_MAX_WIDTH = 1920;
 const CAPTURE_MAX_HEIGHT = 1080;
 const CAPTURE_MAX_FRAME_RATE = 30;
-const OUTPUT_VIDEO_CODEC = 'mpeg4';
-const OUTPUT_VIDEO_QUALITY = '12';
-const FFMPEG_AUDIO_BITRATE = '96k';
+const OUTPUT_VIDEO_CODEC = 'libx264';
+const OUTPUT_VIDEO_PRESET = 'fast';
+const OUTPUT_VIDEO_CRF = '22';
+const OUTPUT_FRAME_RATE = String(CAPTURE_MAX_FRAME_RATE);
+const FFMPEG_AUDIO_BITRATE = '128k';
 type FFmpegClass = typeof import('@ffmpeg/ffmpeg').FFmpeg;
 
 export default defineUnlistedScript(() => {
@@ -52,11 +61,20 @@ export default defineUnlistedScript(() => {
   let manifest: SessionManifest | null = null;
   let chunkCount = 0;
   let pendingStop = false;
+  let stopFinalDataPromise: Promise<void> | null = null;
+  let resolveStopFinalData: (() => void) | null = null;
+  let stopFinalDataTimeout: ReturnType<typeof setTimeout> | null = null;
+  let stopCompletionPromise: Promise<void> | null = null;
+  let resolveStopCompletion: (() => void) | null = null;
   let writeQueue: Promise<void> = Promise.resolve();
   let writeError: Error | null = null;
 
   let lastOutputBlob: Blob | null = null;
   let lastOutputUrl: string | null = null;
+  let systemAudioCheckTimer: ReturnType<typeof setTimeout> | null = null;
+  let systemAudioAudioCtx: AudioContext | null = null;
+  let systemAudioSource: MediaStreamAudioSourceNode | null = null;
+  let storageMonitorInterval: ReturnType<typeof setInterval> | null = null;
 
   // Signal readiness early. If background is not listening yet, ping-based readiness still succeeds.
   void chrome.runtime.sendMessage({ type: 'OFFSCREEN_READY' }).catch(() => {});
@@ -73,12 +91,47 @@ export default defineUnlistedScript(() => {
     }
 
     if (msg.type === 'OFFSCREEN_PROCESS') {
-      void processRecording(String(msg.sessionId)).then(sendResponse);
+      const chunkIndexes = Array.isArray(msg.chunkIndexes)
+        ? msg.chunkIndexes
+            .map((value: unknown) => Number(value))
+            .filter((value: number) => Number.isInteger(value) && value >= 0)
+        : undefined;
+      void processRecording(String(msg.sessionId), chunkIndexes).then(sendResponse);
       return true;
     }
 
     if (msg.type === 'OFFSCREEN_VALIDATE') {
       void validateLatestOutput().then(sendResponse);
+      return true;
+    }
+
+    if (msg.type === 'MIC_PREFLIGHT') {
+      void runMicPreflight().then(sendResponse);
+      return true;
+    }
+
+    if (msg.type === 'OFFSCREEN_PAUSE') {
+      void pauseRecording().then(sendResponse);
+      return true;
+    }
+
+    if (msg.type === 'OFFSCREEN_RESUME') {
+      void resumeRecording().then(sendResponse);
+      return true;
+    }
+
+    if (msg.type === 'OFFSCREEN_SCAN_ORPHANS') {
+      void scanOrphanedSessions().then(sendResponse);
+      return true;
+    }
+
+    if (msg.type === 'OFFSCREEN_CLEAR_SESSION') {
+      void clearSessionData(String(msg.sessionId ?? '')).then(sendResponse);
+      return true;
+    }
+
+    if (msg.type === 'OFFSCREEN_RECOVERY_INSPECT') {
+      void inspectRecoveryChunks(String(msg.sessionId ?? '')).then(sendResponse);
       return true;
     }
 
@@ -137,6 +190,11 @@ export default defineUnlistedScript(() => {
         const nextIndex = chunkCount;
         chunkCount += 1;
         enqueueChunkWrite(nextIndex, event.data);
+
+        // Final stop flush barrier: resolve only after chunk is queued for persistence.
+        if (pendingStop) {
+          resolveFinalStopData();
+        }
       };
 
       recorder.onstop = () => {
@@ -150,6 +208,8 @@ export default defineUnlistedScript(() => {
       };
 
       recorder.start(CHUNK_INTERVAL_MS);
+      startSystemAudioCheck(captureStream);
+      startStorageMonitor();
       const activeMimeType = recorder.mimeType || mimeType;
       // Preload ffmpeg while recording so stop->process latency is lower.
       // Skip prewarm when we're already recording MP4 chunks and may fast-path copy.
@@ -172,10 +232,24 @@ export default defineUnlistedScript(() => {
     }
 
     if (pendingStop) {
+      if (stopCompletionPromise) {
+        await stopCompletionPromise;
+      }
       return { ok: true };
     }
 
     pendingStop = true;
+    stopFinalDataPromise = new Promise<void>((resolve) => {
+      resolveStopFinalData = resolve;
+    });
+    stopFinalDataTimeout = setTimeout(() => {
+      resolveFinalStopData();
+    }, 1_500);
+    stopCompletionPromise = new Promise<void>((resolve) => {
+      resolveStopCompletion = resolve;
+    });
+    stopSystemAudioCheck();
+    stopStorageMonitor();
     if (manifest) {
       manifest.status = 'stopping';
       writeQueue = writeQueue.then(async () => {
@@ -186,15 +260,45 @@ export default defineUnlistedScript(() => {
     try {
       recorder.stop();
     } catch (error) {
+      resolveStopCompletion?.();
+      resolveStopCompletion = null;
+      stopCompletionPromise = null;
       return { ok: false, error: toErrorMessage(error) };
     }
 
-    captureStream?.getTracks().forEach((track) => track.stop());
+    await stopCompletionPromise;
     return { ok: true };
+  }
+
+  async function pauseRecording() {
+    if (!recorder || recorder.state !== 'recording') {
+      return { ok: false, error: 'Recorder is not actively recording' };
+    }
+    try {
+      recorder.pause();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: toErrorMessage(error) };
+    }
+  }
+
+  async function resumeRecording() {
+    if (!recorder || recorder.state !== 'paused') {
+      return { ok: false, error: 'Recorder is not paused' };
+    }
+    try {
+      recorder.resume();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: toErrorMessage(error) };
+    }
   }
 
   async function finalizeStop() {
     try {
+      if (stopFinalDataPromise) {
+        await stopFinalDataPromise;
+      }
       await writeQueue;
       if (writeError) throw writeError;
 
@@ -214,11 +318,34 @@ export default defineUnlistedScript(() => {
       });
     } finally {
       await cleanupMedia();
+      clearFinalStopDataWait();
       pendingStop = false;
+      resolveStopCompletion?.();
+      resolveStopCompletion = null;
+      stopCompletionPromise = null;
     }
   }
 
-  async function processRecording(sessionId: string) {
+  function resolveFinalStopData() {
+    if (!resolveStopFinalData) return;
+    resolveStopFinalData();
+    resolveStopFinalData = null;
+    clearFinalStopDataTimeout();
+  }
+
+  function clearFinalStopDataTimeout() {
+    if (!stopFinalDataTimeout) return;
+    clearTimeout(stopFinalDataTimeout);
+    stopFinalDataTimeout = null;
+  }
+
+  function clearFinalStopDataWait() {
+    clearFinalStopDataTimeout();
+    resolveStopFinalData = null;
+    stopFinalDataPromise = null;
+  }
+
+  async function processRecording(sessionId: string, selectedChunkIndexes?: number[]) {
     const metrics: ProcessingMetrics = {
       chunkCount: 0,
       mode: 'concat',
@@ -255,15 +382,27 @@ export default defineUnlistedScript(() => {
       }
 
       const orderedChunks = [...currentManifest.chunks].sort((a, b) => a.index - b.index);
-      metrics.chunkCount = orderedChunks.length;
-      metrics.mode = orderedChunks.length === 1 ? 'single' : 'concat';
+      const selectedIndexSet =
+        Array.isArray(selectedChunkIndexes) && selectedChunkIndexes.length
+          ? new Set(selectedChunkIndexes)
+          : null;
+      const selectedChunks = selectedIndexSet
+        ? orderedChunks.filter((chunk) => selectedIndexSet.has(chunk.index))
+        : orderedChunks;
+
+      if (!selectedChunks.length) {
+        return { ok: false, error: 'No selected chunks found for processing' };
+      }
+
+      metrics.chunkCount = selectedChunks.length;
+      metrics.mode = selectedChunks.length === 1 ? 'single' : 'concat';
       const captureMimeType = (currentManifest.mimeType ?? '').toLowerCase();
       const captureIsMp4 = captureMimeType.includes('mp4');
       let singleChunkData: ArrayBuffer | null = null;
 
-      if (orderedChunks.length === 1) {
+      if (selectedChunks.length === 1) {
         const readStart = performance.now();
-        singleChunkData = await readChunkData(sessionId, orderedChunks[0].index);
+        singleChunkData = await readChunkData(sessionId, selectedChunks[0].index);
         metrics.chunkReadMs += performance.now() - readStart;
         metrics.inputBytes += singleChunkData.byteLength;
 
@@ -282,8 +421,7 @@ export default defineUnlistedScript(() => {
           lastOutputUrl = URL.createObjectURL(lastOutputBlob);
 
           const validateStart = performance.now();
-          const duration = await probeDuration(lastOutputBlob);
-          const validation = await validateBlob(lastOutputBlob, duration);
+          const validation = await validateBlob(lastOutputBlob);
           metrics.validateMs = performance.now() - validateStart;
           metrics.totalMs = performance.now() - processingStartedAt;
 
@@ -304,10 +442,9 @@ export default defineUnlistedScript(() => {
       const ff = await ensureFFmpeg();
       metrics.ffmpegLoadMs = performance.now() - ffmpegLoadStart;
       const fileNames: string[] = [];
-      let preferConcatStreamCopy = false;
 
-      if (orderedChunks.length === 1) {
-        const data = singleChunkData ?? (await readChunkData(sessionId, orderedChunks[0].index));
+      if (selectedChunks.length === 1) {
+        const data = singleChunkData ?? (await readChunkData(sessionId, selectedChunks[0].index));
         if (!singleChunkData) {
           metrics.inputBytes += data.byteLength;
         }
@@ -317,7 +454,7 @@ export default defineUnlistedScript(() => {
         metrics.ffmpegWriteMs += performance.now() - writeStart;
         fileNames.push(fileName);
       } else if (captureIsMp4) {
-        for (const chunk of orderedChunks) {
+        for (const chunk of selectedChunks) {
           const readStart = performance.now();
           const data = await readChunkData(sessionId, chunk.index);
           metrics.chunkReadMs += performance.now() - readStart;
@@ -334,29 +471,39 @@ export default defineUnlistedScript(() => {
         const concatList = fileNames.map((name) => `file '${name}'`).join('\n');
         await ff.writeFile('list.txt', new TextEncoder().encode(concatList));
         metrics.ffmpegWriteMs += performance.now() - concatListWriteStart;
-        preferConcatStreamCopy = true;
       } else {
-        for (const chunk of orderedChunks) {
+        // WebM chunks from MediaRecorder.ondataavailable are NOT standalone
+        // files — only the first chunk contains the EBML/Tracks initialization
+        // segment.  The concat demuxer requires each file to be independently
+        // parseable, so feeding raw chunks produces a truncated output (only
+        // chunk 0 is decoded).  Instead, concatenate all chunks into a single
+        // binary blob which FFmpeg can demux as one continuous WebM stream.
+        const chunkBuffers: Uint8Array[] = [];
+        for (const chunk of selectedChunks) {
           const readStart = performance.now();
           const data = await readChunkData(sessionId, chunk.index);
           metrics.chunkReadMs += performance.now() - readStart;
           metrics.inputBytes += data.byteLength;
-
-          const writeStart = performance.now();
-          const fileName = `chunk-${chunk.index}.webm`;
-          await ff.writeFile(fileName, new Uint8Array(data));
-          metrics.ffmpegWriteMs += performance.now() - writeStart;
-          fileNames.push(fileName);
+          chunkBuffers.push(new Uint8Array(data));
         }
 
-        const concatListWriteStart = performance.now();
-        const concatList = fileNames.map((name) => `file '${name}'`).join('\n');
-        await ff.writeFile('list.txt', new TextEncoder().encode(concatList));
-        metrics.ffmpegWriteMs += performance.now() - concatListWriteStart;
+        const totalLength = chunkBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+        const merged = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const buf of chunkBuffers) {
+          merged.set(buf, offset);
+          offset += buf.byteLength;
+        }
+
+        const writeStart = performance.now();
+        const fileName = 'input.webm';
+        await ff.writeFile(fileName, merged);
+        metrics.ffmpegWriteMs += performance.now() - writeStart;
+        fileNames.push(fileName);
       }
 
       ffmpegDurationHint =
-        currentManifest.totalDuration || orderedChunks.length * CHUNK_DURATION_SECONDS;
+        selectedChunks.length * CHUNK_DURATION_SECONDS;
       ffmpegLastProgress = -1;
       await emitEvent('PROCESS_PROGRESS', { progress: 5 });
 
@@ -364,18 +511,24 @@ export default defineUnlistedScript(() => {
       const singleTranscodeArgs = [
         '-i',
         fileNames[0],
+        '-vsync',
+        'cfr',
+        '-r',
+        OUTPUT_FRAME_RATE,
         '-c:v',
         OUTPUT_VIDEO_CODEC,
-        '-q:v',
-        OUTPUT_VIDEO_QUALITY,
-        '-threads',
-        '0',
+        '-preset',
+        OUTPUT_VIDEO_PRESET,
+        '-crf',
+        OUTPUT_VIDEO_CRF,
         '-c:a',
         'aac',
         '-b:a',
         FFMPEG_AUDIO_BITRATE,
         '-movflags',
         '+faststart',
+        '-pix_fmt',
+        'yuv420p',
         'output.mp4',
       ];
       const concatTranscodeArgs = [
@@ -385,55 +538,34 @@ export default defineUnlistedScript(() => {
         '0',
         '-i',
         'list.txt',
+        '-vsync',
+        'cfr',
+        '-r',
+        OUTPUT_FRAME_RATE,
         '-c:v',
         OUTPUT_VIDEO_CODEC,
-        '-q:v',
-        OUTPUT_VIDEO_QUALITY,
-        '-threads',
-        '0',
+        '-preset',
+        OUTPUT_VIDEO_PRESET,
+        '-crf',
+        OUTPUT_VIDEO_CRF,
         '-c:a',
         'aac',
         '-b:a',
         FFMPEG_AUDIO_BITRATE,
         '-movflags',
         '+faststart',
-        'output.mp4',
-      ];
-      const concatCopyArgs = [
-        '-f',
-        'concat',
-        '-safe',
-        '0',
-        '-i',
-        'list.txt',
-        '-c',
-        'copy',
-        '-movflags',
-        '+faststart',
+        '-pix_fmt',
+        'yuv420p',
         'output.mp4',
       ];
 
       const execStart = performance.now();
-      let usedConcatCopy = false;
-      if (shouldRunConcatDemuxer && preferConcatStreamCopy) {
-        try {
-          metrics.encodeProfile = 'copy_mp4_concat';
-          await ff.exec(concatCopyArgs);
-          usedConcatCopy = true;
-        } catch (copyError) {
-          console.warn('[Offscreen] concat stream copy failed, falling back to transcode:', copyError);
-          await ff.deleteFile('output.mp4').catch(() => {});
-          metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
-          await ff.exec(concatTranscodeArgs);
-        }
-      } else {
-        metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
-        await ff.exec(shouldRunConcatDemuxer ? concatTranscodeArgs : singleTranscodeArgs);
-      }
+      metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
+      await ff.exec(shouldRunConcatDemuxer ? concatTranscodeArgs : singleTranscodeArgs);
       metrics.execMs = performance.now() - execStart;
 
       const minimumDuration =
-        orderedChunks.length > 1 ? getExpectedMinimumDurationSeconds(orderedChunks.length) : 0;
+        selectedChunks.length > 1 ? getExpectedMinimumDurationSeconds(selectedChunks.length) : 0;
 
       const readAndValidateOutput = async () => {
         const outputReadStart = performance.now();
@@ -444,26 +576,13 @@ export default defineUnlistedScript(() => {
         const blob = new Blob([bytes.buffer], { type: 'video/mp4' });
 
         const validateStart = performance.now();
-        const outputDuration = await probeDuration(blob);
-        const outputValidation = await validateBlob(blob, outputDuration, minimumDuration);
+        const outputValidation = await validateBlob(blob, minimumDuration);
         metrics.validateMs += performance.now() - validateStart;
 
         return { bytes, blob, validation: outputValidation };
       };
 
       let outputResult = await readAndValidateOutput();
-
-      if (usedConcatCopy && !outputResult.validation.passed) {
-        console.warn('[Offscreen] concat stream copy produced invalid output, falling back to transcode');
-        await ff.deleteFile('output.mp4').catch(() => {});
-        metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
-
-        const fallbackExecStart = performance.now();
-        await ff.exec(concatTranscodeArgs);
-        metrics.execMs += performance.now() - fallbackExecStart;
-
-        outputResult = await readAndValidateOutput();
-      }
 
       metrics.outputBytes = outputResult.bytes.byteLength;
       lastOutputBlob = outputResult.blob;
@@ -512,8 +631,7 @@ export default defineUnlistedScript(() => {
       };
     }
 
-    const duration = await probeDuration(lastOutputBlob);
-    return validateBlob(lastOutputBlob, duration);
+    return validateBlob(lastOutputBlob);
   }
 
   function enqueueChunkWrite(index: number, blob: Blob) {
@@ -606,6 +724,79 @@ export default defineUnlistedScript(() => {
     }
 
     return response.data;
+  }
+
+  async function scanOrphanedSessions() {
+    const response = await callWorker(
+      {
+        type: 'scan-orphans',
+      },
+      ['orphans-data'],
+    );
+
+    return {
+      ok: true,
+      sessions: Array.isArray(response.sessions) ? response.sessions : [],
+    };
+  }
+
+  async function clearSessionData(sessionId: string) {
+    if (!sessionId) {
+      return { ok: false, error: 'Missing session id' };
+    }
+
+    await callWorker(
+      {
+        type: 'clear-session',
+        sessionId,
+      },
+      ['cleared'],
+    );
+
+    return { ok: true };
+  }
+
+  async function inspectRecoveryChunks(sessionId: string) {
+    if (!sessionId) {
+      return { ok: false, error: 'Missing session id' };
+    }
+
+    try {
+      const manifestData = await readManifest(sessionId);
+      const chunks = [...manifestData.chunks].sort((a, b) => a.index - b.index);
+      const checks: RecoveryChunkCheck[] = [];
+
+      for (const chunk of chunks) {
+        let status: RecoveryChunkStatus = 'ok';
+        let actualChecksum: string | null = null;
+        const expectedChecksum = chunk.checksum || null;
+        try {
+          const data = await readChunkData(sessionId, chunk.index);
+          actualChecksum = await sha256Hex(data);
+          if (!expectedChecksum || actualChecksum !== expectedChecksum) {
+            status = 'suspect';
+          }
+        } catch {
+          status = 'missing';
+        }
+
+        checks.push({
+          index: chunk.index,
+          size: chunk.size,
+          status,
+          expectedChecksum,
+          actualChecksum,
+          included: status !== 'missing',
+        });
+      }
+
+      return { ok: true, chunks: checks };
+    } catch (error) {
+      return {
+        ok: false,
+        error: toErrorMessage(error),
+      };
+    }
   }
 
   async function ensureOpfsWorker() {
@@ -715,11 +906,169 @@ export default defineUnlistedScript(() => {
   }
 
   async function cleanupMedia() {
+    stopSystemAudioCheck();
+    stopStorageMonitor();
     if (captureStream) {
       captureStream.getTracks().forEach((track) => track.stop());
     }
     captureStream = null;
     recorder = null;
+  }
+
+  async function runMicPreflight() {
+    const permissionStatus = await navigator.permissions.query({
+      name: 'microphone' as PermissionName,
+    });
+
+    if (permissionStatus.state === 'denied') {
+      return { ok: false, error: 'MIC_PERMISSION_DENIED' };
+    }
+
+    if (permissionStatus.state === 'prompt') {
+      return { ok: false, error: 'MIC_PERMISSION_PROMPT' };
+    }
+
+    let stream: MediaStream | null = null;
+    let audioCtx: AudioContext | null = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+
+      audioCtx = new AudioContext();
+      const analyser = audioCtx.createAnalyser();
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      await wait(1_000);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(data);
+      const level = data.reduce((sum, value) => sum + value, 0) / data.length;
+
+      source.disconnect();
+      return { ok: true, level };
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.name === 'NotAllowedError') {
+          return { ok: false, error: 'MIC_PERMISSION_DENIED' };
+        }
+        if (error.name === 'NotFoundError') {
+          return { ok: false, error: 'MIC_NOT_FOUND' };
+        }
+        if (error.name === 'NotReadableError') {
+          return { ok: false, error: 'MIC_IN_USE' };
+        }
+      }
+      return {
+        ok: false,
+        error: toNamedErrorMessage(error),
+      };
+    } finally {
+      stream?.getTracks().forEach((track) => track.stop());
+      await audioCtx?.close().catch(() => {});
+    }
+  }
+
+  function startSystemAudioCheck(stream: MediaStream) {
+    stopSystemAudioCheck();
+
+    const audioTracks = stream.getAudioTracks();
+    if (!audioTracks.length) {
+      void emitRuntimeSignal({ type: 'SYSTEM_AUDIO_ABSENT' });
+      return;
+    }
+
+    try {
+      const audioStream = new MediaStream(audioTracks);
+      const audioCtx = new AudioContext();
+      const analyser = audioCtx.createAnalyser();
+      const source = audioCtx.createMediaStreamSource(audioStream);
+      source.connect(analyser);
+
+      systemAudioAudioCtx = audioCtx;
+      systemAudioSource = source;
+
+      systemAudioCheckTimer = setTimeout(() => {
+        const data = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(data);
+        const level = data.reduce((sum, value) => sum + value, 0) / data.length;
+
+        if (level <= 0) {
+          void emitRuntimeSignal({ type: 'SYSTEM_AUDIO_SILENT', level });
+        } else {
+          void emitRuntimeSignal({ type: 'SYSTEM_AUDIO_OK', level });
+        }
+
+        stopSystemAudioCheck();
+      }, 2_000);
+    } catch (error) {
+      void emitRuntimeSignal({
+        type: 'SYSTEM_AUDIO_ABSENT',
+        error: toErrorMessage(error),
+      });
+      stopSystemAudioCheck();
+    }
+  }
+
+  function stopSystemAudioCheck() {
+    if (systemAudioCheckTimer) {
+      clearTimeout(systemAudioCheckTimer);
+      systemAudioCheckTimer = null;
+    }
+
+    if (systemAudioSource) {
+      try {
+        systemAudioSource.disconnect();
+      } catch {}
+      systemAudioSource = null;
+    }
+
+    if (systemAudioAudioCtx) {
+      void systemAudioAudioCtx.close().catch(() => {});
+      systemAudioAudioCtx = null;
+    }
+  }
+
+  function startStorageMonitor() {
+    stopStorageMonitor();
+    storageMonitorInterval = setInterval(() => {
+      void (async () => {
+        try {
+          const estimate = await navigator.storage.estimate();
+          const availableMB = Math.max(0, ((estimate.quota ?? 0) - (estimate.usage ?? 0)) / (1024 * 1024));
+
+          if (availableMB < 50) {
+            await emitRuntimeSignal({ type: 'AUTO_STOP_LOW_STORAGE', availableMB });
+            stopStorageMonitor();
+            return;
+          }
+
+          if (availableMB < 100) {
+            await emitRuntimeSignal({ type: 'LOW_STORAGE_WARNING', availableMB });
+          }
+        } catch {
+          // Ignore transient storage-estimate failures.
+        }
+      })();
+    }, 30_000);
+  }
+
+  function stopStorageMonitor() {
+    if (storageMonitorInterval) {
+      clearInterval(storageMonitorInterval);
+      storageMonitorInterval = null;
+    }
+  }
+
+  async function emitRuntimeSignal(payload: Record<string, unknown>) {
+    try {
+      await chrome.runtime.sendMessage(payload);
+    } catch {
+      // Background may be asleep between events; ignore.
+    }
   }
 
   async function emitEvent(
@@ -742,21 +1091,15 @@ export default defineUnlistedScript(() => {
     }
   }
 
-  async function validateBlob(
-    blob: Blob,
-    duration: number,
-    minimumDurationSeconds = 0,
-  ): Promise<ValidationResult> {
-    const shouldRelaxDuration = blob.size > 1_000_000;
-    const hasDuration = Number.isFinite(duration) && duration > 0;
+  function wait(ms: number) {
+    return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function validateBlob(blob: Blob, minimumDurationSeconds = 0): Promise<ValidationResult> {
     const checks = {
       size: blob.size > 50_000,
       header: await hasMp4FtypHeader(blob),
-      // Duration metadata is unreliable for some ffmpeg concat outputs.
-      // For larger files, trust size + header and treat duration as best-effort.
-      duration: shouldRelaxDuration
-        ? true
-        : hasDuration && (minimumDurationSeconds <= 0 || duration >= minimumDurationSeconds),
+      duration: await checkDurationWithFallback(blob, minimumDurationSeconds),
     };
 
     return {
@@ -797,6 +1140,62 @@ export default defineUnlistedScript(() => {
     // Parse mvhd metadata directly to avoid false negatives in validation.
     const mp4Duration = await probeMp4DurationFromMetadata(blob);
     return Number.isFinite(mp4Duration) && mp4Duration > 0 ? mp4Duration : 0;
+  }
+
+  async function checkDurationWithFallback(blob: Blob, minimumDurationSeconds = 0): Promise<boolean> {
+    if (minimumDurationSeconds <= 0 && blob.size > 1_000_000) return true;
+
+    const isDurationValid = (value: number) =>
+      Number.isFinite(value) &&
+      value > 0 &&
+      (minimumDurationSeconds <= 0 || value >= minimumDurationSeconds);
+
+    const mediaDuration = await probeDuration(blob);
+    if (isDurationValid(mediaDuration)) {
+      return true;
+    }
+
+    const ffprobeDuration = await probeDurationViaFfprobe(blob);
+    return isDurationValid(ffprobeDuration);
+  }
+
+  async function probeDurationViaFfprobe(blob: Blob): Promise<number> {
+    let inputFile = '';
+    let outputFile = '';
+
+    try {
+      const ff = await ensureFFmpeg();
+      const nonce = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      inputFile = `probe-${nonce}.mp4`;
+      outputFile = `probe-${nonce}.txt`;
+
+      await ff.writeFile(inputFile, new Uint8Array(await blob.arrayBuffer()));
+      const returnCode = await ff.ffprobe([
+        '-v',
+        'error',
+        '-show_entries',
+        'format=duration',
+        '-of',
+        'default=noprint_wrappers=1:nokey=1',
+        inputFile,
+        '-o',
+        outputFile,
+      ]);
+
+      if (returnCode !== 0) return 0;
+
+      const output = await ff.readFile(outputFile, 'utf8');
+      const text = typeof output === 'string' ? output : new TextDecoder().decode(output);
+      const parsed = Number.parseFloat(text.trim());
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    } catch {
+      return 0;
+    } finally {
+      if (ffmpegLoaded && ffmpeg) {
+        if (outputFile) await ffmpeg.deleteFile(outputFile).catch(() => {});
+        if (inputFile) await ffmpeg.deleteFile(inputFile).catch(() => {});
+      }
+    }
   }
 
   async function probeMp4DurationFromMetadata(blob: Blob): Promise<number> {
