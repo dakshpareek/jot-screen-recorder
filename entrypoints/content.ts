@@ -1,5 +1,5 @@
 const BANNER_ID = '__screen_recorder_recording_banner__';
-const BANNER_TEXT = 'Recording in progress — do not close this tab';
+const BANNER_TEXT = "Recording in progress - do not close this tab. Tab audio is being captured (you won't hear it)";
 
 export default defineContentScript({
   matches: ['<all_urls>'],
