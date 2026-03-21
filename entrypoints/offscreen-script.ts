@@ -1,43 +1,17 @@
 import type {
-  OrphanedSession,
   RecoveryChunkCheck,
   RecoveryChunkStatus,
   ProcessingMetrics,
   ValidationResult,
 } from '@/lib/recording';
-import OpfsWorker from '../workers/opfs-worker.ts?worker';
-
-interface ManifestChunk {
-  index: number;
-  size: number;
-  written: boolean;
-  duration: number;
-  checksum: string;
-}
-
-interface SessionManifest {
-  sessionId: string;
-  startTime: number;
-  mimeType?: string;
-  chunks: ManifestChunk[];
-  totalDuration: number;
-  status: 'recording' | 'stopping' | 'complete';
-}
-
-interface WorkerResponse {
-  type: string;
-  chunkIndex?: number;
-  data?: ArrayBuffer;
-  found?: boolean;
-  manifest?: SessionManifest;
-  sessions?: OrphanedSession[];
-  message?: string;
-}
-
-interface RawDownloadItem {
-  url: string;
-  filename: string;
-}
+import {
+  OffscreenEventType,
+  RuntimeMessageType,
+  type AudioSource,
+  type OffscreenEventTypeValue,
+} from '@/lib/messages';
+import { OpfsBridge } from './offscreen/storage/opfs-bridge';
+import type { FFmpegClass, RawDownloadItem, SessionManifest } from './offscreen/types';
 
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
@@ -50,18 +24,16 @@ const OUTPUT_VIDEO_PRESET = 'fast';
 const OUTPUT_VIDEO_CRF = '22';
 const OUTPUT_FRAME_RATE = String(CAPTURE_MAX_FRAME_RATE);
 const FFMPEG_AUDIO_BITRATE = '128k';
-type FFmpegClass = typeof import('@ffmpeg/ffmpeg').FFmpeg;
-type AudioSource = 'both' | 'mic' | 'tab' | 'silent';
 
 export default defineUnlistedScript(() => {
+  const opfsBridge = new OpfsBridge();
+
   let recorder: MediaRecorder | null = null;
   let captureStream: MediaStream | null = null;
   let tabCaptureStream: MediaStream | null = null;
   let micCaptureStream: MediaStream | null = null;
   let preflightMicStream: MediaStream | null = null;
   let preflightMicHoldTimer: ReturnType<typeof setTimeout> | null = null;
-  let opfsWorker: Worker | null = null;
-  let workerQueue: Promise<unknown> = Promise.resolve();
   let FFmpegCtor: FFmpegClass | null = null;
   let ffmpeg: InstanceType<FFmpegClass> | null = null;
   let ffmpegLoaded = false;
@@ -96,24 +68,25 @@ export default defineUnlistedScript(() => {
   const rawExportUrls = new Set<string>();
 
   // Signal readiness early. If background is not listening yet, ping-based readiness still succeeds.
-  void chrome.runtime.sendMessage({ type: 'OFFSCREEN_READY' }).catch(() => {});
+  void chrome.runtime.sendMessage({ type: RuntimeMessageType.OFFSCREEN_READY }).catch(() => {});
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type === 'OFFSCREEN_START') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_START) {
       void startRecording(
         String(msg.sessionId),
         String(msg.streamId ?? ''),
         normalizeAudioSource(msg.audioSource),
+        normalizeMicDeviceId(msg.micDeviceId),
       ).then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_STOP') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_STOP) {
       void stopRecording().then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_PROCESS') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_PROCESS) {
       const chunkIndexes = Array.isArray(msg.chunkIndexes)
         ? msg.chunkIndexes
             .map((value: unknown) => Number(value))
@@ -123,53 +96,53 @@ export default defineUnlistedScript(() => {
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_VALIDATE') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_VALIDATE) {
       void validateLatestOutput().then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'MIC_PREFLIGHT') {
-      void runMicPreflight().then(sendResponse);
+    if (msg.type === RuntimeMessageType.MIC_PREFLIGHT) {
+      void runMicPreflight(normalizeMicDeviceId(msg.micDeviceId)).then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_RELEASE_PREFLIGHT_MIC') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_RELEASE_PREFLIGHT_MIC) {
       releasePreflightMicStream();
       sendResponse({ ok: true });
       return;
     }
 
-    if (msg.type === 'OFFSCREEN_PAUSE') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_PAUSE) {
       void pauseRecording().then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_RESUME') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_RESUME) {
       void resumeRecording().then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_SCAN_ORPHANS') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
       void scanOrphanedSessions().then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_CLEAR_SESSION') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_CLEAR_SESSION) {
       void clearSessionData(String(msg.sessionId ?? '')).then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_RECOVERY_INSPECT') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT) {
       void inspectRecoveryChunks(String(msg.sessionId ?? '')).then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_DOWNLOAD_RAW_CHUNKS') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_DOWNLOAD_RAW_CHUNKS) {
       void downloadRawChunks(String(msg.sessionId ?? '')).then(sendResponse);
       return true;
     }
 
-    if (msg.type === 'OFFSCREEN_STATUS') {
+    if (msg.type === RuntimeMessageType.OFFSCREEN_STATUS) {
       sendResponse({
         alive: true,
         isRecording: recorder?.state === 'recording',
@@ -188,7 +161,19 @@ export default defineUnlistedScript(() => {
     return 'both';
   }
 
-  async function startRecording(nextSessionId: string, streamId: string, audioSource: AudioSource) {
+  function normalizeMicDeviceId(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed === 'default') return null;
+    return trimmed;
+  }
+
+  async function startRecording(
+    nextSessionId: string,
+    streamId: string,
+    audioSource: AudioSource,
+    micDeviceId: string | null,
+  ) {
     if (recorder?.state === 'recording') {
       return { ok: false, error: 'Recorder is already active' };
     }
@@ -199,15 +184,13 @@ export default defineUnlistedScript(() => {
 
     try {
       tabCaptureStream = await getTabStreamById(streamId);
-      captureStream = await buildCaptureStream(tabCaptureStream, audioSource);
+      captureStream = await buildCaptureStream(tabCaptureStream, audioSource, micDeviceId);
 
       activeSessionId = nextSessionId;
       chunkCount = 0;
       pendingStop = false;
       writeError = null;
       writeQueue = Promise.resolve();
-
-      await ensureOpfsWorker();
 
       manifest = {
         sessionId: nextSessionId,
@@ -246,7 +229,7 @@ export default defineUnlistedScript(() => {
       recorder.onerror = (event) => {
         const eventWithError = event as Event & { error?: { message?: string } };
         const err = eventWithError.error?.message ?? 'MediaRecorder error';
-        void emitEvent('ERROR', { error: err });
+        void emitEvent(OffscreenEventType.ERROR, { error: err });
       };
 
       recorder.start(CHUNK_INTERVAL_MS);
@@ -351,12 +334,12 @@ export default defineUnlistedScript(() => {
         await writeManifest();
       }
 
-      await emitEvent('FINAL_CHUNK_WRITTEN', {
+      await emitEvent(OffscreenEventType.FINAL_CHUNK_WRITTEN, {
         sessionId: activeSessionId,
         chunkCount,
       });
     } catch (error) {
-      await emitEvent('ERROR', {
+      await emitEvent(OffscreenEventType.ERROR, {
         error: `Finalization failed: ${toErrorMessage(error)}`,
       });
     } finally {
@@ -468,8 +451,8 @@ export default defineUnlistedScript(() => {
           metrics.validateMs = performance.now() - validateStart;
           metrics.totalMs = performance.now() - processingStartedAt;
 
-          await emitEvent('PROCESS_PROGRESS', { progress: 100 });
-          await emitEvent('PROCESS_METRICS', { metrics });
+          await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
+          await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
           console.info('[Offscreen] Processing metrics', metrics);
 
           return {
@@ -548,7 +531,7 @@ export default defineUnlistedScript(() => {
       ffmpegDurationHint =
         selectedChunks.length * CHUNK_DURATION_SECONDS;
       ffmpegLastProgress = 5;
-      await emitEvent('PROCESS_PROGRESS', { progress: 5 });
+      await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 5 });
 
       const shouldRunConcatDemuxer = fileNames.length > 1;
       const singleTranscodeArgs = [
@@ -638,8 +621,8 @@ export default defineUnlistedScript(() => {
       const validation = outputResult.validation;
       metrics.totalMs = performance.now() - processingStartedAt;
 
-      await emitEvent('PROCESS_PROGRESS', { progress: 100 });
-      await emitEvent('PROCESS_METRICS', { metrics });
+      await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
+      await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
       console.info('[Offscreen] Processing metrics', metrics);
       ffmpegDurationHint = 0;
 
@@ -653,9 +636,9 @@ export default defineUnlistedScript(() => {
       };
     } catch (error) {
       metrics.totalMs = performance.now() - processingStartedAt;
-      await emitEvent('PROCESS_METRICS', { metrics });
+      await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
       console.info('[Offscreen] Processing metrics (failed)', metrics);
-      await emitEvent('ERROR', {
+      await emitEvent(OffscreenEventType.ERROR, {
         error: `Processing failed: ${toErrorMessage(error)}`,
       });
       return { ok: false, error: toErrorMessage(error) };
@@ -689,16 +672,7 @@ export default defineUnlistedScript(() => {
         const arrayBuffer = await blob.arrayBuffer();
         const checksum = await sha256Hex(arrayBuffer);
 
-        await callWorker(
-          {
-            type: 'write-chunk',
-            sessionId: activeSessionId,
-            chunkIndex: index,
-            data: arrayBuffer,
-          },
-          ['chunk-written'],
-          [arrayBuffer],
-        );
+        await opfsBridge.writeChunk(activeSessionId, index, arrayBuffer);
 
         manifest.chunks.push({
           index,
@@ -711,10 +685,10 @@ export default defineUnlistedScript(() => {
         manifest.status = pendingStop ? 'stopping' : 'recording';
         await writeManifest();
 
-        await emitEvent('CHUNK_WRITTEN', { chunkCount });
+        await emitEvent(OffscreenEventType.CHUNK_WRITTEN, { chunkCount });
       } catch (error) {
         writeError = error instanceof Error ? error : new Error(toErrorMessage(error));
-        await emitEvent('ERROR', {
+        await emitEvent(OffscreenEventType.ERROR, {
           error: `Chunk write failed: ${toErrorMessage(error)}`,
         });
       }
@@ -726,60 +700,21 @@ export default defineUnlistedScript(() => {
       throw new Error('Manifest write called without active session');
     }
 
-    await callWorker(
-      {
-        type: 'write-manifest',
-        sessionId: activeSessionId,
-        manifest,
-      },
-      ['manifest-written'],
-    );
+    await opfsBridge.writeManifest(activeSessionId, manifest);
   }
 
   async function readManifest(sessionId: string): Promise<SessionManifest> {
-    const response = await callWorker(
-      {
-        type: 'read-manifest',
-        sessionId,
-      },
-      ['manifest-data', 'manifest-not-found'],
-    );
-
-    if (response.type !== 'manifest-data' || !response.manifest) {
-      throw new Error('Manifest not found');
-    }
-
-    return response.manifest;
+    return await opfsBridge.readManifest(sessionId);
   }
 
   async function readChunkData(sessionId: string, chunkIndex: number): Promise<ArrayBuffer> {
-    const response = await callWorker(
-      {
-        type: 'read-chunk',
-        sessionId,
-        chunkIndex,
-      },
-      ['chunk-data', 'chunk-not-found'],
-    );
-
-    if (response.type !== 'chunk-data' || !response.data) {
-      throw new Error(`Chunk ${chunkIndex} is missing`);
-    }
-
-    return response.data;
+    return await opfsBridge.readChunk(sessionId, chunkIndex);
   }
 
   async function scanOrphanedSessions() {
-    const response = await callWorker(
-      {
-        type: 'scan-orphans',
-      },
-      ['orphans-data'],
-    );
-
     return {
       ok: true,
-      sessions: Array.isArray(response.sessions) ? response.sessions : [],
+      sessions: await opfsBridge.scanOrphans(),
     };
   }
 
@@ -788,13 +723,7 @@ export default defineUnlistedScript(() => {
       return { ok: false, error: 'Missing session id' };
     }
 
-    await callWorker(
-      {
-        type: 'clear-session',
-        sessionId,
-      },
-      ['cleared'],
-    );
+    await opfsBridge.clearSession(sessionId);
 
     return { ok: true };
   }
@@ -895,72 +824,6 @@ export default defineUnlistedScript(() => {
     }
   }
 
-  async function ensureOpfsWorker() {
-    if (opfsWorker) return opfsWorker;
-    opfsWorker = new OpfsWorker();
-    opfsWorker.addEventListener('error', (event) => {
-      console.error('[Offscreen] OPFS worker failed to load:', event.message);
-    });
-    opfsWorker.addEventListener('messageerror', () => {
-      console.error('[Offscreen] OPFS worker message error');
-    });
-    return opfsWorker;
-  }
-
-  async function callWorker(
-    message: Record<string, unknown>,
-    expectedTypes: string[],
-    transferables: Transferable[] = [],
-  ): Promise<WorkerResponse> {
-    await ensureOpfsWorker();
-
-    const task = workerQueue.then(
-      () =>
-        new Promise<WorkerResponse>((resolve, reject) => {
-          if (!opfsWorker) {
-            reject(new Error('OPFS worker unavailable'));
-            return;
-          }
-
-          const timeout = setTimeout(() => {
-            cleanup();
-            reject(new Error(`OPFS worker timeout waiting for: ${expectedTypes.join(', ')}`));
-          }, 10_000);
-
-          const handleMessage = (event: MessageEvent<WorkerResponse>) => {
-            const payload = event.data;
-            if (!payload?.type) return;
-
-            if (payload.type === 'error') {
-              cleanup();
-              reject(new Error(payload.message ?? 'OPFS worker error'));
-              return;
-            }
-
-            if (expectedTypes.includes(payload.type)) {
-              cleanup();
-              resolve(payload);
-            }
-          };
-
-          const cleanup = () => {
-            clearTimeout(timeout);
-            opfsWorker?.removeEventListener('message', handleMessage);
-          };
-
-          opfsWorker.addEventListener('message', handleMessage);
-          opfsWorker.postMessage(message, transferables);
-        }),
-    );
-
-    workerQueue = task.then(
-      () => undefined,
-      () => undefined,
-    );
-
-    return task;
-  }
-
   async function ensureFFmpeg() {
     if (!FFmpegCtor) {
       const module = await import('@ffmpeg/ffmpeg');
@@ -973,7 +836,7 @@ export default defineUnlistedScript(() => {
         const progress = parseProgressFromLog(message, ffmpegDurationHint);
         if (progress !== null && progress > ffmpegLastProgress) {
           ffmpegLastProgress = progress;
-          void emitEvent('PROCESS_PROGRESS', { progress });
+          void emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress });
         }
       });
     }
@@ -1053,7 +916,7 @@ export default defineUnlistedScript(() => {
     recorder = null;
   }
 
-  async function runMicPreflight() {
+  async function runMicPreflight(micDeviceId: string | null = null) {
     releasePreflightMicStream();
     try {
       const permissionStatus = await navigator.permissions.query({
@@ -1070,7 +933,7 @@ export default defineUnlistedScript(() => {
     let stream: MediaStream | null = null;
     let audioCtx: AudioContext | null = null;
     try {
-      stream = await requestMicStream();
+      stream = await requestMicStream(micDeviceId);
 
       audioCtx = new AudioContext();
       const analyser = audioCtx.createAnalyser();
@@ -1115,7 +978,7 @@ export default defineUnlistedScript(() => {
 
     const audioTracks = stream.getAudioTracks();
     if (!audioTracks.length) {
-      void emitRuntimeSignal({ type: 'SYSTEM_AUDIO_ABSENT' });
+      void emitRuntimeSignal({ type: RuntimeMessageType.SYSTEM_AUDIO_ABSENT });
       return;
     }
 
@@ -1135,16 +998,16 @@ export default defineUnlistedScript(() => {
         const level = data.reduce((sum, value) => sum + value, 0) / data.length;
 
         if (level <= 0) {
-          void emitRuntimeSignal({ type: 'SYSTEM_AUDIO_SILENT', level });
+          void emitRuntimeSignal({ type: RuntimeMessageType.SYSTEM_AUDIO_SILENT, level });
         } else {
-          void emitRuntimeSignal({ type: 'SYSTEM_AUDIO_OK', level });
+          void emitRuntimeSignal({ type: RuntimeMessageType.SYSTEM_AUDIO_OK, level });
         }
 
         stopSystemAudioCheck();
       }, 2_000);
     } catch (error) {
       void emitRuntimeSignal({
-        type: 'SYSTEM_AUDIO_ABSENT',
+        type: RuntimeMessageType.SYSTEM_AUDIO_ABSENT,
         error: toErrorMessage(error),
       });
       stopSystemAudioCheck();
@@ -1179,13 +1042,19 @@ export default defineUnlistedScript(() => {
           const availableMB = Math.max(0, ((estimate.quota ?? 0) - (estimate.usage ?? 0)) / (1024 * 1024));
 
           if (availableMB < 50) {
-            await emitRuntimeSignal({ type: 'AUTO_STOP_LOW_STORAGE', availableMB });
+            await emitRuntimeSignal({
+              type: RuntimeMessageType.AUTO_STOP_LOW_STORAGE,
+              availableMB,
+            });
             stopStorageMonitor();
             return;
           }
 
           if (availableMB < 100) {
-            await emitRuntimeSignal({ type: 'LOW_STORAGE_WARNING', availableMB });
+            await emitRuntimeSignal({
+              type: RuntimeMessageType.LOW_STORAGE_WARNING,
+              availableMB,
+            });
           }
         } catch {
           // Ignore transient storage-estimate failures.
@@ -1209,18 +1078,10 @@ export default defineUnlistedScript(() => {
     }
   }
 
-  async function emitEvent(
-    event:
-      | 'CHUNK_WRITTEN'
-      | 'FINAL_CHUNK_WRITTEN'
-      | 'PROCESS_PROGRESS'
-      | 'PROCESS_METRICS'
-      | 'ERROR',
-    payload: Record<string, unknown>,
-  ) {
+  async function emitEvent(event: OffscreenEventTypeValue, payload: Record<string, unknown>) {
     try {
       await chrome.runtime.sendMessage({
-        type: 'OFFSCREEN_EVENT',
+        type: RuntimeMessageType.OFFSCREEN_EVENT,
         event,
         ...payload,
       });
@@ -1453,13 +1314,18 @@ export default defineUnlistedScript(() => {
     });
   }
 
-  async function requestMicStream() {
+  async function requestMicStream(micDeviceId: string | null = null) {
+    const audioConstraints: MediaTrackConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (micDeviceId) {
+      audioConstraints.deviceId = { exact: micDeviceId };
+    }
+
     return await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
+      audio: audioConstraints,
       video: false,
     });
   }
@@ -1492,7 +1358,11 @@ export default defineUnlistedScript(() => {
     }, PREFLIGHT_MIC_HOLD_MS);
   }
 
-  async function buildCaptureStream(tabStream: MediaStream, audioSource: AudioSource) {
+  async function buildCaptureStream(
+    tabStream: MediaStream,
+    audioSource: AudioSource,
+    micDeviceId: string | null,
+  ) {
     const videoTracks = tabStream.getVideoTracks();
     if (!videoTracks.length) {
       throw new Error('Tab capture did not provide a video track');
@@ -1509,7 +1379,7 @@ export default defineUnlistedScript(() => {
     }
 
     if (audioSource === 'mic') {
-      micCaptureStream = consumePreflightMicStream() ?? (await requestMicStream());
+      micCaptureStream = consumePreflightMicStream() ?? (await requestMicStream(micDeviceId));
       const micTracks = micCaptureStream.getAudioTracks();
       if (!micTracks.length) {
         throw new Error('Microphone capture did not provide an audio track');
@@ -1518,7 +1388,7 @@ export default defineUnlistedScript(() => {
     }
 
     try {
-      micCaptureStream = consumePreflightMicStream() ?? (await requestMicStream());
+      micCaptureStream = consumePreflightMicStream() ?? (await requestMicStream(micDeviceId));
       const micTracks = micCaptureStream.getAudioTracks();
       if (!micTracks.length) {
         throw new Error('Microphone capture did not provide an audio track');
@@ -1588,7 +1458,7 @@ export default defineUnlistedScript(() => {
       }
 
       await emitRuntimeSignal({
-        type: 'MIC_MIX_FAILED',
+        type: RuntimeMessageType.MIC_MIX_FAILED,
         reason: toNamedErrorMessage(error),
         fallback: liveMicTracks.length > 0 ? 'mic_only' : 'tab_only',
       });

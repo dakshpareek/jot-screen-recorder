@@ -1,95 +1,43 @@
 import type {
   AudioPreflightSnapshot,
   OrphanedSession,
-  RecoveryChunkCheck,
   ProcessingMetrics,
   RecordingSnapshot,
   RecordingState,
-  SystemAudioStatus,
+  RecoveryChunkCheck,
   ValidationResult,
 } from '@/lib/recording';
+import type {
+  AudioSource,
+  MicMixFailedMessage,
+  MicPreflightResponse,
+  OffscreenEventMessage,
+  OffscreenResponse,
+  RecoveryInspectResponse,
+  StorageSignalMessage,
+  SystemAudioSignalMessage,
+} from '@/lib/messages';
+import { OffscreenEventType, RuntimeMessageType } from '@/lib/messages';
+import { OffscreenClient } from './background/services/offscreen-client';
+import {
+  loadPersistedContext,
+  savePersistedContext,
+  type PersistedContext,
+} from './background/state/persisted-context';
+import { ALLOWED_TRANSITIONS } from './background/state/transitions';
+import {
+  createSessionId,
+  delay,
+  normalizeAudioSource,
+  normalizeMicDeviceId,
+  normalizeSystemAudioStatus,
+  toErrorMessage,
+} from './background/utils';
 
-const CONTEXT_KEY = 'phase2-recording-context';
-
-interface PersistedContext {
-  state: RecordingState;
-  sessionId: string | null;
-  recordingStartTime: number | null;
-  chunkCount: number;
-  processingProgress: number | null;
-  errorMessage: string | null;
-  micWarningMessage: string | null;
-  storageWarningMessage: string | null;
-  outputFileName: string | null;
-  validation: ValidationResult | null;
-  processingMetrics: ProcessingMetrics | null;
-  audioPreflight: AudioPreflightSnapshot;
-  orphanedSessions: OrphanedSession[];
-  recoverySessionId: string | null;
-  recoveryChunks: RecoveryChunkCheck[];
-}
-
-type OffscreenResponse = {
-  ok: boolean;
-  error?: string;
-  outputUrl?: string;
-  fileName?: string;
-  validation?: ValidationResult;
-};
-
-type OffscreenEventMessage = {
-  type: 'OFFSCREEN_EVENT';
-  event:
-    | 'CHUNK_WRITTEN'
-    | 'FINAL_CHUNK_WRITTEN'
-    | 'PROCESS_PROGRESS'
-    | 'PROCESS_METRICS'
-    | 'ERROR';
-  chunkCount?: number;
-  progress?: number;
-  error?: string;
-  metrics?: ProcessingMetrics;
-};
-
-type MicPreflightResponse = {
-  ok: boolean;
-  level?: number;
-  deviceLabel?: string | null;
-  error?: string;
-};
-
-type RecoveryInspectResponse = {
-  ok: boolean;
-  error?: string;
-  chunks?: RecoveryChunkCheck[];
-};
-
-type SystemAudioSignalMessage = {
-  type: 'SYSTEM_AUDIO_OK' | 'SYSTEM_AUDIO_SILENT' | 'SYSTEM_AUDIO_ABSENT';
-  level?: number;
-  error?: string;
-};
-
-type StorageSignalMessage = {
-  type: 'LOW_STORAGE_WARNING' | 'AUTO_STOP_LOW_STORAGE';
-  availableMB?: number;
-};
-
-type MicMixFailedMessage = {
-  type: 'MIC_MIX_FAILED';
-  reason?: string;
-  fallback?: 'mic_only' | 'tab_only';
-};
-
-type AudioSource = 'both' | 'mic' | 'tab' | 'silent';
 type RawDownloadItem = {
   url: string;
   filename: string;
 };
-
-const OFFSCREEN_PING_INITIAL_INTERVAL_MS = 50;
-const OFFSCREEN_PING_MAX_INTERVAL_MS = 400;
-const OFFSCREEN_PING_TIMEOUT_MS = 10_000;
 const PREFLIGHT_RESULT_MIN_VISIBLE_MS = 1_500;
 
 const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
@@ -101,21 +49,6 @@ const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
   systemAudioLevel: null,
   systemAudioMessage: null,
   needsSystemAudioDecision: false,
-};
-
-const ALLOWED_TRANSITIONS: Record<RecordingState, RecordingState[]> = {
-  idle: ['preflight', 'error'],
-  preflight: ['armed', 'preflight_error', 'error'],
-  preflight_error: ['idle', 'preflight', 'error'],
-  armed: ['recording', 'preflight_error', 'idle', 'error'],
-  recording: ['audio_warning', 'stopping', 'error'],
-  audio_warning: ['recording', 'stopping', 'error'],
-  stopping: ['processing', 'error'],
-  processing: ['validating', 'error'],
-  validating: ['done', 'recovery', 'error'],
-  done: ['idle', 'preflight', 'error'],
-  recovery: ['idle', 'preflight', 'error'],
-  error: ['idle', 'preflight'],
 };
 
 let state: RecordingState = 'idle';
@@ -135,28 +68,31 @@ let orphanedSessions: OrphanedSession[] = [];
 let recoverySessionId: string | null = null;
 let recoveryChunks: RecoveryChunkCheck[] = [];
 let processingPipelineRunning = false;
-let offscreenReady = false;
 let recordingTabId: number | null = null;
 let activeAudioSource: AudioSource = 'both';
+let selectedMicDeviceId: string | null = null;
+const offscreenClient = new OffscreenClient();
 
 export default defineBackground(() => {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message?.type) return;
 
-    if (message.type === 'GET_STATE') {
+    if (message.type === RuntimeMessageType.GET_STATE) {
       sendResponse(buildSnapshot());
       return;
     }
 
-    if (message.type === 'START') {
+    if (message.type === RuntimeMessageType.START) {
       const requestedAudioSource = normalizeAudioSource(message.audioSource);
-      void handleStart(requestedAudioSource).then(sendResponse);
+      const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
+      void handleStart(requestedAudioSource, requestedMicDeviceId).then(sendResponse);
       return true;
     }
 
-    if (message.type === 'PREPARE_START') {
+    if (message.type === RuntimeMessageType.PREPARE_START) {
       const includeMic = message.includeMic !== false;
-      void handlePrepareStart(includeMic)
+      const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
+      void handlePrepareStart(includeMic, requestedMicDeviceId)
         .then(sendResponse)
         .catch((error) => {
           errorMessage = toErrorMessage(error);
@@ -170,52 +106,53 @@ export default defineBackground(() => {
       return true;
     }
 
-    if (message.type === 'RUN_MIC_CHECK') {
-      void handleRunMicCheck().then(sendResponse);
+    if (message.type === RuntimeMessageType.RUN_MIC_CHECK) {
+      const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
+      void handleRunMicCheck(requestedMicDeviceId).then(sendResponse);
       return true;
     }
 
-    if (message.type === 'RELEASE_MIC_CHECK') {
+    if (message.type === RuntimeMessageType.RELEASE_MIC_CHECK) {
       void handleReleaseMicCheck().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'CANCEL_START') {
+    if (message.type === RuntimeMessageType.CANCEL_START) {
       void handleCancelStart().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'STOP') {
+    if (message.type === RuntimeMessageType.STOP) {
       void handleStop().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'DOWNLOAD') {
+    if (message.type === RuntimeMessageType.DOWNLOAD) {
       void handleDownload().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'RESET_TO_IDLE') {
+    if (message.type === RuntimeMessageType.RESET_TO_IDLE) {
       void handleResetToIdle().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'DOWNLOAD_RAW_CHUNKS') {
+    if (message.type === RuntimeMessageType.DOWNLOAD_RAW_CHUNKS) {
       void handleDownloadRawChunks(String(message.sessionId ?? '')).then(sendResponse);
       return true;
     }
 
-    if (message.type === 'SYSTEM_AUDIO_CONTINUE') {
+    if (message.type === RuntimeMessageType.SYSTEM_AUDIO_CONTINUE) {
       void handleSystemAudioContinue().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'SYSTEM_AUDIO_STOP_RETRY') {
+    if (message.type === RuntimeMessageType.SYSTEM_AUDIO_STOP_RETRY) {
       void handleSystemAudioStopRetry().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'RECOVER_ORPHAN') {
+    if (message.type === RuntimeMessageType.RECOVER_ORPHAN) {
       const chunkIndexes = Array.isArray(message.chunkIndexes)
         ? message.chunkIndexes
             .map((value: unknown) => Number(value))
@@ -225,49 +162,52 @@ export default defineBackground(() => {
       return true;
     }
 
-    if (message.type === 'DISCARD_ORPHAN') {
+    if (message.type === RuntimeMessageType.DISCARD_ORPHAN) {
       void handleDiscardOrphan(String(message.sessionId ?? '')).then(sendResponse);
       return true;
     }
 
-    if (message.type === 'REFRESH_ORPHANS') {
+    if (message.type === RuntimeMessageType.REFRESH_ORPHANS) {
       void handleRefreshOrphans().then(sendResponse);
       return true;
     }
 
-    if (message.type === 'OPEN_MIC_SETTINGS') {
+    if (message.type === RuntimeMessageType.OPEN_MIC_SETTINGS) {
       void chrome.tabs.create({ url: 'chrome://settings/content/microphone' }).then(() => {
         sendResponse({ ok: true });
       });
       return true;
     }
 
-    if (message.type === 'OFFSCREEN_EVENT') {
+    if (message.type === RuntimeMessageType.OFFSCREEN_EVENT) {
       void handleOffscreenEvent(message as OffscreenEventMessage).then(sendResponse);
       return true;
     }
 
-    if (message.type === 'MIC_MIX_FAILED') {
+    if (message.type === RuntimeMessageType.MIC_MIX_FAILED) {
       void handleMicMixFailed(message as MicMixFailedMessage).then(sendResponse);
       return true;
     }
 
     if (
-      message.type === 'SYSTEM_AUDIO_OK' ||
-      message.type === 'SYSTEM_AUDIO_SILENT' ||
-      message.type === 'SYSTEM_AUDIO_ABSENT'
+      message.type === RuntimeMessageType.SYSTEM_AUDIO_OK ||
+      message.type === RuntimeMessageType.SYSTEM_AUDIO_SILENT ||
+      message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
     ) {
       void handleSystemAudioSignal(message as SystemAudioSignalMessage).then(sendResponse);
       return true;
     }
 
-    if (message.type === 'LOW_STORAGE_WARNING' || message.type === 'AUTO_STOP_LOW_STORAGE') {
+    if (
+      message.type === RuntimeMessageType.LOW_STORAGE_WARNING ||
+      message.type === RuntimeMessageType.AUTO_STOP_LOW_STORAGE
+    ) {
       void handleStorageSignal(message as StorageSignalMessage).then(sendResponse);
       return true;
     }
 
-    if (message.type === 'OFFSCREEN_READY') {
-      offscreenReady = true;
+    if (message.type === RuntimeMessageType.OFFSCREEN_READY) {
+      offscreenClient.markReady();
       sendResponse({ ok: true });
       return;
     }
@@ -290,20 +230,6 @@ async function bootstrap() {
   await broadcastSnapshot();
 }
 
-function normalizeSystemAudioStatus(value: unknown): SystemAudioStatus {
-  if (value === 'pending' || value === 'ok' || value === 'absent' || value === 'silent') {
-    return value;
-  }
-  return 'idle';
-}
-
-function normalizeAudioSource(value: unknown): AudioSource {
-  if (value === 'mic' || value === 'tab' || value === 'silent') {
-    return value;
-  }
-  return 'both';
-}
-
 function normalizeAudioPreflight(value: Partial<AudioPreflightSnapshot> | null | undefined) {
   return {
     ...DEFAULT_AUDIO_PREFLIGHT,
@@ -314,9 +240,7 @@ function normalizeAudioPreflight(value: Partial<AudioPreflightSnapshot> | null |
 
 async function hydrateContext() {
   try {
-    const stored = (await chrome.storage.local.get(CONTEXT_KEY))[CONTEXT_KEY] as
-      | PersistedContext
-      | undefined;
+    const stored = await loadPersistedContext();
     if (!stored) return;
 
     sessionId = stored.sessionId ?? null;
@@ -353,11 +277,11 @@ async function reconcileWithOffscreen() {
   if (!['recording', 'audio_warning', 'stopping', 'processing'].includes(state)) return;
 
   try {
-    const status = await sendToOffscreen<{
+    const status = await offscreenClient.send<{
       alive?: boolean;
       chunkCount?: number;
       isRecording?: boolean;
-    }>({ type: 'OFFSCREEN_STATUS' });
+    }>({ type: RuntimeMessageType.OFFSCREEN_STATUS });
 
     if (!status?.alive) {
       errorMessage = 'Offscreen recorder is unavailable.';
@@ -381,9 +305,9 @@ function hasActiveRuntimeRecording() {
 
 async function refreshOrphanedSessions() {
   try {
-    await ensureOffscreenReadyWithRetry();
-    const result = await sendToOffscreen<{ ok?: boolean; sessions?: OrphanedSession[]; error?: string }>({
-      type: 'OFFSCREEN_SCAN_ORPHANS',
+    await offscreenClient.ensureReadyWithRetry(delay);
+    const result = await offscreenClient.send<{ ok?: boolean; sessions?: OrphanedSession[]; error?: string }>({
+      type: RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS,
     });
 
     const sessions = Array.isArray(result?.sessions) ? result.sessions : [];
@@ -482,13 +406,13 @@ async function persistContext() {
     recoverySessionId,
     recoveryChunks,
   };
-  await chrome.storage.local.set({ [CONTEXT_KEY]: payload });
+  await savePersistedContext(payload);
 }
 
 async function broadcastSnapshot() {
   try {
     await chrome.runtime.sendMessage({
-      type: 'STATE_CHANGE',
+      type: RuntimeMessageType.STATE_CHANGE,
       snapshot: buildSnapshot(),
     });
   } catch {
@@ -512,7 +436,7 @@ async function syncRecordingBanner(next: RecordingState) {
 async function sendRecordingBanner(tabId: number, visible: boolean) {
   try {
     await chrome.tabs.sendMessage(tabId, {
-      type: 'RECORDING_BANNER',
+      type: RuntimeMessageType.RECORDING_BANNER,
       visible,
     });
     return true;
@@ -580,14 +504,16 @@ function resetAttemptMetadata() {
   recoveryChunks = [];
   audioPreflight = { ...DEFAULT_AUDIO_PREFLIGHT };
   activeAudioSource = 'both';
+  selectedMicDeviceId = null;
 }
 
-async function handleStart(audioSource: AudioSource = 'both') {
+async function handleStart(audioSource: AudioSource = 'both', micDeviceId: string | null = null) {
   if (state !== 'armed') {
     return { ok: false, error: `Cannot start from state "${state}"`, snapshot: buildSnapshot() };
   }
 
   activeAudioSource = audioSource;
+  selectedMicDeviceId = audioSource === 'both' || audioSource === 'mic' ? micDeviceId : null;
   const nextSessionId = createSessionId();
   resetSessionMetadata(nextSessionId);
 
@@ -601,11 +527,12 @@ async function handleStart(audioSource: AudioSource = 'both') {
     }
 
     recordingTabId = targetTabId;
-    const result = await sendToOffscreen<OffscreenResponse>({
-      type: 'OFFSCREEN_START',
+    const result = await offscreenClient.send<OffscreenResponse>({
+      type: RuntimeMessageType.OFFSCREEN_START,
       sessionId: nextSessionId,
       streamId,
       audioSource,
+      micDeviceId: selectedMicDeviceId,
     });
 
     if (!result?.ok) {
@@ -635,7 +562,7 @@ async function handleStart(audioSource: AudioSource = 'both') {
   }
 }
 
-async function handlePrepareStart(includeMic = true) {
+async function handlePrepareStart(includeMic = true, micDeviceId: string | null = null) {
   try {
     if (state === 'armed') {
       return { ok: true, snapshot: buildSnapshot() };
@@ -660,9 +587,10 @@ async function handlePrepareStart(includeMic = true) {
     setState('preflight');
     const preflightStartedAt = Date.now();
 
-    await ensureOffscreenReadyWithRetry();
+    await offscreenClient.ensureReadyWithRetry(delay);
 
     if (!includeMic) {
+      selectedMicDeviceId = null;
       audioPreflight = {
         ...audioPreflight,
         micChecked: true,
@@ -681,7 +609,8 @@ async function handlePrepareStart(includeMic = true) {
       return { ok: true, snapshot: buildSnapshot() };
     }
 
-    const micPreflight = await runMicPreflight();
+    selectedMicDeviceId = micDeviceId;
+    const micPreflight = await runMicPreflight(selectedMicDeviceId);
     audioPreflight = {
       ...audioPreflight,
       micChecked: true,
@@ -716,11 +645,13 @@ async function handlePrepareStart(includeMic = true) {
   }
 }
 
-async function runMicPreflight(): Promise<MicPreflightResponse> {
+async function runMicPreflight(micDeviceId: string | null = null): Promise<MicPreflightResponse> {
   try {
-    const result = await sendToOffscreen<MicPreflightResponse>({
-      type: 'MIC_PREFLIGHT',
-    });
+    const payload: Record<string, unknown> = { type: RuntimeMessageType.MIC_PREFLIGHT };
+    if (micDeviceId) {
+      payload.micDeviceId = micDeviceId;
+    }
+    const result = await offscreenClient.send<MicPreflightResponse>(payload);
     if (!result?.ok) {
       return {
         ok: false,
@@ -741,7 +672,7 @@ async function runMicPreflight(): Promise<MicPreflightResponse> {
   }
 }
 
-async function handleRunMicCheck() {
+async function handleRunMicCheck(micDeviceId: string | null = null) {
   if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
     return {
       ok: false,
@@ -750,7 +681,8 @@ async function handleRunMicCheck() {
     };
   }
 
-  const micPreflight = await runMicPreflight();
+  selectedMicDeviceId = micDeviceId;
+  const micPreflight = await runMicPreflight(selectedMicDeviceId);
   audioPreflight = {
     ...audioPreflight,
     micChecked: true,
@@ -790,8 +722,10 @@ async function handleReleaseMicCheck() {
 
 async function releasePreflightMicHold() {
   try {
-    await ensureOffscreenReadyWithRetry();
-    await sendToOffscreen<{ ok?: boolean }>({ type: 'OFFSCREEN_RELEASE_PREFLIGHT_MIC' });
+    await offscreenClient.ensureReadyWithRetry(delay);
+    await offscreenClient.send<{ ok?: boolean }>({
+      type: RuntimeMessageType.OFFSCREEN_RELEASE_PREFLIGHT_MIC,
+    });
   } catch {
     // Best-effort cleanup for any preflight-held mic stream.
   }
@@ -845,8 +779,8 @@ async function handleStop() {
   setState('stopping');
 
   try {
-    const result = await sendToOffscreen<OffscreenResponse>({
-      type: 'OFFSCREEN_STOP',
+    const result = await offscreenClient.send<OffscreenResponse>({
+      type: RuntimeMessageType.OFFSCREEN_STOP,
       sessionId,
     });
 
@@ -907,13 +841,13 @@ async function handleDownloadRawChunks(targetSessionId: string) {
   }
 
   try {
-    await ensureOffscreenReadyWithRetry();
-    const result = await sendToOffscreen<{
+    await offscreenClient.ensureReadyWithRetry(delay);
+    const result = await offscreenClient.send<{
       ok?: boolean;
       error?: string;
       items?: RawDownloadItem[];
     }>({
-      type: 'OFFSCREEN_DOWNLOAD_RAW_CHUNKS',
+      type: RuntimeMessageType.OFFSCREEN_DOWNLOAD_RAW_CHUNKS,
       sessionId: targetSessionId,
     });
 
@@ -976,7 +910,7 @@ async function handleSystemAudioSignal(message: SystemAudioSignalMessage) {
     return { ok: true };
   }
 
-  if (message.type === 'SYSTEM_AUDIO_OK') {
+  if (message.type === RuntimeMessageType.SYSTEM_AUDIO_OK) {
     audioPreflight = {
       ...audioPreflight,
       systemAudioStatus: 'ok',
@@ -994,13 +928,13 @@ async function handleSystemAudioSignal(message: SystemAudioSignalMessage) {
   }
 
   const warningMessage =
-    message.type === 'SYSTEM_AUDIO_ABSENT'
+    message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
       ? 'System audio track is missing. Recording continues with microphone.'
       : 'System audio appears silent. Recording continues with microphone.';
 
   audioPreflight = {
     ...audioPreflight,
-    systemAudioStatus: message.type === 'SYSTEM_AUDIO_ABSENT' ? 'absent' : 'silent',
+    systemAudioStatus: message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT ? 'absent' : 'silent',
     systemAudioLevel: typeof message.level === 'number' ? message.level : null,
     // Non-blocking in simplified UX: only show informational warning when mic is enabled.
     systemAudioMessage: activeAudioSource === 'both' ? warningMessage : null,
@@ -1029,7 +963,7 @@ async function handleSystemAudioContinue() {
   errorMessage = null;
 
   try {
-    await sendToOffscreen<{ ok?: boolean }>({ type: 'OFFSCREEN_RESUME' });
+    await offscreenClient.send<{ ok?: boolean }>({ type: RuntimeMessageType.OFFSCREEN_RESUME });
   } catch {
     // Resume is best-effort; keep the UI state consistent with user decision.
   }
@@ -1058,7 +992,7 @@ async function handleStorageSignal(message: StorageSignalMessage) {
       ? Math.max(0, message.availableMB)
       : null;
 
-  if (message.type === 'LOW_STORAGE_WARNING') {
+  if (message.type === RuntimeMessageType.LOW_STORAGE_WARNING) {
     storageWarningMessage =
       availableMB === null
         ? 'Low storage detected while recording.'
@@ -1143,9 +1077,9 @@ async function handleRecoverOrphan(targetSessionId: string, chunkIndexes?: numbe
 
     let selectedChunkIndexes = chunkIndexes;
     if (!Array.isArray(selectedChunkIndexes) || !selectedChunkIndexes.length) {
-      await ensureOffscreenReadyWithRetry();
-      const inspect = await sendToOffscreen<RecoveryInspectResponse>({
-        type: 'OFFSCREEN_RECOVERY_INSPECT',
+      await offscreenClient.ensureReadyWithRetry(delay);
+      const inspect = await offscreenClient.send<RecoveryInspectResponse>({
+        type: RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT,
         sessionId: targetSessionId,
       });
 
@@ -1229,9 +1163,9 @@ async function handleDiscardOrphan(targetSessionId: string) {
   }
 
   try {
-    await ensureOffscreenReadyWithRetry();
-    const result = await sendToOffscreen<{ ok?: boolean; error?: string }>({
-      type: 'OFFSCREEN_CLEAR_SESSION',
+    await offscreenClient.ensureReadyWithRetry(delay);
+    const result = await offscreenClient.send<{ ok?: boolean; error?: string }>({
+      type: RuntimeMessageType.OFFSCREEN_CLEAR_SESSION,
       sessionId: targetSessionId,
     });
 
@@ -1264,7 +1198,7 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
     await broadcastSnapshot();
   }
 
-  if (message.event === 'PROCESS_PROGRESS' && typeof message.progress === 'number') {
+  if (message.event === OffscreenEventType.PROCESS_PROGRESS && typeof message.progress === 'number') {
     const nextProgress = Math.max(0, Math.min(100, Math.floor(message.progress)));
     const currentProgress = typeof processingProgress === 'number' ? processingProgress : 0;
     processingProgress = Math.max(currentProgress, nextProgress);
@@ -1273,20 +1207,20 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
     return { ok: true };
   }
 
-  if (message.event === 'PROCESS_METRICS' && message.metrics) {
+  if (message.event === OffscreenEventType.PROCESS_METRICS && message.metrics) {
     processingMetrics = message.metrics;
     await persistContext();
     await broadcastSnapshot();
     return { ok: true };
   }
 
-  if (message.event === 'ERROR') {
+  if (message.event === OffscreenEventType.ERROR) {
     errorMessage = message.error ?? 'Offscreen pipeline error';
     setState('error');
     return { ok: true };
   }
 
-  if (message.event === 'FINAL_CHUNK_WRITTEN') {
+  if (message.event === OffscreenEventType.FINAL_CHUNK_WRITTEN) {
     if (state === 'stopping') {
       // Critical transition: stopping -> processing happens only after OPFS confirms final chunk write.
       await runProcessingPipeline();
@@ -1313,7 +1247,7 @@ async function handleMicMixFailed(message: MicMixFailedMessage) {
   audioPreflight = {
     ...audioPreflight,
     micOk: message.fallback === 'mic_only',
-    micError: message.reason ?? 'MIC_MIX_FAILED',
+    micError: message.reason ?? RuntimeMessageType.MIC_MIX_FAILED,
   };
   await persistContext();
   await broadcastSnapshot();
@@ -1341,14 +1275,14 @@ async function runProcessingPipeline(options?: {
     setState('processing');
 
     const processPayload: Record<string, unknown> = {
-      type: 'OFFSCREEN_PROCESS',
+      type: RuntimeMessageType.OFFSCREEN_PROCESS,
       sessionId: targetSessionId,
     };
     if (Array.isArray(options?.chunkIndexes) && options.chunkIndexes.length) {
       processPayload.chunkIndexes = options.chunkIndexes;
     }
 
-    const processResult = await sendToOffscreen<OffscreenResponse>(processPayload);
+    const processResult = await offscreenClient.send<OffscreenResponse>(processPayload);
 
     if (!processResult?.ok || !processResult.outputUrl) {
       errorMessage = processResult?.error ?? 'MP4 processing failed';
@@ -1367,8 +1301,8 @@ async function runProcessingPipeline(options?: {
 
     const validationResult =
       validation ??
-      (await sendToOffscreen<ValidationResult>({
-        type: 'OFFSCREEN_VALIDATE',
+      (await offscreenClient.send<ValidationResult>({
+        type: RuntimeMessageType.OFFSCREEN_VALIDATE,
       }));
 
     validation = validationResult ?? null;
@@ -1380,8 +1314,8 @@ async function runProcessingPipeline(options?: {
       let inspectError: string | null = null;
 
       try {
-        const inspect = await sendToOffscreen<RecoveryInspectResponse>({
-          type: 'OFFSCREEN_RECOVERY_INSPECT',
+        const inspect = await offscreenClient.send<RecoveryInspectResponse>({
+          type: RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT,
           sessionId: targetSessionId,
         });
 
@@ -1423,53 +1357,6 @@ async function runProcessingPipeline(options?: {
   }
 }
 
-async function ensureOffscreenDoc() {
-  if (await chrome.offscreen.hasDocument()) return;
-
-  offscreenReady = false;
-
-  await chrome.offscreen.createDocument({
-    url: chrome.runtime.getURL('offscreen-page.html'),
-    reasons: [
-      'DISPLAY_MEDIA' as chrome.offscreen.Reason,
-      'USER_MEDIA' as chrome.offscreen.Reason,
-    ],
-    justification: 'MediaRecorder for screen capture',
-  });
-}
-
-async function recreateOffscreenDoc() {
-  try {
-    if (await chrome.offscreen.hasDocument()) {
-      await chrome.offscreen.closeDocument();
-    }
-  } catch {
-    // Ignore close failures and retry creation.
-  }
-
-  offscreenReady = false;
-  await ensureOffscreenDoc();
-}
-
-async function ensureOffscreenReadyWithRetry() {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      if (attempt === 0) {
-        await ensureOffscreenDoc();
-      } else {
-        await recreateOffscreenDoc();
-      }
-      await waitForOffscreenReady();
-      return;
-    } catch (error) {
-      lastError = error;
-      await delay(150 * (attempt + 1));
-    }
-  }
-  throw lastError instanceof Error ? lastError : new Error('Unable to initialize offscreen recorder');
-}
-
 async function getStartTargetTabId() {
   const [activeTab] = await chrome.tabs.query({
     active: true,
@@ -1493,57 +1380,4 @@ async function getTabCaptureStreamId(targetTabId: number): Promise<string> {
       resolve(streamId);
     });
   });
-}
-
-async function waitForOffscreenReady(timeoutMs = OFFSCREEN_PING_TIMEOUT_MS) {
-  if (offscreenReady) return;
-
-  const deadline = Date.now() + timeoutMs;
-  let delayMs = OFFSCREEN_PING_INITIAL_INTERVAL_MS;
-
-  while (Date.now() < deadline) {
-    if (offscreenReady) return;
-
-    try {
-      const status = await sendToOffscreen<{ alive?: boolean }>({ type: 'OFFSCREEN_STATUS' });
-      if (status?.alive) {
-        offscreenReady = true;
-        return;
-      }
-    } catch {
-      // Message port is not ready yet; retry with backoff.
-    }
-
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) break;
-
-    await delay(Math.min(delayMs, remainingMs));
-    delayMs = Math.min(delayMs * 2, OFFSCREEN_PING_MAX_INTERVAL_MS);
-  }
-
-  throw new Error(`Offscreen document did not become ready within ${timeoutMs}ms`);
-}
-
-async function sendToOffscreen<T>(message: Record<string, unknown>): Promise<T> {
-  return (await chrome.runtime.sendMessage(message)) as T;
-}
-
-function createSessionId() {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  const hh = String(now.getHours()).padStart(2, '0');
-  const mm = String(now.getMinutes()).padStart(2, '0');
-  const ss = String(now.getSeconds()).padStart(2, '0');
-  return `rec_${y}${m}${d}_${hh}${mm}${ss}`;
-}
-
-function delay(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
-
-function toErrorMessage(error: unknown) {
-  if (error instanceof Error) return error.message;
-  return typeof error === 'string' ? error : 'Unknown error';
 }
