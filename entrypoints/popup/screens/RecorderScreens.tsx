@@ -130,12 +130,16 @@ export function Header({
   const isProcessing = state === 'processing' || state === 'validating';
   const isDone = state === 'done';
 
-  const dotClass = isRecording ? 'recording' : isProcessing ? 'processing' : isDone ? 'done' : '';
-
   return (
     <div className="rk-header">
       <div className="rk-header-left">
-        <div className={`rk-header-dot ${dotClass}`} />
+        <div className="rk-logo-mark">
+          <svg viewBox="0 0 12 12">
+            <circle cx="6" cy="6" r="3.5" />
+            <line x1="6" y1="2.5" x2="6" y2="6" />
+            <line x1="6" y1="6" x2="8.5" y2="6" />
+          </svg>
+        </div>
         <span className="rk-header-name">RecordKit</span>
       </div>
       <div className="rk-header-right">
@@ -174,6 +178,10 @@ export function IdleScreen({
   onRecoverOrphan,
   onDiscardOrphan,
   storageWarning,
+  showSettings,
+  onSettingsClose,
+  quality,
+  onQualityChange,
 }: {
   micControl: ReactNode;
   onStart: () => void;
@@ -184,9 +192,13 @@ export function IdleScreen({
   onRecoverOrphan: (id: string) => void;
   onDiscardOrphan: (id: string) => void;
   storageWarning: string | null;
+  showSettings: boolean;
+  onSettingsClose: () => void;
+  quality: '720p' | '1080p';
+  onQualityChange: (q: '720p' | '1080p') => void;
 }) {
   return (
-    <>
+    <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1 }}>
       <div className="rk-body">
         {orphan && (
           <div className="rk-orphan-card">
@@ -219,29 +231,37 @@ export function IdleScreen({
         )}
 
         {!orphan && (
-          <div className="rk-idle-center">
-            <div className="rk-idle-icon">
-              <svg
-                width="22"
-                height="22"
-                viewBox="0 0 22 22"
-                fill="none"
-                stroke="rgba(255,255,255,0.3)"
-                strokeWidth="1.4"
-                strokeLinecap="round">
-                <circle cx="11" cy="11" r="7.5" />
-                <line x1="11" y1="6" x2="11" y2="11" />
-                <line x1="11" y1="11" x2="14.5" y2="11" />
-                <circle cx="11" cy="11" r="1.2" fill="rgba(255,255,255,0.3)" stroke="none" />
-              </svg>
+          <div className="rk-hero">
+            <div className="rk-hero-eyebrow">
+              <div className="rk-hero-eyebrow-dot" />
+              Your recordings are always safe
             </div>
-            <div className="rk-idle-title">
+            <div className="rk-hero-title">
               Record anything.
               <br />
-              Lose nothing.
+              <em>Lose nothing.</em>
             </div>
-            <div className="rk-idle-sub">
-              Every recording is auto-saved in 10-second chunks. Your data never leaves your device.
+            <div className="rk-outcomes">
+              <div className="rk-outcome rk-outcome-green">
+                <svg viewBox="0 0 10 10" fill="none" strokeWidth="1.6" strokeLinecap="round">
+                  <path d="M2 5l2 2 4-4" />
+                </svg>
+                Never lose a recording
+              </div>
+              <div className="rk-outcome rk-outcome-blue">
+                <svg viewBox="0 0 10 10" fill="none" strokeWidth="1.5" strokeLinecap="round">
+                  <rect x="2" y="4.5" width="6" height="4.5" rx="1" />
+                  <path d="M3.5 4.5V3a1.5 1.5 0 013 0v1.5" />
+                </svg>
+                Stays on your device
+              </div>
+              <div className="rk-outcome rk-outcome-amber">
+                <svg viewBox="0 0 10 10" fill="none" strokeWidth="1.5" strokeLinecap="round">
+                  <rect x="1" y="2" width="8" height="6" rx="1" />
+                  <polygon points="3.5,3.5 3.5,6.5 7,5" />
+                </svg>
+                Plays anywhere
+              </div>
             </div>
           </div>
         )}
@@ -265,7 +285,37 @@ export function IdleScreen({
         </button>
       </div>
       <Footer label="Ready to record" />
-    </>
+
+      {showSettings && (
+        <div className="rk-settings-overlay">
+          <div className="rk-settings-header">
+            <span className="rk-settings-title">Settings</span>
+            <button className="rk-settings-close" onClick={onSettingsClose}>
+              <svg viewBox="0 0 10 10" fill="none">
+                <path d="M1 1l8 8M9 1L1 9" stroke="currentColor" />
+              </svg>
+            </button>
+          </div>
+          <div className="rk-settings-body">
+            <div className="rk-settings-section">Recording quality</div>
+            <div className="rk-quality-grid">
+              <button
+                className={`rk-quality-btn${quality === '720p' ? ' active' : ''}`}
+                onClick={() => onQualityChange('720p')}>
+                <div className="rk-quality-val">720p</div>
+                <div className="rk-quality-sub">Smaller file size</div>
+              </button>
+              <button
+                className={`rk-quality-btn${quality === '1080p' ? ' active' : ''}`}
+                onClick={() => onQualityChange('1080p')}>
+                <div className="rk-quality-val">1080p</div>
+                <div className="rk-quality-sub">Recommended</div>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

@@ -63,6 +63,8 @@ export default function App() {
   const { isBusy, send } = useRecorderCommands(setSnapshot);
 
   const [includeMic, setIncludeMic] = useState(false);
+  const [quality, setQuality] = useState<'720p' | '1080p'>('1080p');
+  const [showSettings, setShowSettings] = useState(false);
   const [selectedMicDeviceId, setSelectedMicDeviceId] = useState('default');
   const [selectedRecoveryChunks, setSelectedRecoveryChunks] = useState<number[]>([]);
   const [processingStartedAtMs, setProcessingStartedAtMs] = useState<number | null>(null);
@@ -255,7 +257,7 @@ export default function App() {
   }
 
   function handleSettings() {
-    void chrome.runtime.openOptionsPage?.();
+    setShowSettings(true);
   }
 
   async function handleRecordAgain() {
@@ -319,6 +321,14 @@ export default function App() {
           onRecoverOrphan={handleRecoverOrphan}
           onDiscardOrphan={handleDiscardOrphan}
           storageWarning={snapshot.storageWarningMessage}
+          showSettings={showSettings}
+          onSettingsClose={() => setShowSettings(false)}
+          quality={quality}
+          onQualityChange={(q) => {
+            setQuality(q);
+            setShowSettings(false);
+            // TODO: persist to chrome.storage.local and pass to recording pipeline
+          }}
         />
       ) : null}
 
