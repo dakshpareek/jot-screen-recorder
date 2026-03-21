@@ -1,23 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-type MicToggleStatus = 'off' | 'checking' | 'ok' | 'waiting' | 'denied' | 'in_use';
-
-type MicCheckResponse = {
-  ok?: boolean;
-  error?: string;
-  level?: number;
-  deviceLabel?: string | null;
-};
+type MicToggleStatus = 'off' | 'checking' | 'ok' | 'waiting' | 'denied' | 'in_use' | 'not_found';
 
 export interface MicToggleCardProps {
   includeMic: boolean;
   onMicChange: (enabled: boolean) => void;
   onReadyChange?: (canStart: boolean) => void;
+  onMicStreamReady?: (stream: MediaStream | null) => void;
 }
 
 const MIN_CHECK_VISIBLE_MS = 1_800;
 const DEVICE_POLL_MS = 2_000;
-const BAR_BASE = [5, 9, 13, 16, 14, 11, 18, 9, 15, 19, 7, 16, 10, 13];
+const BAR_BASE = [5, 9, 7, 12, 8, 11, 6, 10];
+const BIN_RANGES: [number, number][] = [
+  [0, 1],
+  [1, 2],
+  [2, 3],
+  [3, 4],
+  [4, 5],
+  [5, 7],
+  [7, 11],
+  [11, 18],
+];
+const ATTACK = 0.75;
+const DECAY = 0.1;
+const SILENCE = 0.025;
+let animTick = 0;
 
 const STYLES = `
   .rk-mic-card {
@@ -84,53 +92,76 @@ const STYLES = `
   }
   @keyframes rk-mic-spin { to { transform: rotate(360deg); } }
 
-  .rk-mic-device {
-    padding: 6px 8px;
-    border-radius: 7px;
-    border: 1px solid rgba(48,209,88,0.25);
-    background: rgba(48,209,88,0.08);
-    font-size: 11px;
-    color: var(--rk-t);
+  .rk-device-row {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-  }
-  .rk-mic-device-badge {
-    font-size: 9px;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    color: var(--rk-grn);
+    gap: 8px;
+    background: #1c1c20;
+    border: 1px solid rgba(48,209,88,0.25);
+    border-radius: 8px;
+    padding: 7px 10px;
+    margin-bottom: 0;
   }
 
-  .rk-mic-level {
-    margin-top: 8px;
-    background: var(--rk-bg3);
-    border-radius: 7px;
-    padding: 6px 8px;
+  .rk-inline-bars {
     display: flex;
     align-items: center;
-    gap: 6px;
-  }
-  .rk-mic-bars {
-    display: flex;
-    align-items: flex-end;
-    gap: 2px;
+    gap: 1.5px;
     height: 14px;
+    flex-shrink: 0;
+  }
+
+  .rk-ib {
+    width: 2.5px;
+    border-radius: 1.5px;
+    background: rgba(48,209,88,0.2);
+    transition: height 0.06s ease, background 0.06s ease;
+    flex-shrink: 0;
+  }
+
+  .rk-ib.rk-ib-lit { background: #30d158; }
+
+  .rk-device-name {
+    font-size: 11px;
+    font-weight: 600;
+    color: #f0f0f2;
     flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .rk-mic-bar {
-    width: 3px;
-    border-radius: 1px;
-    background: #2e2e33;
+
+  .rk-device-select {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: #f0f0f2;
+    font-size: 11px;
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    cursor: pointer;
+    outline: none;
+    appearance: none;
+    -webkit-appearance: none;
+    min-width: 0;
+    background-image: url("data:image/svg+xml,%3Csvg width='9' height='5' viewBox='0 0 9 5' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l3.5 3.5L8 1' stroke='%2330d158' stroke-width='1.4' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0 center;
+    padding-right: 16px;
   }
-  .rk-mic-bar.on { background: var(--rk-grn); }
-  .rk-mic-level-text {
+
+  .rk-device-select option {
+    background: #1c1c20;
+    color: #f0f0f2;
+    font-weight: 400;
+  }
+
+  .rk-device-active {
     font-size: 9px;
-    color: var(--rk-t3);
-    font-family: 'JetBrains Mono', monospace;
-    min-width: 22px;
-    text-align: right;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: #30d158;
+    flex-shrink: 0;
   }
 
   .rk-mic-wait {
@@ -191,16 +222,6 @@ function wait(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-async function detectAudioInputLabel() {
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const first = devices.find((device) => device.kind === 'audioinput');
-    return first?.label || null;
-  } catch {
-    return null;
-  }
-}
-
 function useMicCardStyles() {
   useEffect(() => {
     const id = 'rk-mic-card-styles';
@@ -212,70 +233,219 @@ function useMicCardStyles() {
   }, []);
 }
 
-export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicToggleCardProps) {
+export function MicToggleCard({
+  includeMic,
+  onMicChange,
+  onReadyChange,
+  onMicStreamReady,
+}: MicToggleCardProps) {
   useMicCardStyles();
 
   const [status, setStatus] = useState<MicToggleStatus>(includeMic ? 'checking' : 'off');
   const [deviceName, setDeviceName] = useState('Microphone');
-  const [seedLevel, setSeedLevel] = useState(10);
-  const [bars, setBars] = useState<number[]>(BAR_BASE);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('default');
+  const [levelBars, setLevelBars] = useState<number[]>([5, 9, 7, 12, 8, 11, 6, 10]);
 
   const runTokenRef = useRef(0);
+  const streamRef = useRef<MediaStream | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const levelRafRef = useRef<number>(0);
 
-  const runMicCheck = useCallback(async () => {
+  const stopStream = useCallback(() => {
+    if (levelRafRef.current) {
+      cancelAnimationFrame(levelRafRef.current);
+      levelRafRef.current = 0;
+    }
+
+    analyserRef.current = null;
+
+    if (audioCtxRef.current) {
+      void audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+
+    onMicStreamReady?.(null);
+    setLevelBars([...BAR_BASE]);
+  }, [onMicStreamReady]);
+
+  const startLevelAnimation = useCallback((stream: MediaStream) => {
+    if (levelRafRef.current) {
+      cancelAnimationFrame(levelRafRef.current);
+      levelRafRef.current = 0;
+    }
+
+    if (audioCtxRef.current) {
+      void audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+
+    try {
+      const ctx = new AudioContext();
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 64;
+      ctx.createMediaStreamSource(stream).connect(analyser);
+      audioCtxRef.current = ctx;
+      analyserRef.current = analyser;
+
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      const smooth = new Float32Array(BIN_RANGES.length).fill(2);
+
+      const frame = () => {
+        analyser.getByteFrequencyData(data);
+        const rms = Math.sqrt(
+          data.reduce((acc, value) => acc + (value / 255) ** 2, 0) / data.length,
+        );
+        const isActive = rms > SILENCE;
+
+        setLevelBars(
+          BIN_RANGES.map(([rawLo, rawHi], i) => {
+            let target = 2;
+
+            if (!isActive) {
+              target = 2 + Math.sin(animTick * 0.06 + i * 1.1) * 0.7;
+            } else {
+              const lo = Math.max(0, Math.min(rawLo, data.length - 1));
+              const hi = Math.max(lo + 1, Math.min(rawHi, data.length));
+              let sum = 0;
+              for (let b = lo; b < hi; b += 1) {
+                sum += data[b];
+              }
+              const binEnergy = sum / ((hi - lo) * 255);
+              target = 2 + binEnergy * 11;
+            }
+
+            const lerpFactor = target > smooth[i] ? ATTACK : DECAY;
+            smooth[i] += (target - smooth[i]) * lerpFactor;
+            return Math.max(2, Math.min(13, smooth[i]));
+          }),
+        );
+
+        animTick += 1;
+        levelRafRef.current = requestAnimationFrame(frame);
+      };
+
+      levelRafRef.current = requestAnimationFrame(frame);
+    } catch {
+      // AudioContext blocked - bars stay static
+    }
+  }, []);
+
+  const checkMic = useCallback(async () => {
     const token = ++runTokenRef.current;
     setStatus('checking');
+    stopStream();
 
     const minDelay = wait(MIN_CHECK_VISIBLE_MS);
-    let response: MicCheckResponse | null = null;
+
     try {
-      response = (await chrome.runtime.sendMessage({ type: 'RUN_MIC_CHECK' })) as MicCheckResponse;
-    } catch {
-      response = { ok: false, error: 'MIC_CHECK_UNAVAILABLE' };
-    }
-    await minDelay;
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 44100,
+          channelCount: 1,
+        },
+      });
 
-    if (token !== runTokenRef.current) return;
+      await minDelay;
+      if (token !== runTokenRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
 
-    if (response?.ok) {
-      const nextLevel = typeof response.level === 'number' ? Math.max(2, Math.min(35, Math.round(response.level))) : 10;
-      setSeedLevel(nextLevel);
-      const nextLabel = response.deviceLabel || (await detectAudioInputLabel()) || 'Microphone';
-      if (token !== runTokenRef.current) return;
-      setDeviceName(nextLabel);
+      streamRef.current = stream;
+      onMicStreamReady?.(stream);
+
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const inputs = devices.filter((d) => d.kind === 'audioinput' && d.label);
+        setAudioDevices(inputs);
+
+        const trackLabel = stream.getAudioTracks()[0]?.label ?? '';
+        const active = inputs.find((d) => d.label === trackLabel);
+        setDeviceName(active?.label ?? trackLabel ?? 'Microphone');
+        setSelectedDeviceId(active?.deviceId ?? 'default');
+      } catch {
+        setAudioDevices([]);
+      }
+
       setStatus('ok');
-      return;
-    }
+      startLevelAnimation(stream);
+    } catch (error: unknown) {
+      await minDelay;
+      if (token !== runTokenRef.current) return;
 
-    const error = String(response?.error ?? 'MIC_NOT_FOUND');
-    if (error === 'MIC_PERMISSION_DENIED' || error === 'MIC_PERMISSION_PROMPT') {
-      setStatus('denied');
-      return;
+      const name = error instanceof Error ? error.name : 'UnknownError';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setStatus('denied');
+      } else if (name === 'NotReadableError' || name === 'TrackStartError') {
+        setStatus('in_use');
+      } else {
+        setStatus('waiting');
+      }
+      setAudioDevices([]);
     }
-    if (error === 'MIC_IN_USE') {
-      setStatus('in_use');
-      return;
-    }
-    setStatus('waiting');
-  }, []);
+  }, [onMicStreamReady, startLevelAnimation, stopStream]);
+
+  const handleDeviceChange = useCallback(
+    async (deviceId: string) => {
+      setSelectedDeviceId(deviceId);
+      stopStream();
+      setStatus('checking');
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: deviceId === 'default' ? undefined : { exact: deviceId },
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+            sampleRate: 44100,
+            channelCount: 1,
+          },
+        });
+
+        const selected = audioDevices.find((d) => d.deviceId === deviceId);
+        setDeviceName(selected?.label ?? 'Microphone');
+        streamRef.current = stream;
+        onMicStreamReady?.(stream);
+        setStatus('ok');
+        startLevelAnimation(stream);
+      } catch (err: unknown) {
+        const name = err instanceof Error ? err.name : 'UnknownError';
+        setStatus(name === 'NotAllowedError' ? 'denied' : 'not_found');
+      }
+    },
+    [audioDevices, onMicStreamReady, startLevelAnimation, stopStream],
+  );
 
   useEffect(() => {
     if (!includeMic) {
       runTokenRef.current += 1;
+      stopStream();
       setStatus('off');
-      setBars(BAR_BASE);
-      setSeedLevel(10);
+      setDeviceName('Microphone');
+      setAudioDevices([]);
+      setSelectedDeviceId('default');
       void chrome.runtime.sendMessage({ type: 'RELEASE_MIC_CHECK' }).catch(() => {});
       return;
     }
 
     if (status === 'off') {
-      void runMicCheck();
+      void checkMic();
     }
-  }, [includeMic, status, runMicCheck]);
+  }, [checkMic, includeMic, status, stopStream]);
 
   useEffect(() => {
-    if (!includeMic || status !== 'waiting') return;
+    if (!includeMic || (status !== 'waiting' && status !== 'not_found')) return;
 
     const interval = window.setInterval(() => {
       void (async () => {
@@ -284,7 +454,7 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
           const hasAudioInput = devices.some((device) => device.kind === 'audioinput');
           if (!hasAudioInput) return;
           window.clearInterval(interval);
-          await runMicCheck();
+          await checkMic();
         } catch {
           // Keep polling on transient enumerate failures.
         }
@@ -292,34 +462,19 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
     }, DEVICE_POLL_MS);
 
     return () => window.clearInterval(interval);
-  }, [includeMic, status, runMicCheck]);
-
-  useEffect(() => {
-    if (status !== 'ok') {
-      setBars(BAR_BASE);
-      return;
-    }
-
-    let tick = 0;
-    const interval = window.setInterval(() => {
-      tick += 1;
-      const base = Math.max(3, Math.min(36, seedLevel));
-      const nextBars = BAR_BASE.map((value, index) => {
-        const wobble = Math.sin((tick + index) * 0.42) * 2.8;
-        const noise = (Math.random() - 0.5) * 2.2;
-        const scaled = value * (0.65 + base / 40);
-        return Math.max(3, Math.min(22, Math.round(scaled + wobble + noise)));
-      });
-      setBars(nextBars);
-    }, 120);
-
-    return () => window.clearInterval(interval);
-  }, [status, seedLevel]);
+  }, [checkMic, includeMic, status]);
 
   useEffect(() => {
     const canStart = !includeMic || status === 'ok';
     onReadyChange?.(canStart);
-  }, [includeMic, status, onReadyChange]);
+  }, [includeMic, onReadyChange, status]);
+
+  useEffect(() => {
+    return () => {
+      runTokenRef.current += 1;
+      stopStream();
+    };
+  }, [stopStream]);
 
   const handleToggle = () => {
     onMicChange(!includeMic);
@@ -331,17 +486,18 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
       ? 'ok'
       : status === 'checking'
         ? 'checking'
-        : status === 'waiting'
+        : status === 'waiting' || status === 'not_found'
           ? 'waiting'
           : status === 'off'
             ? ''
             : 'error';
+
   const subClass =
     status === 'ok'
       ? 'ok'
       : status === 'checking'
         ? 'checking'
-        : status === 'waiting'
+        : status === 'waiting' || status === 'not_found'
           ? 'waiting'
           : status === 'off'
             ? ''
@@ -354,7 +510,7 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
         ? 'Requesting microphone access...'
         : status === 'ok'
           ? 'Mic ready - signal detected'
-          : status === 'waiting'
+          : status === 'waiting' || status === 'not_found'
             ? 'No microphone found - waiting for device'
             : status === 'denied'
               ? 'Permission blocked'
@@ -385,27 +541,37 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
             )}
 
             {status === 'ok' && (
-              <>
-                <div className="rk-mic-device">
-                  <span>{deviceName}</span>
-                  <span className="rk-mic-device-badge">ACTIVE</span>
+              <div className="rk-device-row">
+                <div className="rk-inline-bars">
+                  {levelBars.map((h, i) => (
+                    <div
+                      key={i}
+                      className={`rk-ib${h > 5 ? ' rk-ib-lit' : ''}`}
+                      style={{ height: Math.round(h) }}
+                    />
+                  ))}
                 </div>
-                <div className="rk-mic-level">
-                  <div className="rk-mic-bars">
-                    {bars.map((height, index) => (
-                      <div
-                        key={index}
-                        className={`rk-mic-bar${height >= 9 ? ' on' : ''}`}
-                        style={{ height }}
-                      />
+
+                {audioDevices.length > 1 ? (
+                  <select
+                    className="rk-device-select"
+                    value={selectedDeviceId}
+                    onChange={(e) => void handleDeviceChange(e.target.value)}>
+                    {audioDevices.map((d) => (
+                      <option key={d.deviceId} value={d.deviceId}>
+                        {d.label}
+                      </option>
                     ))}
-                  </div>
-                  <span className="rk-mic-level-text">{seedLevel}</span>
-                </div>
-              </>
+                  </select>
+                ) : (
+                  <span className="rk-device-name">{deviceName}</span>
+                )}
+
+                <span className="rk-device-active">Active</span>
+              </div>
             )}
 
-            {status === 'waiting' && (
+            {(status === 'waiting' || status === 'not_found') && (
               <div className="rk-mic-wait">
                 No microphone detected. Connect a device and we will auto-check again every 2 seconds.
               </div>
@@ -423,7 +589,7 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
                     onClick={() => void chrome.runtime.sendMessage({ type: 'OPEN_MIC_SETTINGS' })}>
                     Open settings
                   </button>
-                  <button className="rk-mic-error-btn" onClick={() => void runMicCheck()}>
+                  <button className="rk-mic-error-btn" onClick={() => void checkMic()}>
                     Retry
                   </button>
                 </div>
@@ -437,7 +603,7 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
                   Close other apps using the mic, or turn this toggle off to continue without voice.
                 </div>
                 <div className="rk-mic-error-btns">
-                  <button className="rk-mic-error-btn" onClick={() => void runMicCheck()}>
+                  <button className="rk-mic-error-btn" onClick={() => void checkMic()}>
                     Retry
                   </button>
                 </div>
@@ -448,9 +614,7 @@ export function MicToggleCard({ includeMic, onMicChange, onReadyChange }: MicTog
       </div>
 
       {startDisabled && (
-        <div className="rk-mic-hint">
-          Turn off the microphone toggle to proceed without voice recording.
-        </div>
+        <div className="rk-mic-hint">Turn off the microphone toggle to proceed without voice recording.</div>
       )}
     </>
   );
