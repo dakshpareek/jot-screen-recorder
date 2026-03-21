@@ -18,6 +18,7 @@ interface PersistedContext {
   chunkCount: number;
   processingProgress: number | null;
   errorMessage: string | null;
+  micWarningMessage: string | null;
   storageWarningMessage: string | null;
   outputFileName: string | null;
   validation: ValidationResult | null;
@@ -53,6 +54,7 @@ type OffscreenEventMessage = {
 type MicPreflightResponse = {
   ok: boolean;
   level?: number;
+  deviceLabel?: string | null;
   error?: string;
 };
 
@@ -73,9 +75,21 @@ type StorageSignalMessage = {
   availableMB?: number;
 };
 
+type MicMixFailedMessage = {
+  type: 'MIC_MIX_FAILED';
+  reason?: string;
+  fallback?: 'mic_only' | 'tab_only';
+};
+
+type AudioSource = 'both' | 'mic' | 'tab' | 'silent';
+type RawDownloadItem = {
+  url: string;
+  filename: string;
+};
+
 const OFFSCREEN_PING_INITIAL_INTERVAL_MS = 50;
 const OFFSCREEN_PING_MAX_INTERVAL_MS = 400;
-const OFFSCREEN_PING_TIMEOUT_MS = 3_000;
+const OFFSCREEN_PING_TIMEOUT_MS = 10_000;
 const PREFLIGHT_RESULT_MIN_VISIBLE_MS = 1_500;
 
 const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
@@ -110,6 +124,7 @@ let recordingStartTime: number | null = null;
 let chunkCount = 0;
 let processingProgress: number | null = null;
 let errorMessage: string | null = null;
+let micWarningMessage: string | null = null;
 let storageWarningMessage: string | null = null;
 let outputFileName: string | null = null;
 let outputUrl: string | null = null;
@@ -122,6 +137,7 @@ let recoveryChunks: RecoveryChunkCheck[] = [];
 let processingPipelineRunning = false;
 let offscreenReady = false;
 let recordingTabId: number | null = null;
+let activeAudioSource: AudioSource = 'both';
 
 export default defineBackground(() => {
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -133,12 +149,34 @@ export default defineBackground(() => {
     }
 
     if (message.type === 'START') {
-      void handleStart().then(sendResponse);
+      const requestedAudioSource = normalizeAudioSource(message.audioSource);
+      void handleStart(requestedAudioSource).then(sendResponse);
       return true;
     }
 
     if (message.type === 'PREPARE_START') {
-      void handlePrepareStart().then(sendResponse);
+      const includeMic = message.includeMic !== false;
+      void handlePrepareStart(includeMic)
+        .then(sendResponse)
+        .catch((error) => {
+          errorMessage = toErrorMessage(error);
+          setState('preflight_error');
+          sendResponse({
+            ok: false,
+            error: errorMessage,
+            snapshot: buildSnapshot(),
+          });
+        });
+      return true;
+    }
+
+    if (message.type === 'RUN_MIC_CHECK') {
+      void handleRunMicCheck().then(sendResponse);
+      return true;
+    }
+
+    if (message.type === 'RELEASE_MIC_CHECK') {
+      void handleReleaseMicCheck().then(sendResponse);
       return true;
     }
 
@@ -154,6 +192,16 @@ export default defineBackground(() => {
 
     if (message.type === 'DOWNLOAD') {
       void handleDownload().then(sendResponse);
+      return true;
+    }
+
+    if (message.type === 'RESET_TO_IDLE') {
+      void handleResetToIdle().then(sendResponse);
+      return true;
+    }
+
+    if (message.type === 'DOWNLOAD_RAW_CHUNKS') {
+      void handleDownloadRawChunks(String(message.sessionId ?? '')).then(sendResponse);
       return true;
     }
 
@@ -196,6 +244,11 @@ export default defineBackground(() => {
 
     if (message.type === 'OFFSCREEN_EVENT') {
       void handleOffscreenEvent(message as OffscreenEventMessage).then(sendResponse);
+      return true;
+    }
+
+    if (message.type === 'MIC_MIX_FAILED') {
+      void handleMicMixFailed(message as MicMixFailedMessage).then(sendResponse);
       return true;
     }
 
@@ -244,6 +297,13 @@ function normalizeSystemAudioStatus(value: unknown): SystemAudioStatus {
   return 'idle';
 }
 
+function normalizeAudioSource(value: unknown): AudioSource {
+  if (value === 'mic' || value === 'tab' || value === 'silent') {
+    return value;
+  }
+  return 'both';
+}
+
 function normalizeAudioPreflight(value: Partial<AudioPreflightSnapshot> | null | undefined) {
   return {
     ...DEFAULT_AUDIO_PREFLIGHT,
@@ -264,6 +324,7 @@ async function hydrateContext() {
     chunkCount = stored.chunkCount ?? 0;
     processingProgress = stored.processingProgress ?? null;
     errorMessage = stored.errorMessage ?? null;
+    micWarningMessage = stored.micWarningMessage ?? null;
     storageWarningMessage = stored.storageWarningMessage ?? null;
     outputFileName = stored.outputFileName ?? null;
     validation = stored.validation ?? null;
@@ -352,6 +413,7 @@ function buildSnapshot(): RecordingSnapshot {
     chunkCount,
     processingProgress,
     errorMessage,
+    micWarningMessage,
     storageWarningMessage,
     canDownload: Boolean(outputUrl) && (state === 'done' || state === 'recovery'),
     outputFileName,
@@ -410,6 +472,7 @@ async function persistContext() {
     chunkCount,
     processingProgress,
     errorMessage,
+    micWarningMessage,
     storageWarningMessage,
     outputFileName,
     validation,
@@ -484,6 +547,7 @@ function resetSessionMetadata(nextSessionId: string) {
   chunkCount = 0;
   processingProgress = null;
   errorMessage = null;
+  micWarningMessage = null;
   storageWarningMessage = null;
   outputFileName = null;
   outputUrl = null;
@@ -506,6 +570,7 @@ function resetAttemptMetadata() {
   chunkCount = 0;
   processingProgress = null;
   errorMessage = null;
+  micWarningMessage = null;
   storageWarningMessage = null;
   outputFileName = null;
   outputUrl = null;
@@ -514,13 +579,15 @@ function resetAttemptMetadata() {
   recoverySessionId = null;
   recoveryChunks = [];
   audioPreflight = { ...DEFAULT_AUDIO_PREFLIGHT };
+  activeAudioSource = 'both';
 }
 
-async function handleStart() {
+async function handleStart(audioSource: AudioSource = 'both') {
   if (state !== 'armed') {
     return { ok: false, error: `Cannot start from state "${state}"`, snapshot: buildSnapshot() };
   }
 
+  activeAudioSource = audioSource;
   const nextSessionId = createSessionId();
   resetSessionMetadata(nextSessionId);
 
@@ -538,6 +605,7 @@ async function handleStart() {
       type: 'OFFSCREEN_START',
       sessionId: nextSessionId,
       streamId,
+      audioSource,
     });
 
     if (!result?.ok) {
@@ -567,31 +635,52 @@ async function handleStart() {
   }
 }
 
-async function handlePrepareStart() {
-  if (state === 'armed') {
-    return { ok: true, snapshot: buildSnapshot() };
-  }
-
-  if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
-    return { ok: false, error: `Cannot prepare from state "${state}"`, snapshot: buildSnapshot() };
-  }
-
-  resetAttemptMetadata();
-  await persistContext();
-  await broadcastSnapshot();
-
-  const storageCheck = await checkStorageQuota();
-  storageWarningMessage = storageCheck.warningMessage ?? null;
-  if (!storageCheck.ok) {
-    errorMessage = storageCheck.warningMessage ?? 'Insufficient storage to start recording';
-    setState('preflight_error');
-    return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-  }
-
-  setState('preflight');
-  const preflightStartedAt = Date.now();
+async function handlePrepareStart(includeMic = true) {
   try {
+    if (state === 'armed') {
+      return { ok: true, snapshot: buildSnapshot() };
+    }
+
+    if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
+      return { ok: false, error: `Cannot prepare from state "${state}"`, snapshot: buildSnapshot() };
+    }
+
+    resetAttemptMetadata();
+    await persistContext();
+    await broadcastSnapshot();
+
+    const storageCheck = await checkStorageQuota();
+    storageWarningMessage = storageCheck.warningMessage ?? null;
+    if (!storageCheck.ok) {
+      errorMessage = storageCheck.warningMessage ?? 'Insufficient storage to start recording';
+      setState('preflight_error');
+      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
+    }
+
+    setState('preflight');
+    const preflightStartedAt = Date.now();
+
     await ensureOffscreenReadyWithRetry();
+
+    if (!includeMic) {
+      audioPreflight = {
+        ...audioPreflight,
+        micChecked: true,
+        micOk: true,
+        micLevel: null,
+        micError: null,
+        systemAudioStatus: 'idle',
+        systemAudioLevel: null,
+        systemAudioMessage: null,
+        needsSystemAudioDecision: false,
+      };
+      errorMessage = null;
+      await persistContext();
+      await broadcastSnapshot();
+      setState('armed');
+      return { ok: true, snapshot: buildSnapshot() };
+    }
+
     const micPreflight = await runMicPreflight();
     audioPreflight = {
       ...audioPreflight,
@@ -642,12 +731,69 @@ async function runMicPreflight(): Promise<MicPreflightResponse> {
     return {
       ok: true,
       level: typeof result.level === 'number' ? result.level : 0,
+      deviceLabel: typeof result.deviceLabel === 'string' ? result.deviceLabel : null,
     };
   } catch (error) {
     return {
       ok: false,
       error: toErrorMessage(error),
     };
+  }
+}
+
+async function handleRunMicCheck() {
+  if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
+    return {
+      ok: false,
+      error: `Cannot check microphone from state "${state}"`,
+      snapshot: buildSnapshot(),
+    };
+  }
+
+  const micPreflight = await runMicPreflight();
+  audioPreflight = {
+    ...audioPreflight,
+    micChecked: true,
+    micOk: micPreflight.ok,
+    micLevel: typeof micPreflight.level === 'number' ? micPreflight.level : null,
+    micError: micPreflight.error ?? null,
+  };
+  if (micPreflight.ok) {
+    micWarningMessage = null;
+  }
+
+  await persistContext();
+  await broadcastSnapshot();
+  return {
+    ok: micPreflight.ok,
+    level: micPreflight.level,
+    deviceLabel: micPreflight.deviceLabel ?? null,
+    error: micPreflight.error,
+    snapshot: buildSnapshot(),
+  };
+}
+
+async function handleReleaseMicCheck() {
+  await releasePreflightMicHold();
+  audioPreflight = {
+    ...audioPreflight,
+    micChecked: false,
+    micOk: false,
+    micLevel: null,
+    micError: null,
+  };
+  micWarningMessage = null;
+  await persistContext();
+  await broadcastSnapshot();
+  return { ok: true, snapshot: buildSnapshot() };
+}
+
+async function releasePreflightMicHold() {
+  try {
+    await ensureOffscreenReadyWithRetry();
+    await sendToOffscreen<{ ok?: boolean }>({ type: 'OFFSCREEN_RELEASE_PREFLIGHT_MIC' });
+  } catch {
+    // Best-effort cleanup for any preflight-held mic stream.
   }
 }
 
@@ -680,9 +826,11 @@ async function checkStorageQuota() {
 
 async function handleCancelStart() {
   if (state === 'armed') {
+    await releasePreflightMicHold();
     errorMessage = null;
     setState('idle');
   } else if (state === 'preflight') {
+    await releasePreflightMicHold();
     errorMessage = null;
     setState('idle', { force: true });
   }
@@ -738,6 +886,91 @@ async function handleDownload() {
   }
 }
 
+async function handleResetToIdle() {
+  if (['recording', 'audio_warning', 'stopping', 'processing', 'validating', 'armed'].includes(state)) {
+    return {
+      ok: false,
+      error: `Cannot reset while state is "${state}"`,
+      snapshot: buildSnapshot(),
+    };
+  }
+
+  await releasePreflightMicHold();
+  resetAttemptMetadata();
+  setState('idle', { force: true });
+  return { ok: true, snapshot: buildSnapshot() };
+}
+
+async function handleDownloadRawChunks(targetSessionId: string) {
+  if (!targetSessionId) {
+    return { ok: false, error: 'Missing session id', snapshot: buildSnapshot() };
+  }
+
+  try {
+    await ensureOffscreenReadyWithRetry();
+    const result = await sendToOffscreen<{
+      ok?: boolean;
+      error?: string;
+      items?: RawDownloadItem[];
+    }>({
+      type: 'OFFSCREEN_DOWNLOAD_RAW_CHUNKS',
+      sessionId: targetSessionId,
+    });
+
+    if (!result?.ok) {
+      return {
+        ok: false,
+        error: result?.error ?? 'Failed to download raw chunks',
+        snapshot: buildSnapshot(),
+      };
+    }
+
+    const items = Array.isArray(result.items) ? result.items : [];
+    if (!items.length) {
+      return {
+        ok: false,
+        error: 'No raw files available to download',
+        snapshot: buildSnapshot(),
+      };
+    }
+
+    let downloadCount = 0;
+    for (const item of items) {
+      if (!item?.url || !item?.filename) continue;
+      try {
+        await chrome.downloads.download({
+          url: item.url,
+          filename: item.filename,
+          saveAs: false,
+        });
+        downloadCount += 1;
+      } catch {
+        // Continue attempting remaining files even if one download fails.
+      }
+    }
+
+    if (!downloadCount) {
+      return {
+        ok: false,
+        error: 'Unable to trigger raw file downloads',
+        snapshot: buildSnapshot(),
+      };
+    }
+
+    return {
+      ok: true,
+      downloadCount,
+      snapshot: buildSnapshot(),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: toErrorMessage(error),
+      snapshot: buildSnapshot(),
+    };
+  }
+}
+
 async function handleSystemAudioSignal(message: SystemAudioSignalMessage) {
   if (!['recording', 'audio_warning'].includes(state)) {
     return { ok: true };
@@ -762,25 +995,24 @@ async function handleSystemAudioSignal(message: SystemAudioSignalMessage) {
 
   const warningMessage =
     message.type === 'SYSTEM_AUDIO_ABSENT'
-      ? 'System audio track is missing. Continue with mic only or stop and retry share settings.'
-      : 'System audio appears silent after start. Continue with mic only or stop and retry share settings.';
+      ? 'System audio track is missing. Recording continues with microphone.'
+      : 'System audio appears silent. Recording continues with microphone.';
 
   audioPreflight = {
     ...audioPreflight,
     systemAudioStatus: message.type === 'SYSTEM_AUDIO_ABSENT' ? 'absent' : 'silent',
     systemAudioLevel: typeof message.level === 'number' ? message.level : null,
-    systemAudioMessage: warningMessage,
-    needsSystemAudioDecision: true,
+    // Non-blocking in simplified UX: only show informational warning when mic is enabled.
+    systemAudioMessage: activeAudioSource === 'both' ? warningMessage : null,
+    needsSystemAudioDecision: false,
   };
-  errorMessage = warningMessage;
-
-  try {
-    await sendToOffscreen<{ ok?: boolean }>({ type: 'OFFSCREEN_PAUSE' });
-  } catch {
-    // Best-effort pause; keep warning surfaced even if pause fails.
+  errorMessage = null;
+  if (state === 'audio_warning') {
+    setState('recording');
+  } else {
+    await persistContext();
+    await broadcastSnapshot();
   }
-
-  setState('audio_warning');
   return { ok: true };
 }
 
@@ -862,6 +1094,7 @@ function primeRecoveredSessionContext(orphan: OrphanedSession) {
   chunkCount = orphan.chunkCount;
   processingProgress = null;
   errorMessage = null;
+  micWarningMessage = null;
   outputFileName = null;
   outputUrl = null;
   validation = null;
@@ -872,96 +1105,122 @@ function primeRecoveredSessionContext(orphan: OrphanedSession) {
 }
 
 async function handleRecoverOrphan(targetSessionId: string, chunkIndexes?: number[]) {
-  if (!targetSessionId) {
-    return { ok: false, error: 'Missing session id', snapshot: buildSnapshot() };
-  }
+  try {
+    if (!targetSessionId) {
+      return { ok: false, error: 'Missing session id', snapshot: buildSnapshot() };
+    }
 
-  if (['preflight', 'armed', 'recording', 'audio_warning', 'stopping', 'processing'].includes(state)) {
-    return {
-      ok: false,
-      error: `Cannot recover while state is "${state}"`,
-      snapshot: buildSnapshot(),
-    };
-  }
+    if (['preflight', 'armed', 'recording', 'audio_warning', 'stopping', 'processing'].includes(state)) {
+      return {
+        ok: false,
+        error: `Cannot recover while state is "${state}"`,
+        snapshot: buildSnapshot(),
+      };
+    }
 
-  const target = orphanedSessions.find((session) => session.sessionId === targetSessionId);
-  if (!target) {
-    await refreshOrphanedSessions();
-  }
+    const target = orphanedSessions.find((session) => session.sessionId === targetSessionId);
+    if (!target) {
+      await refreshOrphanedSessions();
+    }
 
-  const resolvedTarget =
-    target ?? orphanedSessions.find((session) => session.sessionId === targetSessionId);
-  if (!resolvedTarget) {
-    return { ok: false, error: 'Orphaned session not found', snapshot: buildSnapshot() };
-  }
+    let resolvedTarget = target ?? orphanedSessions.find((session) => session.sessionId === targetSessionId);
+    if (!resolvedTarget) {
+      const canUseActiveRecoverySession =
+        state === 'recovery' &&
+        (recoverySessionId === targetSessionId || sessionId === targetSessionId);
 
-  let selectedChunkIndexes = chunkIndexes;
-  if (!Array.isArray(selectedChunkIndexes) || !selectedChunkIndexes.length) {
-    await ensureOffscreenReadyWithRetry();
-    const inspect = await sendToOffscreen<RecoveryInspectResponse>({
-      type: 'OFFSCREEN_RECOVERY_INSPECT',
-      sessionId: targetSessionId,
+      if (canUseActiveRecoverySession) {
+        resolvedTarget = {
+          sessionId: targetSessionId,
+          startTime: recordingStartTime ?? Date.now(),
+          chunkCount: recoveryChunks.length > 0 ? recoveryChunks.length : chunkCount,
+          totalSize: 0,
+        };
+      } else {
+        return { ok: false, error: 'Orphaned session not found', snapshot: buildSnapshot() };
+      }
+    }
+
+    let selectedChunkIndexes = chunkIndexes;
+    if (!Array.isArray(selectedChunkIndexes) || !selectedChunkIndexes.length) {
+      await ensureOffscreenReadyWithRetry();
+      const inspect = await sendToOffscreen<RecoveryInspectResponse>({
+        type: 'OFFSCREEN_RECOVERY_INSPECT',
+        sessionId: targetSessionId,
+      });
+
+      if (!inspect?.ok) {
+        return {
+          ok: false,
+          error: inspect?.error ?? 'Failed to inspect orphaned session chunks',
+          snapshot: buildSnapshot(),
+        };
+      }
+
+      const inspectedChunks = Array.isArray(inspect.chunks) ? inspect.chunks : [];
+      const suspectChunks = inspectedChunks.filter((chunk) => chunk.status !== 'ok');
+      if (suspectChunks.length) {
+        recoverySessionId = targetSessionId;
+        recoveryChunks = inspectedChunks.map((chunk) => ({
+          ...chunk,
+          included: chunk.status !== 'missing' && chunk.status === 'ok',
+        }));
+        errorMessage = 'Suspect chunks detected. Select chunks to include before processing.';
+        setState('recovery');
+        return {
+          ok: false,
+          error: errorMessage,
+          snapshot: buildSnapshot(),
+        };
+      }
+
+      selectedChunkIndexes = inspectedChunks
+        .filter((chunk) => chunk.status !== 'missing')
+        .map((chunk) => chunk.index);
+    }
+
+    const fallbackRecoveryChunks =
+      recoverySessionId === resolvedTarget.sessionId && recoveryChunks.length
+        ? recoveryChunks.map((chunk) => ({ ...chunk }))
+        : [];
+
+    primeRecoveredSessionContext(resolvedTarget);
+    await persistContext();
+    await broadcastSnapshot();
+
+    await runProcessingPipeline({
+      targetSessionId: resolvedTarget.sessionId,
+      chunkIndexes: selectedChunkIndexes,
+      fallbackRecoveryChunks,
     });
 
-    if (!inspect?.ok) {
+    if (state === 'done' && outputUrl) {
+      const downloadResult = await handleDownload();
+      await refreshOrphanedSessions();
       return {
-        ok: false,
-        error: inspect?.error ?? 'Failed to inspect orphaned session chunks',
+        ok: Boolean(downloadResult?.ok),
+        error: downloadResult?.ok ? undefined : (downloadResult?.error as string | undefined),
         snapshot: buildSnapshot(),
       };
     }
 
-    const inspectedChunks = Array.isArray(inspect.chunks) ? inspect.chunks : [];
-    const suspectChunks = inspectedChunks.filter((chunk) => chunk.status !== 'ok');
-    if (suspectChunks.length) {
-      recoverySessionId = targetSessionId;
-      recoveryChunks = inspectedChunks.map((chunk) => ({
-        ...chunk,
-        included: chunk.status !== 'missing' && chunk.status === 'ok',
-      }));
-      errorMessage = 'Suspect chunks detected. Select chunks to include before processing.';
-      setState('recovery');
-      return {
-        ok: false,
-        error: errorMessage,
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    selectedChunkIndexes = inspectedChunks
-      .filter((chunk) => chunk.status !== 'missing')
-      .map((chunk) => chunk.index);
-  }
-
-  primeRecoveredSessionContext(resolvedTarget);
-  await persistContext();
-  await broadcastSnapshot();
-
-  await runProcessingPipeline({
-    targetSessionId: resolvedTarget.sessionId,
-    chunkIndexes: selectedChunkIndexes,
-  });
-
-  if (state === 'done' && outputUrl) {
-    const downloadResult = await handleDownload();
     await refreshOrphanedSessions();
-    return {
-      ok: Boolean(downloadResult?.ok),
-      error: downloadResult?.ok ? undefined : (downloadResult?.error as string | undefined),
-      snapshot: buildSnapshot(),
-    };
-  }
+    if (state === 'error' || state === 'recovery') {
+      return {
+        ok: false,
+        error: errorMessage ?? 'Failed to recover orphaned session',
+        snapshot: buildSnapshot(),
+      };
+    }
 
-  await refreshOrphanedSessions();
-  if (state === 'error' || state === 'recovery') {
+    return { ok: true, snapshot: buildSnapshot() };
+  } catch (error) {
     return {
       ok: false,
-      error: errorMessage ?? 'Failed to recover orphaned session',
+      error: toErrorMessage(error),
       snapshot: buildSnapshot(),
     };
   }
-
-  return { ok: true, snapshot: buildSnapshot() };
 }
 
 async function handleDiscardOrphan(targetSessionId: string) {
@@ -1006,7 +1265,9 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
   }
 
   if (message.event === 'PROCESS_PROGRESS' && typeof message.progress === 'number') {
-    processingProgress = Math.max(0, Math.min(100, Math.floor(message.progress)));
+    const nextProgress = Math.max(0, Math.min(100, Math.floor(message.progress)));
+    const currentProgress = typeof processingProgress === 'number' ? processingProgress : 0;
+    processingProgress = Math.max(currentProgress, nextProgress);
     await persistContext();
     await broadcastSnapshot();
     return { ok: true };
@@ -1036,7 +1297,34 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
   return { ok: true };
 }
 
-async function runProcessingPipeline(options?: { targetSessionId?: string; chunkIndexes?: number[] }) {
+async function handleMicMixFailed(message: MicMixFailedMessage) {
+  if (!['armed', 'recording', 'audio_warning', 'stopping'].includes(state)) {
+    return { ok: true };
+  }
+
+  if (activeAudioSource === 'tab' || activeAudioSource === 'silent') {
+    return { ok: true };
+  }
+
+  micWarningMessage =
+    message.fallback === 'mic_only'
+      ? 'Tab audio unavailable — continuing with microphone only.'
+      : 'Microphone unavailable — continuing without mic audio.';
+  audioPreflight = {
+    ...audioPreflight,
+    micOk: message.fallback === 'mic_only',
+    micError: message.reason ?? 'MIC_MIX_FAILED',
+  };
+  await persistContext();
+  await broadcastSnapshot();
+  return { ok: true };
+}
+
+async function runProcessingPipeline(options?: {
+  targetSessionId?: string;
+  chunkIndexes?: number[];
+  fallbackRecoveryChunks?: RecoveryChunkCheck[];
+}) {
   if (processingPipelineRunning) return;
   const targetSessionId = options?.targetSessionId ?? sessionId;
   if (!targetSessionId) {
@@ -1088,7 +1376,37 @@ async function runProcessingPipeline(options?: { targetSessionId?: string; chunk
     await broadcastSnapshot();
 
     if (!validationResult?.passed) {
-      errorMessage = 'Validation failed. Raw chunks remain in OPFS for recovery.';
+      recoverySessionId = targetSessionId;
+      let inspectError: string | null = null;
+
+      try {
+        const inspect = await sendToOffscreen<RecoveryInspectResponse>({
+          type: 'OFFSCREEN_RECOVERY_INSPECT',
+          sessionId: targetSessionId,
+        });
+
+        if (inspect?.ok && Array.isArray(inspect.chunks) && inspect.chunks.length > 0) {
+          recoveryChunks = inspect.chunks.map((chunk) => ({
+            ...chunk,
+            included: chunk.status !== 'missing',
+          }));
+        } else {
+          inspectError = inspect?.error ?? null;
+          recoveryChunks = Array.isArray(options?.fallbackRecoveryChunks)
+            ? options.fallbackRecoveryChunks.map((chunk) => ({ ...chunk }))
+            : [];
+        }
+      } catch (error) {
+        inspectError = toErrorMessage(error);
+        recoveryChunks = Array.isArray(options?.fallbackRecoveryChunks)
+          ? options.fallbackRecoveryChunks.map((chunk) => ({ ...chunk }))
+          : [];
+      }
+
+      errorMessage = inspectError
+        ? `Validation failed again (${inspectError}). Try fewer chunks or download raw files.`
+        : 'Validation failed again. Try fewer chunks or download raw files.';
+
       setState('recovery');
       return;
     }
@@ -1134,13 +1452,22 @@ async function recreateOffscreenDoc() {
 }
 
 async function ensureOffscreenReadyWithRetry() {
-  try {
-    await ensureOffscreenDoc();
-    await waitForOffscreenReady();
-  } catch {
-    await recreateOffscreenDoc();
-    await waitForOffscreenReady();
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      if (attempt === 0) {
+        await ensureOffscreenDoc();
+      } else {
+        await recreateOffscreenDoc();
+      }
+      await waitForOffscreenReady();
+      return;
+    } catch (error) {
+      lastError = error;
+      await delay(150 * (attempt + 1));
+    }
   }
+  throw lastError instanceof Error ? lastError : new Error('Unable to initialize offscreen recorder');
 }
 
 async function getStartTargetTabId() {

@@ -34,8 +34,14 @@ interface WorkerResponse {
   message?: string;
 }
 
+interface RawDownloadItem {
+  url: string;
+  filename: string;
+}
+
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
+const PREFLIGHT_MIC_HOLD_MS = 60_000;
 const CAPTURE_MAX_WIDTH = 1920;
 const CAPTURE_MAX_HEIGHT = 1080;
 const CAPTURE_MAX_FRAME_RATE = 30;
@@ -45,10 +51,15 @@ const OUTPUT_VIDEO_CRF = '22';
 const OUTPUT_FRAME_RATE = String(CAPTURE_MAX_FRAME_RATE);
 const FFMPEG_AUDIO_BITRATE = '128k';
 type FFmpegClass = typeof import('@ffmpeg/ffmpeg').FFmpeg;
+type AudioSource = 'both' | 'mic' | 'tab' | 'silent';
 
 export default defineUnlistedScript(() => {
   let recorder: MediaRecorder | null = null;
   let captureStream: MediaStream | null = null;
+  let tabCaptureStream: MediaStream | null = null;
+  let micCaptureStream: MediaStream | null = null;
+  let preflightMicStream: MediaStream | null = null;
+  let preflightMicHoldTimer: ReturnType<typeof setTimeout> | null = null;
   let opfsWorker: Worker | null = null;
   let workerQueue: Promise<unknown> = Promise.resolve();
   let FFmpegCtor: FFmpegClass | null = null;
@@ -74,14 +85,26 @@ export default defineUnlistedScript(() => {
   let systemAudioCheckTimer: ReturnType<typeof setTimeout> | null = null;
   let systemAudioAudioCtx: AudioContext | null = null;
   let systemAudioSource: MediaStreamAudioSourceNode | null = null;
+  let mixAudioCtx: AudioContext | null = null;
+  let mixTabSource: MediaStreamAudioSourceNode | null = null;
+  let mixMicSource: MediaStreamAudioSourceNode | null = null;
+  let mixTabGain: GainNode | null = null;
+  let mixMicGain: GainNode | null = null;
+  let mixDestination: MediaStreamAudioDestinationNode | null = null;
   let storageMonitorInterval: ReturnType<typeof setInterval> | null = null;
+  let rawExportRevokeTimer: ReturnType<typeof setTimeout> | null = null;
+  const rawExportUrls = new Set<string>();
 
   // Signal readiness early. If background is not listening yet, ping-based readiness still succeeds.
   void chrome.runtime.sendMessage({ type: 'OFFSCREEN_READY' }).catch(() => {});
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'OFFSCREEN_START') {
-      void startRecording(String(msg.sessionId), String(msg.streamId ?? '')).then(sendResponse);
+      void startRecording(
+        String(msg.sessionId),
+        String(msg.streamId ?? ''),
+        normalizeAudioSource(msg.audioSource),
+      ).then(sendResponse);
       return true;
     }
 
@@ -110,6 +133,12 @@ export default defineUnlistedScript(() => {
       return true;
     }
 
+    if (msg.type === 'OFFSCREEN_RELEASE_PREFLIGHT_MIC') {
+      releasePreflightMicStream();
+      sendResponse({ ok: true });
+      return;
+    }
+
     if (msg.type === 'OFFSCREEN_PAUSE') {
       void pauseRecording().then(sendResponse);
       return true;
@@ -135,6 +164,11 @@ export default defineUnlistedScript(() => {
       return true;
     }
 
+    if (msg.type === 'OFFSCREEN_DOWNLOAD_RAW_CHUNKS') {
+      void downloadRawChunks(String(msg.sessionId ?? '')).then(sendResponse);
+      return true;
+    }
+
     if (msg.type === 'OFFSCREEN_STATUS') {
       sendResponse({
         alive: true,
@@ -147,7 +181,14 @@ export default defineUnlistedScript(() => {
     }
   });
 
-  async function startRecording(nextSessionId: string, streamId: string) {
+  function normalizeAudioSource(value: unknown): AudioSource {
+    if (value === 'mic' || value === 'tab' || value === 'silent') {
+      return value;
+    }
+    return 'both';
+  }
+
+  async function startRecording(nextSessionId: string, streamId: string, audioSource: AudioSource) {
     if (recorder?.state === 'recording') {
       return { ok: false, error: 'Recorder is already active' };
     }
@@ -157,7 +198,8 @@ export default defineUnlistedScript(() => {
     }
 
     try {
-      captureStream = await getTabStreamById(streamId);
+      tabCaptureStream = await getTabStreamById(streamId);
+      captureStream = await buildCaptureStream(tabCaptureStream, audioSource);
 
       activeSessionId = nextSessionId;
       chunkCount = 0;
@@ -208,7 +250,8 @@ export default defineUnlistedScript(() => {
       };
 
       recorder.start(CHUNK_INTERVAL_MS);
-      startSystemAudioCheck(captureStream);
+      // System-audio verification must inspect tab audio only (not mixed mic+tab output).
+      startSystemAudioCheck(tabCaptureStream);
       startStorageMonitor();
       const activeMimeType = recorder.mimeType || mimeType;
       // Preload ffmpeg while recording so stop->process latency is lower.
@@ -504,7 +547,7 @@ export default defineUnlistedScript(() => {
 
       ffmpegDurationHint =
         selectedChunks.length * CHUNK_DURATION_SECONDS;
-      ffmpegLastProgress = -1;
+      ffmpegLastProgress = 5;
       await emitEvent('PROCESS_PROGRESS', { progress: 5 });
 
       const shouldRunConcatDemuxer = fileNames.length > 1;
@@ -799,6 +842,59 @@ export default defineUnlistedScript(() => {
     }
   }
 
+  async function downloadRawChunks(sessionId: string) {
+    if (!sessionId) {
+      return { ok: false, error: 'Missing session id' };
+    }
+
+    try {
+      const manifestData = await readManifest(sessionId);
+      const orderedChunks = [...manifestData.chunks].sort((a, b) => a.index - b.index);
+      if (!orderedChunks.length) {
+        return { ok: false, error: 'No chunks found for this session' };
+      }
+
+      const baseName = `${sessionId}-raw`;
+      const chunkExt = (manifestData.mimeType ?? '').includes('mp4') ? 'mp4' : 'webm';
+
+      const items: RawDownloadItem[] = [];
+      const manifestBlob = new Blob([JSON.stringify(manifestData, null, 2)], {
+        type: 'application/json',
+      });
+      items.push({
+        url: URL.createObjectURL(manifestBlob),
+        filename: `${baseName}/manifest.json`,
+      });
+
+      for (const chunk of orderedChunks) {
+        try {
+          const data = await readChunkData(sessionId, chunk.index);
+          const chunkBlob = new Blob([data], {
+            type: manifestData.mimeType || 'application/octet-stream',
+          });
+          items.push({
+            url: URL.createObjectURL(chunkBlob),
+            filename: `${baseName}/chunk-${chunk.index}.${chunkExt}`,
+          });
+        } catch {
+          // Skip missing chunks and continue exporting everything available.
+        }
+      }
+
+      if (!items.length) {
+        return { ok: false, error: 'No exportable files found for this session' };
+      }
+
+      scheduleRawExportUrlCleanup(items.map((item) => item.url));
+      return { ok: true, items };
+    } catch (error) {
+      return {
+        ok: false,
+        error: toErrorMessage(error),
+      };
+    }
+  }
+
   async function ensureOpfsWorker() {
     if (opfsWorker) return opfsWorker;
     opfsWorker = new OpfsWorker();
@@ -908,35 +1004,73 @@ export default defineUnlistedScript(() => {
   async function cleanupMedia() {
     stopSystemAudioCheck();
     stopStorageMonitor();
+    releasePreflightMicStream();
+
+    if (mixTabSource) {
+      try {
+        mixTabSource.disconnect();
+      } catch {}
+      mixTabSource = null;
+    }
+
+    if (mixMicSource) {
+      try {
+        mixMicSource.disconnect();
+      } catch {}
+      mixMicSource = null;
+    }
+    if (mixTabGain) {
+      try {
+        mixTabGain.disconnect();
+      } catch {}
+      mixTabGain = null;
+    }
+    if (mixMicGain) {
+      try {
+        mixMicGain.disconnect();
+      } catch {}
+      mixMicGain = null;
+    }
+
+    mixDestination = null;
+    if (mixAudioCtx) {
+      await mixAudioCtx.close().catch(() => {});
+      mixAudioCtx = null;
+    }
+
     if (captureStream) {
       captureStream.getTracks().forEach((track) => track.stop());
     }
+    if (tabCaptureStream) {
+      tabCaptureStream.getTracks().forEach((track) => track.stop());
+    }
+    if (micCaptureStream) {
+      micCaptureStream.getTracks().forEach((track) => track.stop());
+    }
     captureStream = null;
+    tabCaptureStream = null;
+    micCaptureStream = null;
     recorder = null;
   }
 
   async function runMicPreflight() {
-    const permissionStatus = await navigator.permissions.query({
-      name: 'microphone' as PermissionName,
-    });
-
-    if (permissionStatus.state === 'denied') {
-      return { ok: false, error: 'MIC_PERMISSION_DENIED' };
-    }
-
-    if (permissionStatus.state === 'prompt') {
-      return { ok: false, error: 'MIC_PERMISSION_PROMPT' };
+    releasePreflightMicStream();
+    try {
+      const permissionStatus = await navigator.permissions.query({
+        name: 'microphone' as PermissionName,
+      });
+      if (permissionStatus.state === 'denied') {
+        return { ok: false, error: 'MIC_PERMISSION_DENIED' };
+      }
+    } catch {
+      // Some Chrome contexts may not expose permission query reliably.
+      // Continue to getUserMedia and handle errors there.
     }
 
     let stream: MediaStream | null = null;
     let audioCtx: AudioContext | null = null;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
-      });
+      stream = await requestMicStream();
 
       audioCtx = new AudioContext();
       const analyser = audioCtx.createAnalyser();
@@ -947,13 +1081,17 @@ export default defineUnlistedScript(() => {
       const data = new Uint8Array(analyser.frequencyBinCount);
       analyser.getByteFrequencyData(data);
       const level = data.reduce((sum, value) => sum + value, 0) / data.length;
+      const deviceLabel = stream.getAudioTracks()[0]?.label ?? null;
 
       source.disconnect();
-      return { ok: true, level };
+      preflightMicStream = stream;
+      stream = null;
+      schedulePreflightMicHoldRelease();
+      return { ok: true, level, deviceLabel };
     } catch (error) {
       if (error instanceof Error) {
         if (error.name === 'NotAllowedError') {
-          return { ok: false, error: 'MIC_PERMISSION_DENIED' };
+          return { ok: false, error: 'MIC_PERMISSION_PROMPT' };
         }
         if (error.name === 'NotFoundError') {
           return { ok: false, error: 'MIC_NOT_FOUND' };
@@ -1093,6 +1231,24 @@ export default defineUnlistedScript(() => {
 
   function wait(ms: number) {
     return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  function scheduleRawExportUrlCleanup(urls: string[]) {
+    for (const url of urls) {
+      rawExportUrls.add(url);
+    }
+
+    if (rawExportRevokeTimer) {
+      clearTimeout(rawExportRevokeTimer);
+    }
+
+    rawExportRevokeTimer = setTimeout(() => {
+      for (const url of rawExportUrls) {
+        URL.revokeObjectURL(url);
+      }
+      rawExportUrls.clear();
+      rawExportRevokeTimer = null;
+    }, 10 * 60 * 1000);
   }
 
   async function validateBlob(blob: Blob, minimumDurationSeconds = 0): Promise<ValidationResult> {
@@ -1295,6 +1451,160 @@ export default defineUnlistedScript(() => {
       video,
       audio,
     });
+  }
+
+  async function requestMicStream() {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    });
+  }
+
+  function consumePreflightMicStream() {
+    if (!preflightMicStream) return null;
+    clearPreflightMicHoldRelease();
+    const stream = preflightMicStream;
+    preflightMicStream = null;
+    return stream;
+  }
+
+  function clearPreflightMicHoldRelease() {
+    if (!preflightMicHoldTimer) return;
+    clearTimeout(preflightMicHoldTimer);
+    preflightMicHoldTimer = null;
+  }
+
+  function releasePreflightMicStream() {
+    clearPreflightMicHoldRelease();
+    if (!preflightMicStream) return;
+    preflightMicStream.getTracks().forEach((track) => track.stop());
+    preflightMicStream = null;
+  }
+
+  function schedulePreflightMicHoldRelease() {
+    clearPreflightMicHoldRelease();
+    preflightMicHoldTimer = setTimeout(() => {
+      releasePreflightMicStream();
+    }, PREFLIGHT_MIC_HOLD_MS);
+  }
+
+  async function buildCaptureStream(tabStream: MediaStream, audioSource: AudioSource) {
+    const videoTracks = tabStream.getVideoTracks();
+    if (!videoTracks.length) {
+      throw new Error('Tab capture did not provide a video track');
+    }
+
+    if (audioSource === 'silent') {
+      releasePreflightMicStream();
+      return new MediaStream([...videoTracks]);
+    }
+
+    if (audioSource === 'tab') {
+      releasePreflightMicStream();
+      return new MediaStream([...videoTracks, ...tabStream.getAudioTracks()]);
+    }
+
+    if (audioSource === 'mic') {
+      micCaptureStream = consumePreflightMicStream() ?? (await requestMicStream());
+      const micTracks = micCaptureStream.getAudioTracks();
+      if (!micTracks.length) {
+        throw new Error('Microphone capture did not provide an audio track');
+      }
+      return new MediaStream([...videoTracks, ...micTracks]);
+    }
+
+    try {
+      micCaptureStream = consumePreflightMicStream() ?? (await requestMicStream());
+      const micTracks = micCaptureStream.getAudioTracks();
+      if (!micTracks.length) {
+        throw new Error('Microphone capture did not provide an audio track');
+      }
+
+      mixAudioCtx = new AudioContext();
+      mixDestination = mixAudioCtx.createMediaStreamDestination();
+
+      const tabAudioTracks = tabStream.getAudioTracks();
+      if (tabAudioTracks.length) {
+        mixTabSource = mixAudioCtx.createMediaStreamSource(new MediaStream(tabAudioTracks));
+        mixTabGain = mixAudioCtx.createGain();
+        mixTabGain.gain.value = 1;
+        mixTabSource.connect(mixTabGain);
+        mixTabGain.connect(mixDestination);
+      }
+
+      mixMicSource = mixAudioCtx.createMediaStreamSource(new MediaStream(micTracks));
+      mixMicGain = mixAudioCtx.createGain();
+      mixMicGain.gain.value = 1.4;
+      mixMicSource.connect(mixMicGain);
+      mixMicGain.connect(mixDestination);
+      await mixAudioCtx.resume().catch(() => {});
+
+      const mixedAudioTracks = mixDestination.stream.getAudioTracks();
+      if (!mixedAudioTracks.length) {
+        throw new Error('Failed to build mixed audio stream');
+      }
+
+      return new MediaStream([...videoTracks, ...mixedAudioTracks]);
+    } catch (error) {
+      const currentMicStream: MediaStream | null = micCaptureStream;
+      const liveMicTracks: MediaStreamTrack[] = currentMicStream
+        ? currentMicStream
+            .getAudioTracks()
+            .filter((track: MediaStreamTrack) => track.readyState === 'live')
+        : [];
+
+      if (mixTabSource) {
+        try {
+          mixTabSource.disconnect();
+        } catch {}
+        mixTabSource = null;
+      }
+      if (mixMicSource) {
+        try {
+          mixMicSource.disconnect();
+        } catch {}
+        mixMicSource = null;
+      }
+      if (mixTabGain) {
+        try {
+          mixTabGain.disconnect();
+        } catch {}
+        mixTabGain = null;
+      }
+      if (mixMicGain) {
+        try {
+          mixMicGain.disconnect();
+        } catch {}
+        mixMicGain = null;
+      }
+      mixDestination = null;
+      if (mixAudioCtx) {
+        await mixAudioCtx.close().catch(() => {});
+        mixAudioCtx = null;
+      }
+
+      await emitRuntimeSignal({
+        type: 'MIC_MIX_FAILED',
+        reason: toNamedErrorMessage(error),
+        fallback: liveMicTracks.length > 0 ? 'mic_only' : 'tab_only',
+      });
+
+      if (liveMicTracks.length > 0) {
+        return new MediaStream([...videoTracks, ...liveMicTracks]);
+      }
+
+      if (currentMicStream) {
+        currentMicStream.getTracks().forEach((track: MediaStreamTrack) => track.stop());
+        micCaptureStream = null;
+      }
+
+      // Last-resort fallback keeps recording alive even when mic mix fails completely.
+      return new MediaStream([...videoTracks, ...tabStream.getAudioTracks()]);
+    }
   }
 
   function pickMimeType() {

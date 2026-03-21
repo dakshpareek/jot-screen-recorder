@@ -4,6 +4,7 @@ export type RecordingState =
   | 'preflight_error'
   | 'armed'
   | 'recording'
+  | 'audio_warning'
   | 'stopping'
   | 'processing'
   | 'validating'
@@ -39,6 +40,37 @@ export interface ProcessingMetrics {
   totalMs: number;
 }
 
+export type SystemAudioStatus = 'idle' | 'pending' | 'ok' | 'absent' | 'silent';
+
+export interface AudioPreflightSnapshot {
+  micChecked: boolean;
+  micOk: boolean;
+  micLevel: number | null;
+  micError: string | null;
+  systemAudioStatus: SystemAudioStatus;
+  systemAudioLevel: number | null;
+  systemAudioMessage: string | null;
+  needsSystemAudioDecision: boolean;
+}
+
+export interface OrphanedSession {
+  sessionId: string;
+  startTime: number;
+  chunkCount: number;
+  totalSize: number;
+}
+
+export type RecoveryChunkStatus = 'ok' | 'suspect' | 'missing';
+
+export interface RecoveryChunkCheck {
+  index: number;
+  size: number;
+  status: RecoveryChunkStatus;
+  expectedChecksum: string | null;
+  actualChecksum: string | null;
+  included: boolean;
+}
+
 export interface RecordingSnapshot {
   state: RecordingState;
   sessionId: string | null;
@@ -47,10 +79,16 @@ export interface RecordingSnapshot {
   chunkCount: number;
   processingProgress: number | null;
   errorMessage: string | null;
+  micWarningMessage: string | null;
+  storageWarningMessage: string | null;
   canDownload: boolean;
   outputFileName: string | null;
   validation: ValidationResult | null;
   processingMetrics: ProcessingMetrics | null;
+  audioPreflight: AudioPreflightSnapshot;
+  orphanedSessions: OrphanedSession[];
+  recoverySessionId: string | null;
+  recoveryChunks: RecoveryChunkCheck[];
 }
 
 export function formatDuration(seconds: number): string {
