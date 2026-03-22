@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { RuntimeMessageType } from '@/lib/messages';
+import { RuntimeMessageType, type CaptureQuality } from '@/lib/messages';
 import type { RecordingSnapshot, RecordingState } from '@/lib/recording';
 import { MicToggleCard } from './components/MicToggleCard';
 import { useRecorderCommands } from './hooks/useRecorderCommands';
@@ -32,6 +32,7 @@ const EMPTY_SNAPSHOT: RecordingSnapshot = {
   storageWarningMessage: null,
   canDownload: false,
   outputFileName: null,
+  recordingQuality: '1080p',
   validation: null,
   processingMetrics: null,
   orphanedSessions: [],
@@ -63,7 +64,7 @@ export default function App() {
   const { isBusy, send } = useRecorderCommands(setSnapshot);
 
   const [includeMic, setIncludeMic] = useState(false);
-  const [quality, setQuality] = useState<'720p' | '1080p'>('1080p');
+  const [quality, setQuality] = useState<CaptureQuality>(EMPTY_SNAPSHOT.recordingQuality);
   const [showSettings, setShowSettings] = useState(false);
   const [selectedMicDeviceId, setSelectedMicDeviceId] = useState('default');
   const [selectedRecoveryChunks, setSelectedRecoveryChunks] = useState<number[]>([]);
@@ -88,6 +89,10 @@ export default function App() {
     const included = snapshot.recoveryChunks.filter((chunk) => chunk.included).map((chunk) => chunk.index);
     setSelectedRecoveryChunks(included);
   }, [snapshot.recoveryChunks, snapshot.recoverySessionId, snapshot.sessionId, snapshot.state]);
+
+  useEffect(() => {
+    setQuality(snapshot.recordingQuality ?? '1080p');
+  }, [snapshot.recordingQuality]);
 
   useEffect(() => {
     if (snapshot.state === 'processing') {
@@ -119,6 +124,7 @@ export default function App() {
 
     const preparePayload: Record<string, unknown> = {
       includeMic: nextIncludeMic,
+      quality,
     };
     if (nextIncludeMic && normalizedMicDeviceId) {
       preparePayload.micDeviceId = normalizedMicDeviceId;
@@ -162,6 +168,7 @@ export default function App() {
 
     const startPayload: Record<string, unknown> = {
       audioSource: nextIncludeMic ? 'both' : 'tab',
+      quality,
     };
     if (nextIncludeMic && normalizedMicDeviceId) {
       startPayload.micDeviceId = normalizedMicDeviceId;
@@ -327,7 +334,6 @@ export default function App() {
           onQualityChange={(q) => {
             setQuality(q);
             setShowSettings(false);
-            // TODO: persist to chrome.storage.local and pass to recording pipeline
           }}
         />
       ) : null}
@@ -361,7 +367,12 @@ export default function App() {
       ) : null}
 
       {state === 'recording' ? (
-        <RecordingScreen snapshot={snapshot} onStop={handleStop} isBusy={isBusy} />
+        <RecordingScreen
+          snapshot={snapshot}
+          onStop={handleStop}
+          isBusy={isBusy}
+          quality={snapshot.recordingQuality}
+        />
       ) : null}
 
       {state === 'audio_warning' ? (

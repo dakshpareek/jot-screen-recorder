@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import type { CaptureQuality } from '@/lib/messages';
 import {
   formatDuration,
   type AudioPreflightSnapshot,
@@ -194,8 +195,8 @@ export function IdleScreen({
   storageWarning: string | null;
   showSettings: boolean;
   onSettingsClose: () => void;
-  quality: '720p' | '1080p';
-  onQualityChange: (q: '720p' | '1080p') => void;
+  quality: CaptureQuality;
+  onQualityChange: (q: CaptureQuality) => void;
 }) {
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1 }}>
@@ -569,30 +570,19 @@ export function RecordingScreen({
   snapshot,
   onStop,
   isBusy,
+  quality = snapshot.recordingQuality,
 }: {
   snapshot: RecordingSnapshot;
   onStop: () => void;
   isBusy: boolean;
+  quality?: CaptureQuality;
 }) {
-  const estimatedBytes = snapshot.chunkCount * snapshot.elapsedSeconds * 140;
+  const safeSeconds = snapshot.chunkCount * 10;
+  const hasSavedData = snapshot.chunkCount > 0;
 
   return (
     <>
       <div className="rk-body-sm">
-        <div className="rk-rec-indicator">
-          <div className="rk-rec-dot" />
-          <span className="rk-rec-label">Recording</span>
-          <span
-            style={{
-              fontSize: 10,
-              color: 'var(--rk-t3)',
-              marginLeft: 'auto',
-              fontFamily: "'JetBrains Mono', monospace",
-            }}>
-            local only
-          </span>
-        </div>
-
         {snapshot.micWarningMessage && (
           <div className="rk-storage-warn" style={{ marginBottom: 10 }}>
             <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
@@ -607,25 +597,33 @@ export function RecordingScreen({
         <Timer seconds={snapshot.elapsedSeconds} />
         <Waveform />
 
-        <div className="rk-meta-grid">
-          <div className="rk-meta-card">
-            <div className="rk-meta-val">{snapshot.chunkCount}</div>
-            <div className="rk-meta-lbl">Chunks</div>
+        <div className="rk-safety-card">
+          <div className="rk-safety-left">
+            <div className="rk-safety-icon">
+              <svg viewBox="0 0 14 14">
+                <path d="M7 1.5L2 4v4.5C2 11.5 4.5 13.5 7 14c2.5-.5 5-2.5 5-5.5V4L7 1.5z" />
+                <path d="M4.5 7.5l2 2 3-3.5" />
+              </svg>
+            </div>
+            <div>
+              <div className="rk-safety-label">
+                {hasSavedData ? 'Saving as you record' : 'Recording in progress'}
+              </div>
+              <div className="rk-safety-sub">
+                {hasSavedData ? '10-second chunks — always recoverable' : 'First save in a few seconds'}
+              </div>
+            </div>
           </div>
-          <div className="rk-meta-card">
-            <div className="rk-meta-val">1080p</div>
-            <div className="rk-meta-lbl">Quality</div>
-          </div>
-          <div className="rk-meta-card">
-            <div className="rk-meta-val">{formatBytes(estimatedBytes)}</div>
-            <div className="rk-meta-lbl">~Size</div>
+          <div className={`rk-safety-time${hasSavedData ? '' : ' pending'}`}>
+            {hasSavedData ? `${safeSeconds}s` : '—'}
           </div>
         </div>
 
-        <div className="rk-chunks-row">
-          <span className="rk-chunks-label">Auto-saved</span>
-          <ChunkDots count={snapshot.chunkCount} safeCount={snapshot.chunkCount} />
-          {snapshot.chunkCount > 0 && <span className="rk-safe-tag">✓ Safe</span>}
+        <div className="rk-quality-row">
+          <div className="rk-quality-pill">
+            <div className="rk-quality-pill-dot" />
+            {quality} · 30fps · Local only
+          </div>
         </div>
 
         <button className="rk-btn-stop" disabled={isBusy} onClick={onStop}>
@@ -633,7 +631,7 @@ export function RecordingScreen({
           Stop Recording
         </button>
       </div>
-      <Footer label={`${snapshot.chunkCount} chunk${snapshot.chunkCount !== 1 ? 's' : ''} safe`} />
+      <Footer label={hasSavedData ? `${safeSeconds}s safely saved` : 'Recording started'} />
     </>
   );
 }
@@ -866,7 +864,7 @@ export function DoneScreen({
               <div className="rk-done-mlbl">Size</div>
             </div>
             <div className="rk-done-meta-item">
-              <div className="rk-done-mval">1080p</div>
+              <div className="rk-done-mval">{snapshot.recordingQuality}</div>
               <div className="rk-done-mlbl">Quality</div>
             </div>
             <div className="rk-done-meta-item">

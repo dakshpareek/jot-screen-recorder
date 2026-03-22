@@ -1,6 +1,7 @@
 import type { ProcessingMetrics, RecordingSnapshot, RecoveryChunkCheck, ValidationResult } from './recording';
 
 export type AudioSource = 'both' | 'mic' | 'tab' | 'silent';
+export type CaptureQuality = '720p' | '1080p';
 
 export const RuntimeMessageType = {
   GET_STATE: 'GET_STATE',
@@ -90,6 +91,7 @@ export type RecoveryInspectResponse = {
   ok: boolean;
   error?: string;
   chunks?: RecoveryChunkCheck[];
+  recordingQuality?: CaptureQuality;
 };
 
 export type StateChangeMessage = {

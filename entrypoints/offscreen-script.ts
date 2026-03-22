@@ -8,21 +8,24 @@ import {
   OffscreenEventType,
   RuntimeMessageType,
   type AudioSource,
+  type CaptureQuality,
   type OffscreenEventTypeValue,
 } from '@/lib/messages';
 import { OpfsBridge } from './offscreen/storage/opfs-bridge';
 import type { FFmpegClass, RawDownloadItem, SessionManifest } from './offscreen/types';
+import {
+  buildTabCaptureConstraints,
+  getCaptureProfile,
+  normalizeCaptureQuality,
+} from './offscreen/utils';
 
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
 const PREFLIGHT_MIC_HOLD_MS = 60_000;
-const CAPTURE_MAX_WIDTH = 1920;
-const CAPTURE_MAX_HEIGHT = 1080;
-const CAPTURE_MAX_FRAME_RATE = 30;
 const OUTPUT_VIDEO_CODEC = 'libx264';
 const OUTPUT_VIDEO_PRESET = 'fast';
 const OUTPUT_VIDEO_CRF = '22';
-const OUTPUT_FRAME_RATE = String(CAPTURE_MAX_FRAME_RATE);
+const OUTPUT_FRAME_RATE = '30';
 const FFMPEG_AUDIO_BITRATE = '128k';
 
 export default defineUnlistedScript(() => {
@@ -42,6 +45,7 @@ export default defineUnlistedScript(() => {
 
   let activeSessionId: string | null = null;
   let manifest: SessionManifest | null = null;
+  let activeCaptureQuality: CaptureQuality = '1080p';
   let chunkCount = 0;
   let pendingStop = false;
   let stopFinalDataPromise: Promise<void> | null = null;
@@ -77,6 +81,7 @@ export default defineUnlistedScript(() => {
         String(msg.streamId ?? ''),
         normalizeAudioSource(msg.audioSource),
         normalizeMicDeviceId(msg.micDeviceId),
+        normalizeCaptureQuality(msg.quality),
       ).then(sendResponse);
       return true;
     }
@@ -173,6 +178,7 @@ export default defineUnlistedScript(() => {
     streamId: string,
     audioSource: AudioSource,
     micDeviceId: string | null,
+    captureQuality: CaptureQuality,
   ) {
     if (recorder?.state === 'recording') {
       return { ok: false, error: 'Recorder is already active' };
@@ -183,7 +189,9 @@ export default defineUnlistedScript(() => {
     }
 
     try {
-      tabCaptureStream = await getTabStreamById(streamId);
+      activeCaptureQuality = normalizeCaptureQuality(captureQuality);
+      const captureProfile = getCaptureProfile(activeCaptureQuality);
+      tabCaptureStream = await getTabStreamById(streamId, activeCaptureQuality);
       captureStream = await buildCaptureStream(tabCaptureStream, audioSource, micDeviceId);
 
       activeSessionId = nextSessionId;
@@ -195,6 +203,7 @@ export default defineUnlistedScript(() => {
       manifest = {
         sessionId: nextSessionId,
         startTime: Date.now(),
+        recordingQuality: activeCaptureQuality,
         chunks: [],
         totalDuration: 0,
         status: 'recording',
@@ -203,7 +212,7 @@ export default defineUnlistedScript(() => {
       const mimeType = pickMimeType();
       recorder = new MediaRecorder(captureStream, {
         mimeType,
-        videoBitsPerSecond: 4_000_000,
+        videoBitsPerSecond: captureProfile.videoBitsPerSecond,
       });
       if (manifest) {
         manifest.mimeType = recorder.mimeType || mimeType;
@@ -762,7 +771,11 @@ export default defineUnlistedScript(() => {
         });
       }
 
-      return { ok: true, chunks: checks };
+      return {
+        ok: true,
+        chunks: checks,
+        recordingQuality: normalizeCaptureQuality(manifestData.recordingQuality),
+      };
     } catch (error) {
       return {
         ok: false,
@@ -1290,16 +1303,8 @@ export default defineUnlistedScript(() => {
     return high * 2 ** 32 + low;
   }
 
-  async function getTabStreamById(streamId: string) {
-    const video = {
-      mandatory: {
-        chromeMediaSource: 'tab',
-        chromeMediaSourceId: streamId,
-        maxWidth: CAPTURE_MAX_WIDTH,
-        maxHeight: CAPTURE_MAX_HEIGHT,
-        maxFrameRate: CAPTURE_MAX_FRAME_RATE,
-      },
-    } as unknown as MediaTrackConstraints;
+  async function getTabStreamById(streamId: string, captureQuality: CaptureQuality) {
+    const video = buildTabCaptureConstraints(streamId, captureQuality);
 
     const audio = {
       mandatory: {

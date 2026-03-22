@@ -9,6 +9,7 @@ import type {
 } from '@/lib/recording';
 import type {
   AudioSource,
+  CaptureQuality,
   MicMixFailedMessage,
   MicPreflightResponse,
   OffscreenEventMessage,
@@ -29,6 +30,7 @@ import {
   createSessionId,
   delay,
   normalizeAudioSource,
+  normalizeCaptureQuality,
   normalizeMicDeviceId,
   normalizeSystemAudioStatus,
   toErrorMessage,
@@ -71,6 +73,7 @@ let processingPipelineRunning = false;
 let recordingTabId: number | null = null;
 let activeAudioSource: AudioSource = 'both';
 let selectedMicDeviceId: string | null = null;
+let recordingQuality: CaptureQuality = '1080p';
 const offscreenClient = new OffscreenClient();
 
 export default defineBackground(() => {
@@ -85,14 +88,16 @@ export default defineBackground(() => {
     if (message.type === RuntimeMessageType.START) {
       const requestedAudioSource = normalizeAudioSource(message.audioSource);
       const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
-      void handleStart(requestedAudioSource, requestedMicDeviceId).then(sendResponse);
+      const requestedQuality = normalizeCaptureQuality(message.quality);
+      void handleStart(requestedAudioSource, requestedMicDeviceId, requestedQuality).then(sendResponse);
       return true;
     }
 
     if (message.type === RuntimeMessageType.PREPARE_START) {
       const includeMic = message.includeMic !== false;
       const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
-      void handlePrepareStart(includeMic, requestedMicDeviceId)
+      const requestedQuality = normalizeCaptureQuality(message.quality);
+      void handlePrepareStart(includeMic, requestedMicDeviceId, requestedQuality)
         .then(sendResponse)
         .catch((error) => {
           errorMessage = toErrorMessage(error);
@@ -257,6 +262,7 @@ async function hydrateContext() {
     orphanedSessions = Array.isArray(stored.orphanedSessions) ? stored.orphanedSessions : [];
     recoverySessionId = stored.recoverySessionId ?? null;
     recoveryChunks = Array.isArray(stored.recoveryChunks) ? stored.recoveryChunks : [];
+    recordingQuality = normalizeCaptureQuality(stored.recordingQuality);
     outputUrl = null;
 
     if (stored.state === 'done') {
@@ -341,6 +347,7 @@ function buildSnapshot(): RecordingSnapshot {
     storageWarningMessage,
     canDownload: Boolean(outputUrl) && (state === 'done' || state === 'recovery'),
     outputFileName,
+    recordingQuality,
     validation,
     processingMetrics,
     audioPreflight,
@@ -399,6 +406,7 @@ async function persistContext() {
     micWarningMessage,
     storageWarningMessage,
     outputFileName,
+    recordingQuality,
     validation,
     processingMetrics,
     audioPreflight,
@@ -507,13 +515,18 @@ function resetAttemptMetadata() {
   selectedMicDeviceId = null;
 }
 
-async function handleStart(audioSource: AudioSource = 'both', micDeviceId: string | null = null) {
+async function handleStart(
+  audioSource: AudioSource = 'both',
+  micDeviceId: string | null = null,
+  quality: CaptureQuality = '1080p',
+) {
   if (state !== 'armed') {
     return { ok: false, error: `Cannot start from state "${state}"`, snapshot: buildSnapshot() };
   }
 
   activeAudioSource = audioSource;
   selectedMicDeviceId = audioSource === 'both' || audioSource === 'mic' ? micDeviceId : null;
+  recordingQuality = normalizeCaptureQuality(quality);
   const nextSessionId = createSessionId();
   resetSessionMetadata(nextSessionId);
 
@@ -533,6 +546,7 @@ async function handleStart(audioSource: AudioSource = 'both', micDeviceId: strin
       streamId,
       audioSource,
       micDeviceId: selectedMicDeviceId,
+      quality: recordingQuality,
     });
 
     if (!result?.ok) {
@@ -562,9 +576,16 @@ async function handleStart(audioSource: AudioSource = 'both', micDeviceId: strin
   }
 }
 
-async function handlePrepareStart(includeMic = true, micDeviceId: string | null = null) {
+async function handlePrepareStart(
+  includeMic = true,
+  micDeviceId: string | null = null,
+  quality: CaptureQuality = '1080p',
+) {
   try {
     if (state === 'armed') {
+      recordingQuality = normalizeCaptureQuality(quality);
+      await persistContext();
+      await broadcastSnapshot();
       return { ok: true, snapshot: buildSnapshot() };
     }
 
@@ -572,6 +593,7 @@ async function handlePrepareStart(includeMic = true, micDeviceId: string | null 
       return { ok: false, error: `Cannot prepare from state "${state}"`, snapshot: buildSnapshot() };
     }
 
+    recordingQuality = normalizeCaptureQuality(quality);
     resetAttemptMetadata();
     await persistContext();
     await broadcastSnapshot();
@@ -1090,6 +1112,8 @@ async function handleRecoverOrphan(targetSessionId: string, chunkIndexes?: numbe
           snapshot: buildSnapshot(),
         };
       }
+
+      recordingQuality = normalizeCaptureQuality(inspect.recordingQuality);
 
       const inspectedChunks = Array.isArray(inspect.chunks) ? inspect.chunks : [];
       const suspectChunks = inspectedChunks.filter((chunk) => chunk.status !== 'ok');

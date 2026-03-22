@@ -6,6 +6,7 @@ import type {
   RecoveryChunkCheck,
   ValidationResult,
 } from '@/lib/recording';
+import type { CaptureQuality } from '@/lib/messages';
 
 const CONTEXT_KEY = 'phase2-recording-context';
 
@@ -19,6 +20,7 @@ export interface PersistedContext {
   micWarningMessage: string | null;
   storageWarningMessage: string | null;
   outputFileName: string | null;
+  recordingQuality?: CaptureQuality;
   validation: ValidationResult | null;
   processingMetrics: ProcessingMetrics | null;
   audioPreflight: AudioPreflightSnapshot;

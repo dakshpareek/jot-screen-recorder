@@ -3,6 +3,7 @@ import {
   createSessionId,
   delay,
   normalizeAudioSource,
+  normalizeCaptureQuality,
   normalizeMicDeviceId,
   normalizeSystemAudioStatus,
   toErrorMessage,
@@ -25,6 +26,13 @@ describe('background utils', () => {
     expect(normalizeAudioSource('both')).toBe('both');
     expect(normalizeAudioSource('unexpected')).toBe('both');
     expect(normalizeAudioSource(undefined)).toBe('both');
+  });
+
+  it('normalizes capture quality safely', () => {
+    expect(normalizeCaptureQuality('720p')).toBe('720p');
+    expect(normalizeCaptureQuality('1080p')).toBe('1080p');
+    expect(normalizeCaptureQuality('unexpected')).toBe('1080p');
+    expect(normalizeCaptureQuality(undefined)).toBe('1080p');
   });
 
   it('normalizes mic device ids', () => {

@@ -1,3 +1,5 @@
+import type { CaptureQuality } from './messages';
+
 export type RecordingState =
   | 'idle'
   | 'preflight'
@@ -83,6 +85,7 @@ export interface RecordingSnapshot {
   storageWarningMessage: string | null;
   canDownload: boolean;
   outputFileName: string | null;
+  recordingQuality: CaptureQuality;
   validation: ValidationResult | null;
   processingMetrics: ProcessingMetrics | null;
   audioPreflight: AudioPreflightSnapshot;

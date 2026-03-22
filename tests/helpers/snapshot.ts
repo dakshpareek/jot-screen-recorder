@@ -13,6 +13,7 @@ export function createSnapshot(overrides: Partial<RecordingSnapshot> = {}): Reco
     storageWarningMessage: null,
     canDownload: false,
     outputFileName: null,
+    recordingQuality: '1080p',
     validation: null,
     processingMetrics: null,
     audioPreflight: {

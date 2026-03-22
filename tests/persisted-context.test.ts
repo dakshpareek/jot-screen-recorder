@@ -18,6 +18,7 @@ function createSampleContext(): PersistedContext {
     micWarningMessage: null,
     storageWarningMessage: null,
     outputFileName: null,
+    recordingQuality: '720p',
     validation: null,
     processingMetrics: null,
     audioPreflight: {

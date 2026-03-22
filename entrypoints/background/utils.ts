@@ -1,4 +1,4 @@
-import type { AudioSource } from '@/lib/messages';
+import type { AudioSource, CaptureQuality } from '@/lib/messages';
 import type { SystemAudioStatus } from '@/lib/recording';
 
 export function normalizeSystemAudioStatus(value: unknown): SystemAudioStatus {
@@ -13,6 +13,13 @@ export function normalizeAudioSource(value: unknown): AudioSource {
     return value;
   }
   return 'both';
+}
+
+export function normalizeCaptureQuality(value: unknown): CaptureQuality {
+  if (value === '720p') {
+    return value;
+  }
+  return '1080p';
 }
 
 export function normalizeMicDeviceId(value: unknown): string | null {
