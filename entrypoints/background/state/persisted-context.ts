@@ -7,11 +7,13 @@ import type {
   RecoveryChunkCheck,
   ValidationResult,
 } from '@/lib/recording';
-import type { CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
+import type { CaptureQuality, CaptureResolvedQuality, EncoderBackend } from '@/lib/messages';
 import { normalizeCaptureQuality, normalizeResolvedCaptureQuality } from '@/lib/capture-presets';
+export type { EncoderBackend } from '@/lib/messages';
 
 const CONTEXT_KEY = 'phase2-recording-context';
-const EXPERIMENTAL_FLAGS_KEY = 'experimental-flags';
+const RECORDER_SETTINGS_KEY = 'recorder-settings';
+const LEGACY_EXPERIMENTAL_FLAGS_KEY = 'experimental-flags';
 
 export interface PersistedContext {
   state: RecordingState;
@@ -36,8 +38,12 @@ export interface PersistedContext {
   webCodecsStats?: RecordingSnapshot['webCodecsStats'];
 }
 
-export interface ExperimentalFlags {
-  useWebCodecs: boolean;
+export interface RecorderSettings {
+  encoderBackend: EncoderBackend;
+}
+
+interface LegacyExperimentalFlags {
+  useWebCodecs?: boolean;
 }
 
 /**
@@ -46,23 +52,39 @@ export interface ExperimentalFlags {
  */
 export const WEBCODECS_KILL_SWITCH_FORCE_LEGACY = false;
 
-const DEFAULT_EXPERIMENTAL_FLAGS: ExperimentalFlags = {
-  // 4.1: WebCodecs default-on for new users (unless explicitly disabled).
-  useWebCodecs: true,
+const DEFAULT_RECORDER_SETTINGS: RecorderSettings = {
+  // 4.1/4.3: WebCodecs default-on as the primary encoder backend.
+  encoderBackend: 'webcodecs',
 };
 
-function applyExperimentalFlagPolicy(flags: ExperimentalFlags): ExperimentalFlags {
-  if (WEBCODECS_KILL_SWITCH_FORCE_LEGACY) {
-    return { ...flags, useWebCodecs: false };
-  }
-  return flags;
+function normalizeEncoderBackend(value: unknown): EncoderBackend {
+  if (value === 'mediarecorder') return 'mediarecorder';
+  return 'webcodecs';
 }
 
-async function loadStoredExperimentalFlags(): Promise<Partial<ExperimentalFlags>> {
-  const stored = (await chrome.storage.local.get(EXPERIMENTAL_FLAGS_KEY))[EXPERIMENTAL_FLAGS_KEY] as
-    | Partial<ExperimentalFlags>
-    | undefined;
-  return stored ?? {};
+function applyRecorderSettingsPolicy(settings: RecorderSettings): RecorderSettings {
+  if (WEBCODECS_KILL_SWITCH_FORCE_LEGACY) {
+    return { ...settings, encoderBackend: 'mediarecorder' };
+  }
+  return settings;
+}
+
+async function loadStoredRecorderSettings(): Promise<Partial<RecorderSettings>> {
+  const stored = await chrome.storage.local.get([RECORDER_SETTINGS_KEY, LEGACY_EXPERIMENTAL_FLAGS_KEY]);
+  const current = stored[RECORDER_SETTINGS_KEY] as Partial<RecorderSettings> | undefined;
+  if (current?.encoderBackend) {
+    return {
+      encoderBackend: normalizeEncoderBackend(current.encoderBackend),
+    };
+  }
+
+  const legacy = stored[LEGACY_EXPERIMENTAL_FLAGS_KEY] as LegacyExperimentalFlags | undefined;
+  if (typeof legacy?.useWebCodecs === 'boolean') {
+    return {
+      encoderBackend: legacy.useWebCodecs ? 'webcodecs' : 'mediarecorder',
+    };
+  }
+  return {};
 }
 
 export async function loadPersistedContext(): Promise<PersistedContext | undefined> {
@@ -90,22 +112,32 @@ export async function savePersistedContext(payload: PersistedContext): Promise<v
   await chrome.storage.local.set({ [CONTEXT_KEY]: payload });
 }
 
-export async function loadExperimentalFlags(): Promise<ExperimentalFlags> {
-  const stored = await loadStoredExperimentalFlags();
+export async function loadRecorderSettings(): Promise<RecorderSettings> {
+  const stored = await loadStoredRecorderSettings();
   const merged = {
-    ...DEFAULT_EXPERIMENTAL_FLAGS,
+    ...DEFAULT_RECORDER_SETTINGS,
     ...stored,
   };
-  return applyExperimentalFlagPolicy(merged);
+  return applyRecorderSettingsPolicy({
+    ...merged,
+    encoderBackend: normalizeEncoderBackend(merged.encoderBackend),
+  });
 }
 
-export async function saveExperimentalFlags(flags: Partial<ExperimentalFlags>): Promise<ExperimentalFlags> {
-  const stored = await loadStoredExperimentalFlags();
+export async function saveRecorderSettings(
+  settings: Partial<RecorderSettings>,
+): Promise<RecorderSettings> {
+  const stored = await loadStoredRecorderSettings();
   const currentRaw = {
-    ...DEFAULT_EXPERIMENTAL_FLAGS,
+    ...DEFAULT_RECORDER_SETTINGS,
     ...stored,
   };
-  const updated = { ...currentRaw, ...flags };
-  await chrome.storage.local.set({ [EXPERIMENTAL_FLAGS_KEY]: updated });
-  return applyExperimentalFlagPolicy(updated);
+  const updated = {
+    ...currentRaw,
+    ...settings,
+    encoderBackend: normalizeEncoderBackend(settings.encoderBackend ?? currentRaw.encoderBackend),
+  };
+  await chrome.storage.local.set({ [RECORDER_SETTINGS_KEY]: updated });
+  await chrome.storage.local.remove(LEGACY_EXPERIMENTAL_FLAGS_KEY).catch(() => {});
+  return applyRecorderSettingsPolicy(updated);
 }

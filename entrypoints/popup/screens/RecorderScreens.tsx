@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import type { CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
+import type { CaptureQuality, CaptureResolvedQuality, EncoderBackend } from '@/lib/messages';
 import { toCaptureQualityLabel, toResolvedQualityLabel } from '@/lib/capture-presets';
 import {
   type AudioPreflightSnapshot,
@@ -190,8 +190,8 @@ export function IdleScreen({
   onSettingsClose,
   quality,
   onQualityChange,
-  useWebCodecs,
-  onWebCodecsChange,
+  encoderBackend,
+  onEncoderBackendChange,
   webCodecsSupport,
 }: {
   micControl: ReactNode;
@@ -207,10 +207,13 @@ export function IdleScreen({
   onSettingsClose: () => void;
   quality: CaptureQuality;
   onQualityChange: (q: CaptureQuality) => void;
-  useWebCodecs: boolean;
-  onWebCodecsChange: (enabled: boolean) => void;
+  encoderBackend: EncoderBackend;
+  onEncoderBackendChange: (backend: EncoderBackend) => void;
   webCodecsSupport: { supported: boolean; hardwareAccelerated: boolean } | null;
 }) {
+  const webCodecsUnavailable = webCodecsSupport !== null && !webCodecsSupport.supported;
+  const useLegacyEncoder = encoderBackend === 'mediarecorder' || webCodecsUnavailable;
+
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1 }}>
       <div className="rk-body">
@@ -325,27 +328,29 @@ export function IdleScreen({
             </div>
 
             <div className="rk-settings-section" style={{ marginTop: 16 }}>
-              Experimental
+              Encoding engine
             </div>
             <label className="rk-toggle-row">
               <span className="rk-toggle-label">
-                <span>Use WebCodecs pipeline</span>
+                <span>Use legacy encoder (MediaRecorder)</span>
                 <span className="rk-toggle-desc">
                   {webCodecsSupport === null
                     ? 'Checking...'
-                    : webCodecsSupport.supported
-                      ? webCodecsSupport.hardwareAccelerated
-                        ? 'GPU-accelerated • Faster stop'
-                        : 'Software encoding • Faster stop'
-                      : 'Not supported on this device'}
+                    : webCodecsUnavailable
+                      ? 'WebCodecs unavailable on this device — legacy mode required'
+                      : webCodecsSupport.hardwareAccelerated
+                        ? 'WebCodecs (recommended): GPU-accelerated • faster stop'
+                        : 'WebCodecs (recommended): software encoding • faster stop'}
                 </span>
               </span>
               <input
                 type="checkbox"
                 className="rk-toggle-input"
-                checked={useWebCodecs}
-                disabled={!webCodecsSupport?.supported}
-                onChange={(e) => onWebCodecsChange(e.target.checked)}
+                checked={useLegacyEncoder}
+                disabled={webCodecsUnavailable}
+                onChange={(e) =>
+                  onEncoderBackendChange(e.target.checked ? 'mediarecorder' : 'webcodecs')
+                }
               />
               <span className="rk-toggle-switch" />
             </label>

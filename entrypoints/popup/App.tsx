@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { RuntimeMessageType, type CaptureQuality } from '@/lib/messages';
+import { RuntimeMessageType, type CaptureQuality, type EncoderBackend } from '@/lib/messages';
 import type { RecordingSnapshot, RecordingState } from '@/lib/recording';
 import { debugWarn } from '@/lib/runtime-log';
 import { MicToggleCard } from './components/MicToggleCard';
@@ -74,8 +74,7 @@ export default function App() {
   const [processingStartedAtMs, setProcessingStartedAtMs] = useState<number | null>(null);
   const initializedRecoverySessionRef = useRef<string | null>(null);
 
-  // Experimental WebCodecs state
-  const [useWebCodecs, setUseWebCodecs] = useState(false);
+  const [encoderBackend, setEncoderBackend] = useState<EncoderBackend>('webcodecs');
   const [webCodecsSupport, setWebCodecsSupport] = useState<{
     supported: boolean;
     hardwareAccelerated: boolean;
@@ -112,18 +111,18 @@ export default function App() {
     setProcessingStartedAtMs(null);
   }, [snapshot.state]);
 
-  // Load experimental flags and check WebCodecs support on mount
+  // Load encoder settings + WebCodecs support on mount.
   useEffect(() => {
-    async function loadFlags() {
+    async function loadEncoderSettings() {
       try {
-        const flags = await chrome.runtime.sendMessage({
-          type: RuntimeMessageType.GET_EXPERIMENTAL_FLAGS,
+        const settings = await chrome.runtime.sendMessage({
+          type: RuntimeMessageType.GET_ENCODER_SETTINGS,
         });
-        if (flags?.useWebCodecs !== undefined) {
-          setUseWebCodecs(flags.useWebCodecs);
+        if (settings?.encoderBackend === 'webcodecs' || settings?.encoderBackend === 'mediarecorder') {
+          setEncoderBackend(settings.encoderBackend);
         }
       } catch {
-        // Ignore errors loading flags
+        // Ignore errors loading settings
       }
     }
     
@@ -134,20 +133,30 @@ export default function App() {
           quality: 'auto',
         });
         if (result) {
+          const supported = result.videoSupported === true && result.audioSupported === true;
           setWebCodecsSupport({
-            supported: result.videoSupported === true && result.audioSupported === true,
+            supported,
             hardwareAccelerated: result.hardwareAcceleration === true,
           });
+          if (!supported) {
+            setEncoderBackend('mediarecorder');
+            void chrome.runtime.sendMessage({
+              type: RuntimeMessageType.SET_ENCODER_SETTINGS,
+              settings: { encoderBackend: 'mediarecorder' },
+            }).catch(() => {});
+          }
         } else {
           setWebCodecsSupport({ supported: false, hardwareAccelerated: false });
+          setEncoderBackend('mediarecorder');
         }
       } catch (error) {
         debugWarn('[Popup] WebCodecs check error:', error);
         setWebCodecsSupport({ supported: false, hardwareAccelerated: false });
+        setEncoderBackend('mediarecorder');
       }
     }
 
-    void loadFlags();
+    void loadEncoderSettings();
     void checkSupport();
   }, []);
 
@@ -316,15 +325,15 @@ export default function App() {
     setShowSettings(true);
   }
 
-  async function handleWebCodecsChange(enabled: boolean) {
-    setUseWebCodecs(enabled);
+  async function handleEncoderBackendChange(nextBackend: EncoderBackend) {
+    setEncoderBackend(nextBackend);
     try {
       await chrome.runtime.sendMessage({
-        type: RuntimeMessageType.SET_EXPERIMENTAL_FLAGS,
-        flags: { useWebCodecs: enabled },
+        type: RuntimeMessageType.SET_ENCODER_SETTINGS,
+        settings: { encoderBackend: nextBackend },
       });
     } catch {
-      // Ignore errors saving flags
+      // Ignore errors saving settings
     }
   }
 
@@ -396,8 +405,8 @@ export default function App() {
             setQuality(q);
             setShowSettings(false);
           }}
-          useWebCodecs={useWebCodecs}
-          onWebCodecsChange={handleWebCodecsChange}
+          encoderBackend={encoderBackend}
+          onEncoderBackendChange={handleEncoderBackendChange}
           webCodecsSupport={webCodecsSupport}
         />
       ) : null}

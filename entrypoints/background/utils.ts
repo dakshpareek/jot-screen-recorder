@@ -29,12 +29,12 @@ export function normalizeResolvedCaptureQuality(value: unknown): CaptureResolved
 
 export function getSystemAudioPreflightSnapshot(
   audioSource: AudioSource,
-  useWebCodecs: boolean,
+  usesWebCodecsBackend: boolean,
 ): Pick<
   AudioPreflightSnapshot,
   'systemAudioStatus' | 'systemAudioLevel' | 'systemAudioMessage' | 'needsSystemAudioDecision'
 > {
-  const shouldRunCheck = !useWebCodecs && (audioSource === 'both' || audioSource === 'tab');
+  const shouldRunCheck = !usesWebCodecsBackend && (audioSource === 'both' || audioSource === 'tab');
   return {
     systemAudioStatus: shouldRunCheck ? 'pending' : 'idle',
     systemAudioLevel: null,

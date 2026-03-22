@@ -54,6 +54,8 @@ export default defineUnlistedScript(() => {
   let FFmpegCtor: FFmpegClass | null = null;
   let ffmpeg: InstanceType<FFmpegClass> | null = null;
   let ffmpegLoaded = false;
+  let ffmpegLoadCount = 0;
+  let ffmpegLastLoadMs = 0;
   let ffmpegDurationHint = 0;
   let ffmpegLastProgress = -1;
 
@@ -176,7 +178,7 @@ export default defineUnlistedScript(() => {
       return;
     }
 
-    // Experimental WebCodecs pipeline handlers
+    // WebCodecs pipeline handlers
     if (msg.type === RuntimeMessageType.WEBCODECS_CHECK_SUPPORT) {
       void (async () => {
         try {
@@ -401,14 +403,7 @@ export default defineUnlistedScript(() => {
       // System-audio verification must inspect tab audio only (not mixed mic+tab output).
       startSystemAudioCheck(tabCaptureStream);
       startStorageMonitor();
-      const activeMimeType = recorder.mimeType || mimeType;
-      // Preload ffmpeg while recording so stop->process latency is lower.
-      // Skip prewarm when we're already recording MP4 chunks and may fast-path copy.
-      if (!activeMimeType.includes('mp4')) {
-        void ensureFFmpeg().catch((error) => {
-          debugWarn('[Offscreen] ffmpeg prewarm failed:', toNamedErrorMessage(error));
-        });
-      }
+      // 4.2: FFmpeg stays cold-path only (processing/recovery). No start-time prewarm.
       return {
         ok: true,
         requestedPreset: activeCaptureQuality,
@@ -1153,12 +1148,19 @@ export default defineUnlistedScript(() => {
     }
 
     if (!ffmpegLoaded) {
+      const loadStart = performance.now();
       await ffmpeg.load({
         classWorkerURL: chrome.runtime.getURL('ffmpeg/worker.js'),
         coreURL: chrome.runtime.getURL('ffmpeg-core.js'),
         wasmURL: chrome.runtime.getURL('ffmpeg-core.wasm'),
       });
       ffmpegLoaded = true;
+      ffmpegLoadCount += 1;
+      ffmpegLastLoadMs = performance.now() - loadStart;
+      debugInfo('[Offscreen] FFmpeg loaded on cold path', {
+        ffmpegLoadCount,
+        ffmpegLastLoadMs,
+      });
     }
 
     return ffmpeg;

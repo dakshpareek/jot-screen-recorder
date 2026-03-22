@@ -3,6 +3,7 @@ import type { ProcessingMetrics, RecordingSnapshot, RecoveryChunkCheck, Validati
 export type AudioSource = 'both' | 'mic' | 'tab' | 'silent';
 export type CaptureQuality = 'auto' | '1080p30' | '1080p60' | '4k30';
 export type CaptureResolvedQuality = CaptureQuality | '1440p30';
+export type EncoderBackend = 'webcodecs' | 'mediarecorder';
 
 export const RuntimeMessageType = {
   GET_STATE: 'GET_STATE',
@@ -41,13 +42,14 @@ export const RuntimeMessageType = {
   OFFSCREEN_READY: 'OFFSCREEN_READY',
   OFFSCREEN_EVENT: 'OFFSCREEN_EVENT',
 
-  // Experimental WebCodecs pipeline
+  // WebCodecs pipeline
   WEBCODECS_CHECK_SUPPORT: 'WEBCODECS_CHECK_SUPPORT',
   OFFSCREEN_START_WEBCODECS: 'OFFSCREEN_START_WEBCODECS',
   OFFSCREEN_STOP_WEBCODECS: 'OFFSCREEN_STOP_WEBCODECS',
   WEBCODECS_FATAL_ERROR: 'WEBCODECS_FATAL_ERROR',
-  GET_EXPERIMENTAL_FLAGS: 'GET_EXPERIMENTAL_FLAGS',
-  SET_EXPERIMENTAL_FLAGS: 'SET_EXPERIMENTAL_FLAGS',
+  // Product settings surface.
+  GET_ENCODER_SETTINGS: 'GET_ENCODER_SETTINGS',
+  SET_ENCODER_SETTINGS: 'SET_ENCODER_SETTINGS',
 
   SYSTEM_AUDIO_OK: 'SYSTEM_AUDIO_OK',
   SYSTEM_AUDIO_SILENT: 'SYSTEM_AUDIO_SILENT',

@@ -1,14 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   loadPersistedContext,
-  loadExperimentalFlags,
-  saveExperimentalFlags,
+  loadRecorderSettings,
+  saveRecorderSettings,
   savePersistedContext,
   type PersistedContext,
 } from '@/entrypoints/background/state/persisted-context';
 
 const CONTEXT_KEY = 'phase2-recording-context';
-const EXPERIMENTAL_FLAGS_KEY = 'experimental-flags';
+const RECORDER_SETTINGS_KEY = 'recorder-settings';
+const LEGACY_EXPERIMENTAL_FLAGS_KEY = 'experimental-flags';
 
 function createSampleContext(): PersistedContext {
   return {
@@ -54,16 +55,19 @@ function createSampleContext(): PersistedContext {
 describe('persisted-context storage contract', () => {
   const getMock = vi.fn();
   const setMock = vi.fn();
+  const removeMock = vi.fn();
 
   beforeEach(() => {
     getMock.mockReset();
     setMock.mockReset();
+    removeMock.mockReset();
 
     (globalThis as { chrome: unknown }).chrome = {
       storage: {
         local: {
           get: getMock,
           set: setMock,
+          remove: removeMock,
         },
       },
     };
@@ -131,37 +135,59 @@ describe('persisted-context storage contract', () => {
     await expect(loadPersistedContext()).rejects.toThrow('read-failed');
   });
 
-  it('defaults experimental flags to WebCodecs on for new installs', async () => {
+  it('defaults recorder settings to WebCodecs backend on new installs', async () => {
     getMock.mockResolvedValue({});
 
-    const flags = await loadExperimentalFlags();
+    const settings = await loadRecorderSettings();
 
-    expect(getMock).toHaveBeenCalledWith(EXPERIMENTAL_FLAGS_KEY);
-    expect(flags).toEqual({ useWebCodecs: true });
+    expect(settings).toEqual({ encoderBackend: 'webcodecs' });
   });
 
-  it('preserves stored experimental flags when already set', async () => {
+  it('preserves stored recorder settings when already set', async () => {
     getMock.mockResolvedValue({
-      [EXPERIMENTAL_FLAGS_KEY]: { useWebCodecs: false },
+      [RECORDER_SETTINGS_KEY]: { encoderBackend: 'mediarecorder' },
     });
 
-    const flags = await loadExperimentalFlags();
+    const settings = await loadRecorderSettings();
 
-    expect(flags).toEqual({ useWebCodecs: false });
+    expect(settings).toEqual({ encoderBackend: 'mediarecorder' });
   });
 
-  it('saves and returns merged experimental flags', async () => {
+  it('migrates legacy experimental flag storage into encoder settings', async () => {
+    getMock.mockResolvedValue({
+      [LEGACY_EXPERIMENTAL_FLAGS_KEY]: { useWebCodecs: false },
+    });
+
+    const settings = await loadRecorderSettings();
+
+    expect(settings).toEqual({ encoderBackend: 'mediarecorder' });
+  });
+
+  it('saves and returns merged recorder settings', async () => {
     const store: Record<string, unknown> = {
-      [EXPERIMENTAL_FLAGS_KEY]: { useWebCodecs: false },
+      [RECORDER_SETTINGS_KEY]: { encoderBackend: 'mediarecorder' },
+      [LEGACY_EXPERIMENTAL_FLAGS_KEY]: { useWebCodecs: false },
     };
-    getMock.mockImplementation(async (key: string) => ({ [key]: store[key] }));
+    getMock.mockImplementation(async (key: string | string[]) => {
+      if (Array.isArray(key)) {
+        return key.reduce(
+          (acc, k) => ({ ...acc, [k]: store[k] }),
+          {} as Record<string, unknown>,
+        );
+      }
+      return { [key]: store[key] };
+    });
     setMock.mockImplementation(async (value: Record<string, unknown>) => {
       Object.assign(store, value);
     });
+    removeMock.mockImplementation(async (key: string) => {
+      delete store[key];
+    });
 
-    const updated = await saveExperimentalFlags({ useWebCodecs: true });
+    const updated = await saveRecorderSettings({ encoderBackend: 'webcodecs' });
 
-    expect(updated).toEqual({ useWebCodecs: true });
-    expect(store[EXPERIMENTAL_FLAGS_KEY]).toEqual({ useWebCodecs: true });
+    expect(updated).toEqual({ encoderBackend: 'webcodecs' });
+    expect(store[RECORDER_SETTINGS_KEY]).toEqual({ encoderBackend: 'webcodecs' });
+    expect(store[LEGACY_EXPERIMENTAL_FLAGS_KEY]).toBeUndefined();
   });
 });

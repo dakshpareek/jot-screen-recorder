@@ -39,8 +39,8 @@ Authoritative transition table lives in:
 - `REFRESH_ORPHANS`
 - `DOWNLOAD_RAW_CHUNKS` (`sessionId`)
 - `OPEN_MIC_SETTINGS`
-- `GET_EXPERIMENTAL_FLAGS`
-- `SET_EXPERIMENTAL_FLAGS` (`flags.useWebCodecs`)
+- `GET_ENCODER_SETTINGS`
+- `SET_ENCODER_SETTINGS` (`settings.encoderBackend`)
 - `WEBCODECS_CHECK_SUPPORT` (`quality`)
 
 ## Background -> Offscreen Commands
@@ -96,7 +96,13 @@ Quality preset fields:
 - WebCodecs mode does not currently run runtime system-audio verification, so `audioPreflight.systemAudioStatus` remains `idle` unless explicit system-audio runtime signals are added in the future.
 
 ## WebCodecs Default Policy (Phase 4.1)
-- WebCodecs is now default-on for new installs via `DEFAULT_EXPERIMENTAL_FLAGS.useWebCodecs = true`.
-- User preference is still honored through `experimental-flags.useWebCodecs`.
+- WebCodecs is default-on for new installs via `DEFAULT_RECORDER_SETTINGS.encoderBackend = "webcodecs"`.
+- User preference is honored through `recorder-settings.encoderBackend`.
+- Legacy installs using `experimental-flags.useWebCodecs` are migrated on read.
 - A global kill switch (`WEBCODECS_KILL_SWITCH_FORCE_LEGACY`) can force MediaRecorder regardless of saved/user flags.
 - Start flow is WebCodecs-first with automatic fallback to MediaRecorder if WebCodecs start fails.
+
+## FFmpeg Load Policy (Phase 4.2)
+- FFmpeg remains a cold-path dependency for processing/recovery/transcode paths.
+- Recording start/happy-path capture does not prewarm FFmpeg.
+- `ffmpeg.load()` should only occur from cold paths that require FFmpeg execution.
