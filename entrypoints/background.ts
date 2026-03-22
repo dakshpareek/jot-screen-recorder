@@ -632,19 +632,8 @@ async function handleStart(
     recordingTabId = targetTabId;
 
     let result: OffscreenResponse;
-    if (usingWebCodecs) {
-      // Use experimental WebCodecs pipeline
-      result = await offscreenClient.send<OffscreenResponse>({
-        type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS,
-        sessionId: nextSessionId,
-        streamId,
-        quality: recordingQuality,
-        audioSource,
-        micDeviceId: selectedMicDeviceId,
-      });
-    } else {
-      // Use standard MediaRecorder pipeline
-      result = await offscreenClient.send<OffscreenResponse>({
+    const startMediaRecorder = async () =>
+      await offscreenClient.send<OffscreenResponse>({
         type: RuntimeMessageType.OFFSCREEN_START,
         sessionId: nextSessionId,
         streamId,
@@ -652,6 +641,49 @@ async function handleStart(
         micDeviceId: selectedMicDeviceId,
         quality: recordingQuality,
       });
+
+    if (usingWebCodecs) {
+      // 4.1: WebCodecs primary path with automatic MediaRecorder fallback.
+      let webCodecsError: string | null = null;
+      try {
+        const webCodecsResult = await offscreenClient.send<OffscreenResponse>({
+          type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS,
+          sessionId: nextSessionId,
+          streamId,
+          quality: recordingQuality,
+          audioSource,
+          micDeviceId: selectedMicDeviceId,
+        });
+        if (webCodecsResult?.ok) {
+          result = webCodecsResult;
+        } else {
+          webCodecsError = webCodecsResult?.error ?? 'Unknown WebCodecs start failure';
+          debugWarn('[Background] WebCodecs start failed; falling back to MediaRecorder:', webCodecsError);
+          usingWebCodecs = false;
+          const fallback = await startMediaRecorder();
+          result =
+            fallback?.ok || !fallback
+              ? fallback
+              : {
+                  ...fallback,
+                  error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${fallback.error ?? 'Unknown fallback failure'}`,
+                };
+        }
+      } catch (error) {
+        webCodecsError = toErrorMessage(error);
+        debugWarn('[Background] WebCodecs start threw; falling back to MediaRecorder:', webCodecsError);
+        usingWebCodecs = false;
+        const fallback = await startMediaRecorder();
+        result =
+          fallback?.ok || !fallback
+            ? fallback
+            : {
+                ...fallback,
+                error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${fallback.error ?? 'Unknown fallback failure'}`,
+              };
+      }
+    } else {
+      result = await startMediaRecorder();
     }
 
     if (!result?.ok) {

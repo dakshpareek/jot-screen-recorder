@@ -40,9 +40,30 @@ export interface ExperimentalFlags {
   useWebCodecs: boolean;
 }
 
+/**
+ * Global emergency rollback switch.
+ * Set true to force MediaRecorder path regardless of saved/user flags.
+ */
+export const WEBCODECS_KILL_SWITCH_FORCE_LEGACY = false;
+
 const DEFAULT_EXPERIMENTAL_FLAGS: ExperimentalFlags = {
-  useWebCodecs: false,
+  // 4.1: WebCodecs default-on for new users (unless explicitly disabled).
+  useWebCodecs: true,
 };
+
+function applyExperimentalFlagPolicy(flags: ExperimentalFlags): ExperimentalFlags {
+  if (WEBCODECS_KILL_SWITCH_FORCE_LEGACY) {
+    return { ...flags, useWebCodecs: false };
+  }
+  return flags;
+}
+
+async function loadStoredExperimentalFlags(): Promise<Partial<ExperimentalFlags>> {
+  const stored = (await chrome.storage.local.get(EXPERIMENTAL_FLAGS_KEY))[EXPERIMENTAL_FLAGS_KEY] as
+    | Partial<ExperimentalFlags>
+    | undefined;
+  return stored ?? {};
+}
 
 export async function loadPersistedContext(): Promise<PersistedContext | undefined> {
   const payload = (await chrome.storage.local.get(CONTEXT_KEY))[CONTEXT_KEY] as
@@ -70,18 +91,21 @@ export async function savePersistedContext(payload: PersistedContext): Promise<v
 }
 
 export async function loadExperimentalFlags(): Promise<ExperimentalFlags> {
-  const stored = (await chrome.storage.local.get(EXPERIMENTAL_FLAGS_KEY))[EXPERIMENTAL_FLAGS_KEY] as
-    | Partial<ExperimentalFlags>
-    | undefined;
-  return {
+  const stored = await loadStoredExperimentalFlags();
+  const merged = {
     ...DEFAULT_EXPERIMENTAL_FLAGS,
-    ...(stored ?? {}),
+    ...stored,
   };
+  return applyExperimentalFlagPolicy(merged);
 }
 
 export async function saveExperimentalFlags(flags: Partial<ExperimentalFlags>): Promise<ExperimentalFlags> {
-  const current = await loadExperimentalFlags();
-  const updated = { ...current, ...flags };
+  const stored = await loadStoredExperimentalFlags();
+  const currentRaw = {
+    ...DEFAULT_EXPERIMENTAL_FLAGS,
+    ...stored,
+  };
+  const updated = { ...currentRaw, ...flags };
   await chrome.storage.local.set({ [EXPERIMENTAL_FLAGS_KEY]: updated });
-  return updated;
+  return applyExperimentalFlagPolicy(updated);
 }

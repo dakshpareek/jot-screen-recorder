@@ -1,11 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   loadPersistedContext,
+  loadExperimentalFlags,
+  saveExperimentalFlags,
   savePersistedContext,
   type PersistedContext,
 } from '@/entrypoints/background/state/persisted-context';
 
 const CONTEXT_KEY = 'phase2-recording-context';
+const EXPERIMENTAL_FLAGS_KEY = 'experimental-flags';
 
 function createSampleContext(): PersistedContext {
   return {
@@ -126,5 +129,39 @@ describe('persisted-context storage contract', () => {
 
     getMock.mockRejectedValueOnce(new Error('read-failed'));
     await expect(loadPersistedContext()).rejects.toThrow('read-failed');
+  });
+
+  it('defaults experimental flags to WebCodecs on for new installs', async () => {
+    getMock.mockResolvedValue({});
+
+    const flags = await loadExperimentalFlags();
+
+    expect(getMock).toHaveBeenCalledWith(EXPERIMENTAL_FLAGS_KEY);
+    expect(flags).toEqual({ useWebCodecs: true });
+  });
+
+  it('preserves stored experimental flags when already set', async () => {
+    getMock.mockResolvedValue({
+      [EXPERIMENTAL_FLAGS_KEY]: { useWebCodecs: false },
+    });
+
+    const flags = await loadExperimentalFlags();
+
+    expect(flags).toEqual({ useWebCodecs: false });
+  });
+
+  it('saves and returns merged experimental flags', async () => {
+    const store: Record<string, unknown> = {
+      [EXPERIMENTAL_FLAGS_KEY]: { useWebCodecs: false },
+    };
+    getMock.mockImplementation(async (key: string) => ({ [key]: store[key] }));
+    setMock.mockImplementation(async (value: Record<string, unknown>) => {
+      Object.assign(store, value);
+    });
+
+    const updated = await saveExperimentalFlags({ useWebCodecs: true });
+
+    expect(updated).toEqual({ useWebCodecs: true });
+    expect(store[EXPERIMENTAL_FLAGS_KEY]).toEqual({ useWebCodecs: true });
   });
 });
