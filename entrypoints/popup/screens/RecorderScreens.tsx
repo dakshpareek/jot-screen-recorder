@@ -1,7 +1,6 @@
 import type { ReactNode } from 'react';
 import type { CaptureQuality } from '@/lib/messages';
 import {
-  formatDuration,
   type AudioPreflightSnapshot,
   type OrphanedSession,
   type RecordingSnapshot,
@@ -855,11 +854,17 @@ export function DoneScreen({
   isBusy: boolean;
 }) {
   const metrics = snapshot.processingMetrics;
-  const durationSec = metrics ? Math.round(metrics.inputBytes / 175000) : 0;
+  const durationSec =
+    snapshot.elapsedSeconds > 0
+      ? snapshot.elapsedSeconds
+      : metrics
+        ? Math.round(metrics.inputBytes / 175000)
+        : 0;
   const durMin = Math.floor(durationSec / 60);
   const durSec = durationSec % 60;
-  const durLabel =
-    durationSec > 0 ? `${durMin}:${String(durSec).padStart(2, '0')}` : formatDuration(snapshot.elapsedSeconds);
+  const durLabel = durationSec > 0 ? `${durMin}:${String(durSec).padStart(2, '0')}` : '—';
+  const sizeLabel = metrics?.outputBytes ? formatBytes(metrics.outputBytes) : '—';
+  const qualityLabel = snapshot.recordingQuality ?? '1080p';
 
   return (
     <>
@@ -872,54 +877,53 @@ export function DoneScreen({
           </div>
           <div>
             <div className="rk-done-title">Recording ready</div>
-            <div className="rk-done-sub">Validated · H.264 MP4 · Plays everywhere</div>
+            <div className="rk-done-sub">H.264 MP4 · Plays everywhere</div>
           </div>
         </div>
 
-        <div className="rk-done-preview">
-          <div className="rk-done-thumb">
-            <svg
-              width="32"
-              height="32"
-              viewBox="0 0 32 32"
-              fill="none"
-              stroke="rgba(255,255,255,0.12)"
-              strokeWidth="1.2">
-              <rect x="2" y="5" width="28" height="20" rx="2" />
-              <polygon
-                points="13,11 13,21 22,16"
-                fill="rgba(255,255,255,0.08)"
-                stroke="rgba(255,255,255,0.15)"
-              />
-            </svg>
-            <div className="rk-done-dur">{durLabel}</div>
+        <div className="rk-done-meta-card">
+          <div className="rk-done-meta-top">
+            <div className="rk-done-meta-group">
+              <div className="rk-done-meta-group-lbl">Duration</div>
+              <div className="rk-done-meta-big">{durLabel}</div>
+            </div>
+            <div className="rk-done-meta-group" style={{ textAlign: 'right' }}>
+              <div className="rk-done-meta-group-lbl">File size</div>
+              <div className="rk-done-meta-big">{sizeLabel}</div>
+            </div>
           </div>
-          <div className="rk-done-meta">
-            <div className="rk-done-meta-item">
-              <div className="rk-done-mval">{durLabel}</div>
-              <div className="rk-done-mlbl">Duration</div>
+
+          <div className="rk-done-pills">
+            <div className="rk-done-pill">
+              <svg viewBox="0 0 10 10">
+                <rect x="1" y="1.5" width="8" height="7" rx="1" strokeWidth="1.4" strokeLinecap="round" />
+                <polygon points="3.5,3.5 3.5,6.5 7,5" fill="currentColor" stroke="none" />
+              </svg>
+              {qualityLabel} · 30fps
             </div>
-            <div className="rk-done-meta-item">
-              <div className="rk-done-mval">{metrics ? formatBytes(metrics.outputBytes) : '—'}</div>
-              <div className="rk-done-mlbl">Size</div>
+            <div className="rk-done-pill">
+              <svg viewBox="0 0 10 10">
+                <path d="M2 5h6M5 2l3 3-3 3" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              H.264 MP4
             </div>
-            <div className="rk-done-meta-item">
-              <div className="rk-done-mval">{snapshot.recordingQuality}</div>
-              <div className="rk-done-mlbl">Quality</div>
-            </div>
-            <div className="rk-done-meta-item">
-              <div className="rk-done-mval">MP4</div>
-              <div className="rk-done-mlbl">Format</div>
+            <div className="rk-done-pill">
+              <svg viewBox="0 0 10 10">
+                <rect x="2" y="4" width="6" height="4.5" rx="1" strokeWidth="1.4" strokeLinecap="round" />
+                <path d="M3.5 4V3a1.5 1.5 0 013 0V4" strokeWidth="1.4" strokeLinecap="round" />
+              </svg>
+              Local only
             </div>
           </div>
         </div>
 
         {snapshot.validation?.passed && (
           <div className="rk-val-row">
-            <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M2 6l3 3 5-5" />
+            <svg viewBox="0 0 14 14" fill="none">
+              <path d="M7 1.5L2 4v4.5C2 11.5 4.5 13.5 7 14c2.5-.5 5-2.5 5-5.5V4L7 1.5z" />
+              <path d="M4.5 7.5l2 2 3-3.5" />
             </svg>
-            <span>File validated — video, audio, and duration confirmed</span>
+            <span>Validated — video, audio, and duration confirmed</span>
           </div>
         )}
 
@@ -930,14 +934,14 @@ export function DoneScreen({
           </svg>
           Download MP4
         </button>
-        <div className="rk-row-btns">
-          <button className="rk-sm-btn" onClick={onRecordAgain}>
-            Record again
-          </button>
-          <button className="rk-sm-btn" onClick={() => navigator.clipboard.writeText(snapshot.sessionId ?? '')}>
-            Copy session ID
-          </button>
-        </div>
+
+        <button className="rk-btn-record-again" onClick={onRecordAgain}>
+          <svg viewBox="0 0 12 12">
+            <circle cx="6" cy="6" r="4.5" strokeWidth="1.6" strokeLinecap="round" />
+            <circle cx="6" cy="6" r="1.5" fill="currentColor" stroke="none" />
+          </svg>
+          Record again
+        </button>
       </div>
       <Footer label="MP4 ready to download" />
     </>
