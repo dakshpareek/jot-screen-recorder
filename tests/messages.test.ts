@@ -9,6 +9,10 @@ describe('RuntimeMessageType', () => {
     expect(RuntimeMessageType.STATE_CHANGE).toBe('STATE_CHANGE');
     expect(RuntimeMessageType.OFFSCREEN_STATUS).toBe('OFFSCREEN_STATUS');
     expect(RuntimeMessageType.OFFSCREEN_EVENT).toBe('OFFSCREEN_EVENT');
+    expect(RuntimeMessageType.OFFSCREEN_START_WEBCODECS).toBe('OFFSCREEN_START_WEBCODECS');
+    expect(RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS).toBe('OFFSCREEN_STOP_WEBCODECS');
+    expect(RuntimeMessageType.WEBCODECS_CHECK_SUPPORT).toBe('WEBCODECS_CHECK_SUPPORT');
+    expect(RuntimeMessageType.WEBCODECS_FATAL_ERROR).toBe('WEBCODECS_FATAL_ERROR');
   });
 
   it('does not contain duplicate message values', () => {
@@ -24,6 +28,7 @@ describe('OffscreenEventType', () => {
     expect(OffscreenEventType.PROCESS_PROGRESS).toBe('PROCESS_PROGRESS');
     expect(OffscreenEventType.PROCESS_METRICS).toBe('PROCESS_METRICS');
     expect(OffscreenEventType.ERROR).toBe('ERROR');
+    expect(OffscreenEventType.WEBCODECS_STATS).toBe('WEBCODECS_STATS');
   });
 
   it('does not contain duplicate event values', () => {

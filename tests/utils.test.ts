@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createSessionId,
   delay,
+  getSystemAudioPreflightSnapshot,
   normalizeAudioSource,
   normalizeCaptureQuality,
   normalizeMicDeviceId,
@@ -33,6 +34,16 @@ describe('background utils', () => {
     expect(normalizeCaptureQuality('1080p')).toBe('1080p');
     expect(normalizeCaptureQuality('unexpected')).toBe('1080p');
     expect(normalizeCaptureQuality(undefined)).toBe('1080p');
+  });
+
+  it('derives system-audio preflight status from source + pipeline', () => {
+    expect(getSystemAudioPreflightSnapshot('both', false).systemAudioStatus).toBe('pending');
+    expect(getSystemAudioPreflightSnapshot('tab', false).systemAudioStatus).toBe('pending');
+    expect(getSystemAudioPreflightSnapshot('mic', false).systemAudioStatus).toBe('idle');
+    expect(getSystemAudioPreflightSnapshot('silent', false).systemAudioStatus).toBe('idle');
+    expect(getSystemAudioPreflightSnapshot('both', true).systemAudioStatus).toBe('idle');
+    expect(getSystemAudioPreflightSnapshot('tab', true).systemAudioStatus).toBe('idle');
+    expect(getSystemAudioPreflightSnapshot('both', true).systemAudioMessage).toBeNull();
   });
 
   it('normalizes mic device ids', () => {

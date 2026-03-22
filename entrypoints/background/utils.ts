@@ -1,5 +1,5 @@
 import type { AudioSource, CaptureQuality } from '@/lib/messages';
-import type { SystemAudioStatus } from '@/lib/recording';
+import type { AudioPreflightSnapshot, SystemAudioStatus } from '@/lib/recording';
 
 export function normalizeSystemAudioStatus(value: unknown): SystemAudioStatus {
   if (value === 'pending' || value === 'ok' || value === 'absent' || value === 'silent') {
@@ -20,6 +20,22 @@ export function normalizeCaptureQuality(value: unknown): CaptureQuality {
     return value;
   }
   return '1080p';
+}
+
+export function getSystemAudioPreflightSnapshot(
+  audioSource: AudioSource,
+  useWebCodecs: boolean,
+): Pick<
+  AudioPreflightSnapshot,
+  'systemAudioStatus' | 'systemAudioLevel' | 'systemAudioMessage' | 'needsSystemAudioDecision'
+> {
+  const shouldRunCheck = !useWebCodecs && (audioSource === 'both' || audioSource === 'tab');
+  return {
+    systemAudioStatus: shouldRunCheck ? 'pending' : 'idle',
+    systemAudioLevel: null,
+    systemAudioMessage: shouldRunCheck ? 'System audio check in progress...' : null,
+    needsSystemAudioDecision: false,
+  };
 }
 
 export function normalizeMicDeviceId(value: unknown): string | null {

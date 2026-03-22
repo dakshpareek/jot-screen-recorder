@@ -19,16 +19,21 @@ import type {
   SystemAudioSignalMessage,
 } from '@/lib/messages';
 import { OffscreenEventType, RuntimeMessageType } from '@/lib/messages';
+import { debugWarn } from '@/lib/runtime-log';
 import { OffscreenClient } from './background/services/offscreen-client';
 import {
   loadPersistedContext,
   savePersistedContext,
+  loadExperimentalFlags,
+  saveExperimentalFlags,
   type PersistedContext,
+  type ExperimentalFlags,
 } from './background/state/persisted-context';
 import { ALLOWED_TRANSITIONS } from './background/state/transitions';
 import {
   createSessionId,
   delay,
+  getSystemAudioPreflightSnapshot,
   normalizeAudioSource,
   normalizeCaptureQuality,
   normalizeMicDeviceId,
@@ -74,6 +79,8 @@ let recordingTabId: number | null = null;
 let activeAudioSource: AudioSource = 'both';
 let selectedMicDeviceId: string | null = null;
 let recordingQuality: CaptureQuality = '1080p';
+let usingWebCodecs = false;
+let webCodecsStats: RecordingSnapshot['webCodecsStats'] = null;
 const offscreenClient = new OffscreenClient();
 
 export default defineBackground(() => {
@@ -211,10 +218,55 @@ export default defineBackground(() => {
       return true;
     }
 
+    if (message.type === RuntimeMessageType.WEBCODECS_FATAL_ERROR) {
+      void handleWebCodecsFatalError(message.error as string | undefined).then(sendResponse);
+      return true;
+    }
+
     if (message.type === RuntimeMessageType.OFFSCREEN_READY) {
       offscreenClient.markReady();
       sendResponse({ ok: true });
       return;
+    }
+
+    if (message.type === RuntimeMessageType.GET_EXPERIMENTAL_FLAGS) {
+      void loadExperimentalFlags().then(sendResponse);
+      return true;
+    }
+
+    if (message.type === RuntimeMessageType.SET_EXPERIMENTAL_FLAGS) {
+      void saveExperimentalFlags(message.flags as Partial<ExperimentalFlags>).then(sendResponse);
+      return true;
+    }
+
+    if (message.type === RuntimeMessageType.WEBCODECS_CHECK_SUPPORT) {
+      void (async () => {
+        try {
+          await offscreenClient.ensureReadyWithRetry(delay);
+          const result = await offscreenClient.send<{
+            ok?: boolean;
+            videoSupported?: boolean;
+            audioSupported?: boolean;
+            hardwareAcceleration?: boolean;
+            fallbackReason?: string | null;
+            error?: string;
+          }>({
+            type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
+            quality: message.quality,
+          });
+          sendResponse(result ?? { ok: false, error: 'No response from offscreen' });
+        } catch (error) {
+          debugWarn('[Background] WebCodecs check failed:', error);
+          sendResponse({
+            ok: false,
+            error: toErrorMessage(error),
+            videoSupported: false,
+            audioSupported: false,
+            hardwareAcceleration: false,
+          });
+        }
+      })();
+      return true;
     }
   });
 
@@ -263,6 +315,8 @@ async function hydrateContext() {
     recoverySessionId = stored.recoverySessionId ?? null;
     recoveryChunks = Array.isArray(stored.recoveryChunks) ? stored.recoveryChunks : [];
     recordingQuality = normalizeCaptureQuality(stored.recordingQuality);
+    usingWebCodecs = stored.usingWebCodecs ?? false;
+    webCodecsStats = stored.webCodecsStats ?? null;
     outputUrl = null;
 
     if (stored.state === 'done') {
@@ -270,6 +324,9 @@ async function hydrateContext() {
       setState('recovery', { force: true });
       return;
     }
+
+    // WebCodecs uses OPFS (webcodecs-stream.mp4 + manifest); after SW restart,
+    // reconcileWithOffscreen moves to recovery so the user can reprocess like MediaRecorder orphans.
 
     setState(stored.state ?? 'idle', { force: true });
   } catch (error) {
@@ -287,10 +344,20 @@ async function reconcileWithOffscreen() {
       alive?: boolean;
       chunkCount?: number;
       isRecording?: boolean;
+      isWebCodecsRecording?: boolean;
     }>({ type: RuntimeMessageType.OFFSCREEN_STATUS });
 
     if (!status?.alive) {
       errorMessage = 'Offscreen recorder is unavailable.';
+      setState('recovery', { force: true });
+      return;
+    }
+
+    const captureLive =
+      status.isRecording === true || status.isWebCodecsRecording === true;
+    // `audio_warning` can be shown before capture is running; only treat active `recording` as requiring live capture.
+    if (state === 'recording' && !captureLive) {
+      errorMessage = 'Recording session was lost.';
       setState('recovery', { force: true });
       return;
     }
@@ -354,6 +421,7 @@ function buildSnapshot(): RecordingSnapshot {
     orphanedSessions,
     recoverySessionId,
     recoveryChunks,
+    webCodecsStats,
   };
 }
 
@@ -382,6 +450,7 @@ function updateBadge(next: RecordingState) {
   const badges: Partial<Record<RecordingState, { text: string; color: string }>> = {
     recording: { text: '●', color: '#FF3B30' },
     audio_warning: { text: '●', color: '#FF3B30' },
+    stopping: { text: '◐', color: '#FFD60A' },
     processing: { text: '◐', color: '#FFD60A' },
     error: { text: '!', color: '#FF9F0A' },
   };
@@ -407,12 +476,14 @@ async function persistContext() {
     storageWarningMessage,
     outputFileName,
     recordingQuality,
+    usingWebCodecs,
     validation,
     processingMetrics,
     audioPreflight,
     orphanedSessions,
     recoverySessionId,
     recoveryChunks,
+    webCodecsStats,
   };
   await savePersistedContext(payload);
 }
@@ -487,11 +558,12 @@ function resetSessionMetadata(nextSessionId: string) {
   processingMetrics = null;
   recoverySessionId = null;
   recoveryChunks = [];
+  webCodecsStats = null;
   audioPreflight = {
     ...audioPreflight,
-    systemAudioStatus: 'pending',
+    systemAudioStatus: 'idle',
     systemAudioLevel: null,
-    systemAudioMessage: 'System audio check in progress...',
+    systemAudioMessage: null,
     needsSystemAudioDecision: false,
   };
 }
@@ -513,6 +585,8 @@ function resetAttemptMetadata() {
   audioPreflight = { ...DEFAULT_AUDIO_PREFLIGHT };
   activeAudioSource = 'both';
   selectedMicDeviceId = null;
+  usingWebCodecs = false;
+  webCodecsStats = null;
 }
 
 async function handleStart(
@@ -530,6 +604,10 @@ async function handleStart(
   const nextSessionId = createSessionId();
   resetSessionMetadata(nextSessionId);
 
+  // Check if WebCodecs experimental flag is enabled
+  const experimentalFlags = await loadExperimentalFlags();
+  usingWebCodecs = experimentalFlags.useWebCodecs;
+
   try {
     const targetTabId = await getStartTargetTabId();
     const streamId = await getTabCaptureStreamId(targetTabId);
@@ -540,17 +618,33 @@ async function handleStart(
     }
 
     recordingTabId = targetTabId;
-    const result = await offscreenClient.send<OffscreenResponse>({
-      type: RuntimeMessageType.OFFSCREEN_START,
-      sessionId: nextSessionId,
-      streamId,
-      audioSource,
-      micDeviceId: selectedMicDeviceId,
-      quality: recordingQuality,
-    });
+
+    let result: OffscreenResponse;
+    if (usingWebCodecs) {
+      // Use experimental WebCodecs pipeline
+      result = await offscreenClient.send<OffscreenResponse>({
+        type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS,
+        sessionId: nextSessionId,
+        streamId,
+        quality: recordingQuality,
+        audioSource,
+        micDeviceId: selectedMicDeviceId,
+      });
+    } else {
+      // Use standard MediaRecorder pipeline
+      result = await offscreenClient.send<OffscreenResponse>({
+        type: RuntimeMessageType.OFFSCREEN_START,
+        sessionId: nextSessionId,
+        streamId,
+        audioSource,
+        micDeviceId: selectedMicDeviceId,
+        quality: recordingQuality,
+      });
+    }
 
     if (!result?.ok) {
       recordingTabId = null;
+      usingWebCodecs = false;
       errorMessage = result?.error ?? 'Failed to start recorder';
       setState('preflight_error');
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
@@ -559,10 +653,7 @@ async function handleStart(
     recordingStartTime = Date.now();
     audioPreflight = {
       ...audioPreflight,
-      systemAudioStatus: 'pending',
-      systemAudioLevel: null,
-      systemAudioMessage: 'System audio check in progress...',
-      needsSystemAudioDecision: false,
+      ...getSystemAudioPreflightSnapshot(activeAudioSource, usingWebCodecs),
     };
     await persistContext();
     await broadcastSnapshot();
@@ -570,6 +661,7 @@ async function handleStart(
     return { ok: true, snapshot: buildSnapshot() };
   } catch (error) {
     recordingTabId = null;
+    usingWebCodecs = false;
     errorMessage = toErrorMessage(error);
     setState('preflight_error');
     return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
@@ -801,6 +893,38 @@ async function handleStop() {
   setState('stopping');
 
   try {
+    if (usingWebCodecs) {
+      // WebCodecs path: stop returns the final MP4 directly, no processing needed
+      const result = await offscreenClient.send<OffscreenResponse & {
+        outputSize?: number;
+        stopDurationMs?: number;
+      }>({
+        type: RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS,
+      });
+
+      if (!result?.ok) {
+        errorMessage = result?.error ?? 'Failed to stop WebCodecs recorder';
+        usingWebCodecs = false;
+        setState('error');
+        return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
+      }
+
+      // WebCodecs returns the output directly - skip processing
+      outputUrl = result.outputUrl ?? null;
+      outputFileName = result.fileName ?? `${sessionId ?? 'recording'}.mp4`;
+      validation = result.validation ?? null;
+      processingProgress = 100;
+
+      usingWebCodecs = false;
+      await persistContext();
+      await broadcastSnapshot();
+
+      // Go directly to done (skip processing/validating for WebCodecs)
+      setState('done', { force: true });
+      return { ok: true, snapshot: buildSnapshot() };
+    }
+
+    // Standard MediaRecorder path
     const result = await offscreenClient.send<OffscreenResponse>({
       type: RuntimeMessageType.OFFSCREEN_STOP,
       sessionId,
@@ -815,9 +939,26 @@ async function handleStop() {
     return { ok: true, snapshot: buildSnapshot() };
   } catch (error) {
     errorMessage = toErrorMessage(error);
+    usingWebCodecs = false;
     setState('error');
     return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
   }
+}
+
+async function handleWebCodecsFatalError(errorMsg?: string) {
+  if (!usingWebCodecs || !['recording', 'audio_warning'].includes(state)) {
+    return { ok: true };
+  }
+
+  debugWarn('[Background] WebCodecs fatal error, triggering graceful stop:', errorMsg);
+  // Attempt a graceful stop — this will finalize whatever was encoded so far
+  const result = await handleStop();
+  if (!result.ok) {
+    errorMessage = errorMsg ?? 'WebCodecs recording failed unexpectedly';
+    usingWebCodecs = false;
+    setState('error');
+  }
+  return result;
 }
 
 async function handleDownload() {
@@ -1238,6 +1379,13 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
     return { ok: true };
   }
 
+  if (message.event === OffscreenEventType.WEBCODECS_STATS && message.webCodecsStats) {
+    webCodecsStats = message.webCodecsStats;
+    await persistContext();
+    await broadcastSnapshot();
+    return { ok: true };
+  }
+
   if (message.event === OffscreenEventType.ERROR) {
     errorMessage = message.error ?? 'Offscreen pipeline error';
     setState('error');
@@ -1245,8 +1393,9 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
   }
 
   if (message.event === OffscreenEventType.FINAL_CHUNK_WRITTEN) {
-    if (state === 'stopping') {
+    if (state === 'stopping' && !usingWebCodecs) {
       // Critical transition: stopping -> processing happens only after OPFS confirms final chunk write.
+      // WebCodecs path handles stop->done directly in handleStop, so skip processing here.
       await runProcessingPipeline();
     }
     return { ok: true };

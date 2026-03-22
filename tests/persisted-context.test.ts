@@ -19,6 +19,7 @@ function createSampleContext(): PersistedContext {
     storageWarningMessage: null,
     outputFileName: null,
     recordingQuality: '720p',
+    usingWebCodecs: true,
     validation: null,
     processingMetrics: null,
     audioPreflight: {
@@ -34,6 +35,14 @@ function createSampleContext(): PersistedContext {
     orphanedSessions: [],
     recoverySessionId: null,
     recoveryChunks: [],
+    webCodecsStats: {
+      framesEncoded: 1234,
+      bytesWritten: 44_000_000,
+      droppedFrames: 2,
+      hardwareAccelerated: true,
+      memoryPressureTier: 1,
+      videoBitrateBps: 5_600_000,
+    },
   };
 }
 

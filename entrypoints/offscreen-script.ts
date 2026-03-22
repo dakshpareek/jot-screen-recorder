@@ -11,6 +11,7 @@ import {
   type CaptureQuality,
   type OffscreenEventTypeValue,
 } from '@/lib/messages';
+import { debugInfo, debugWarn } from '@/lib/runtime-log';
 import { OpfsBridge } from './offscreen/storage/opfs-bridge';
 import type { FFmpegClass, RawDownloadItem, SessionManifest } from './offscreen/types';
 import {
@@ -18,6 +19,11 @@ import {
   getCaptureProfile,
   normalizeCaptureQuality,
 } from './offscreen/utils';
+import {
+  resolveWebCodecsRecordingFormat,
+  WebCodecsPipeline,
+  type WebCodecsPipelineStats,
+} from './offscreen/webcodecs';
 
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
@@ -47,6 +53,8 @@ export default defineUnlistedScript(() => {
   let manifest: SessionManifest | null = null;
   let activeCaptureQuality: CaptureQuality = '1080p';
   let chunkCount = 0;
+  let webcodecsStreamHighWater = 0;
+  let webcodecsManifestTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingStop = false;
   let stopFinalDataPromise: Promise<void> | null = null;
   let resolveStopFinalData: (() => void) | null = null;
@@ -151,11 +159,88 @@ export default defineUnlistedScript(() => {
       sendResponse({
         alive: true,
         isRecording: recorder?.state === 'recording',
+        isWebCodecsRecording: isWebCodecsRecording(),
         chunkCount,
         sessionId: activeSessionId,
         hasOutput: Boolean(lastOutputUrl),
       });
       return;
+    }
+
+    // Experimental WebCodecs pipeline handlers
+    if (msg.type === RuntimeMessageType.WEBCODECS_CHECK_SUPPORT) {
+      void (async () => {
+        try {
+          const result = await checkWebCodecsSupport(normalizeCaptureQuality(msg.quality));
+          sendResponse(result);
+        } catch (error) {
+          debugWarn('[Offscreen] WebCodecs check error:', error);
+          sendResponse({
+            ok: false,
+            error: toErrorMessage(error),
+            videoSupported: false,
+            audioSupported: false,
+            hardwareAcceleration: false,
+            fallbackReason: toErrorMessage(error),
+          });
+        }
+      })();
+      return true;
+    }
+
+    if (msg.type === RuntimeMessageType.OFFSCREEN_START_WEBCODECS) {
+      void (async () => {
+        try {
+          const streamId = String(msg.streamId ?? '');
+          const quality = normalizeCaptureQuality(msg.quality);
+          const sessionId = String(msg.sessionId ?? '');
+          const audioSource = normalizeAudioSource(msg.audioSource);
+          const micDeviceId = normalizeMicDeviceId(msg.micDeviceId);
+
+          if (!streamId) {
+            sendResponse({ ok: false, error: 'Missing stream ID' });
+            return;
+          }
+
+          // Get the tab capture stream using the same method as MediaRecorder
+          const tabStream = await getTabStreamById(streamId, quality);
+          tabCaptureStream = tabStream;
+
+          // Build capture stream with audio mixing (reuses the same logic as MediaRecorder path)
+          const stream = await buildCaptureStream(tabStream, audioSource, micDeviceId);
+          captureStream = stream;
+
+          const result = await startWebCodecsRecording(sessionId, stream, quality);
+
+          if (!result.ok) {
+            debugWarn('[Offscreen] WebCodecs start failed:', result.error);
+            await cleanupMedia();
+          }
+
+          sendResponse(result);
+        } catch (error) {
+          console.error('[Offscreen] WebCodecs start error:', error);
+          await cleanupMedia();
+          sendResponse({ ok: false, error: toNamedErrorMessage(error) });
+        }
+      })();
+      return true;
+    }
+
+    if (msg.type === RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS) {
+      void (async () => {
+        try {
+          const result = await stopWebCodecsRecording();
+
+          // Cleanup streams
+          await cleanupMedia();
+
+          sendResponse(result);
+        } catch (error) {
+          sendResponse({ ok: false, error: toNamedErrorMessage(error) });
+        }
+      })();
+      return true;
     }
   });
 
@@ -250,7 +335,7 @@ export default defineUnlistedScript(() => {
       // Skip prewarm when we're already recording MP4 chunks and may fast-path copy.
       if (!activeMimeType.includes('mp4')) {
         void ensureFFmpeg().catch((error) => {
-          console.warn('[Offscreen] ffmpeg prewarm failed:', toNamedErrorMessage(error));
+          debugWarn('[Offscreen] ffmpeg prewarm failed:', toNamedErrorMessage(error));
         });
       }
       return { ok: true };
@@ -412,6 +497,48 @@ export default defineUnlistedScript(() => {
       const currentManifest = await readManifest(sessionId);
       metrics.manifestReadMs = performance.now() - manifestReadStart;
 
+      if (currentManifest.recordingKind === 'webcodecs-opfs') {
+        const readStart = performance.now();
+        const streamFile = webCodecsOpfsStreamName(currentManifest);
+        const outMime =
+          (currentManifest.mimeType ?? '').includes('webm') ? 'video/webm' : 'video/mp4';
+        const outExt = outMime.includes('webm') ? 'webm' : 'mp4';
+        let streamData: ArrayBuffer;
+        try {
+          streamData = await opfsBridge.readWebCodecsStream(sessionId, streamFile);
+        } catch {
+          return { ok: false, error: 'No WebCodecs stream data found for this session' };
+        }
+        metrics.chunkReadMs += performance.now() - readStart;
+        metrics.inputBytes = streamData.byteLength;
+        metrics.chunkCount = 1;
+        metrics.mode = 'single_copy';
+        metrics.encodeProfile = outExt === 'webm' ? 'copy_webm' : 'copy_mp4';
+        metrics.outputBytes = streamData.byteLength;
+
+        lastOutputBlob = new Blob([streamData], { type: outMime });
+        if (lastOutputUrl) {
+          URL.revokeObjectURL(lastOutputUrl);
+        }
+        lastOutputUrl = URL.createObjectURL(lastOutputBlob);
+
+        const validateStart = performance.now();
+        const validation = await validateBlob(lastOutputBlob);
+        metrics.validateMs = performance.now() - validateStart;
+        metrics.totalMs = performance.now() - processingStartedAt;
+
+        await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
+        await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
+        debugInfo('[Offscreen] Processing metrics', metrics);
+
+        return {
+          ok: true,
+          outputUrl: lastOutputUrl,
+          fileName: `${sessionId}.${outExt}`,
+          validation,
+        };
+      }
+
       if (!currentManifest.chunks.length) {
         return { ok: false, error: 'No chunks found for this session' };
       }
@@ -462,7 +589,7 @@ export default defineUnlistedScript(() => {
 
           await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
           await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
-          console.info('[Offscreen] Processing metrics', metrics);
+          debugInfo('[Offscreen] Processing metrics', metrics);
 
           return {
             ok: true,
@@ -632,7 +759,7 @@ export default defineUnlistedScript(() => {
 
       await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
       await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
-      console.info('[Offscreen] Processing metrics', metrics);
+      debugInfo('[Offscreen] Processing metrics', metrics);
       ffmpegDurationHint = 0;
 
       await cleanupFfmpegFiles(fileNames);
@@ -646,7 +773,7 @@ export default defineUnlistedScript(() => {
     } catch (error) {
       metrics.totalMs = performance.now() - processingStartedAt;
       await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
-      console.info('[Offscreen] Processing metrics (failed)', metrics);
+      debugInfo('[Offscreen] Processing metrics (failed)', metrics);
       await emitEvent(OffscreenEventType.ERROR, {
         error: `Processing failed: ${toErrorMessage(error)}`,
       });
@@ -712,6 +839,23 @@ export default defineUnlistedScript(() => {
     await opfsBridge.writeManifest(activeSessionId, manifest);
   }
 
+  function scheduleWebcodecsManifestUpdate() {
+    if (manifest?.recordingKind !== 'webcodecs-opfs') return;
+    if (webcodecsManifestTimer) return;
+    webcodecsManifestTimer = setTimeout(() => {
+      webcodecsManifestTimer = null;
+      void (async () => {
+        if (!manifest || manifest.recordingKind !== 'webcodecs-opfs' || !activeSessionId) return;
+        try {
+          manifest.streamBytesWritten = webcodecsStreamHighWater;
+          await writeManifest();
+        } catch {
+          // Best-effort; recording continues without blocking on manifest IO.
+        }
+      })();
+    }, 2500);
+  }
+
   async function readManifest(sessionId: string): Promise<SessionManifest> {
     return await opfsBridge.readManifest(sessionId);
   }
@@ -744,6 +888,46 @@ export default defineUnlistedScript(() => {
 
     try {
       const manifestData = await readManifest(sessionId);
+
+      if (manifestData.recordingKind === 'webcodecs-opfs') {
+        try {
+          const data = await opfsBridge.readWebCodecsStream(
+            sessionId,
+            webCodecsOpfsStreamName(manifestData),
+          );
+          const checksum = await sha256Hex(data);
+          return {
+            ok: true,
+            chunks: [
+              {
+                index: 0,
+                size: data.byteLength,
+                status: data.byteLength > 1000 ? 'ok' : 'suspect',
+                expectedChecksum: null,
+                actualChecksum: checksum,
+                included: true,
+              },
+            ],
+            recordingQuality: normalizeCaptureQuality(manifestData.recordingQuality),
+          };
+        } catch {
+          return {
+            ok: true,
+            chunks: [
+              {
+                index: 0,
+                size: 0,
+                status: 'missing',
+                expectedChecksum: null,
+                actualChecksum: null,
+                included: false,
+              },
+            ],
+            recordingQuality: normalizeCaptureQuality(manifestData.recordingQuality),
+          };
+        }
+      }
+
       const chunks = [...manifestData.chunks].sort((a, b) => a.index - b.index);
       const checks: RecoveryChunkCheck[] = [];
 
@@ -791,6 +975,37 @@ export default defineUnlistedScript(() => {
 
     try {
       const manifestData = await readManifest(sessionId);
+
+      if (manifestData.recordingKind === 'webcodecs-opfs') {
+        try {
+          const streamFile = webCodecsOpfsStreamName(manifestData);
+          const data = await opfsBridge.readWebCodecsStream(sessionId, streamFile);
+          const baseName = `${sessionId}-raw`;
+          const items: RawDownloadItem[] = [];
+          const manifestBlob = new Blob([JSON.stringify(manifestData, null, 2)], {
+            type: 'application/json',
+          });
+          items.push({
+            url: URL.createObjectURL(manifestBlob),
+            filename: `${baseName}/manifest.json`,
+          });
+          const streamBlob = new Blob([data], {
+            type: manifestData.mimeType || 'video/mp4',
+          });
+          items.push({
+            url: URL.createObjectURL(streamBlob),
+            filename: `${baseName}/${streamFile}`,
+          });
+          scheduleRawExportUrlCleanup(items.map((item) => item.url));
+          return { ok: true, items };
+        } catch (error) {
+          return {
+            ok: false,
+            error: toErrorMessage(error),
+          };
+        }
+      }
+
       const orderedChunks = [...manifestData.chunks].sort((a, b) => a.index - b.index);
       if (!orderedChunks.length) {
         return { ok: false, error: 'No chunks found for this session' };
@@ -1125,10 +1340,21 @@ export default defineUnlistedScript(() => {
     }, 10 * 60 * 1000);
   }
 
+  function webCodecsOpfsStreamName(manifest: SessionManifest): string {
+    return manifest.webCodecsOpfsStreamFile ?? 'webcodecs-stream.mp4';
+  }
+
+  async function hasWebmEbmlHeader(blob: Blob) {
+    const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+    if (header.length < 4) return false;
+    return header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3;
+  }
+
   async function validateBlob(blob: Blob, minimumDurationSeconds = 0): Promise<ValidationResult> {
+    const isWebm = blob.type.includes('webm');
     const checks = {
       size: blob.size > 50_000,
-      header: await hasMp4FtypHeader(blob),
+      header: isWebm ? await hasWebmEbmlHeader(blob) : await hasMp4FtypHeader(blob),
       duration: await checkDurationWithFallback(blob, minimumDurationSeconds),
     };
 
@@ -1550,5 +1776,264 @@ export default defineUnlistedScript(() => {
       return error.message;
     }
     return typeof error === 'string' ? error : 'Unknown error';
+  }
+
+  // ============================================================
+  // EXPERIMENTAL: WebCodecs Pipeline
+  // ============================================================
+
+  let webcodecsPipeline: WebCodecsPipeline | null = null;
+  let webcodecsPipelineStartTime: number | null = null;
+
+  async function checkWebCodecsSupport(quality: CaptureQuality) {
+    try {
+      // Check if WebCodecs APIs exist
+      const hasVideoEncoder = typeof VideoEncoder !== 'undefined';
+      const hasAudioEncoder = typeof AudioEncoder !== 'undefined';
+      if (!hasVideoEncoder || !hasAudioEncoder) {
+        return {
+          ok: false,
+          error: 'WebCodecs API not available in this context',
+          videoSupported: false,
+          audioSupported: false,
+          hardwareAcceleration: false,
+          fallbackReason: 'WebCodecs API not available',
+          container: 'mp4' as const,
+          outputMimeType: 'video/mp4',
+          opfsStreamFile: 'webcodecs-stream.mp4',
+        };
+      }
+
+      const result = await WebCodecsPipeline.checkCapabilities(quality);
+      return {
+        ok: true,
+        ...result,
+      };
+    } catch (error) {
+      debugWarn('[Offscreen] checkWebCodecsSupport error:', error);
+      return {
+        ok: false,
+        error: toErrorMessage(error),
+        videoSupported: false,
+        audioSupported: false,
+        hardwareAcceleration: false,
+        fallbackReason: toErrorMessage(error),
+        container: 'mp4' as const,
+        outputMimeType: 'video/mp4',
+        opfsStreamFile: 'webcodecs-stream.mp4',
+      };
+    }
+  }
+
+  async function startWebCodecsRecording(
+    nextSessionId: string,
+    stream: MediaStream,
+    quality: CaptureQuality,
+  ) {
+    if (webcodecsPipeline?.isRunning()) {
+      return { ok: false, error: 'WebCodecs pipeline already running' };
+    }
+
+    try {
+      const resolved = await resolveWebCodecsRecordingFormat(quality);
+      if (!resolved.videoSupported) {
+        return {
+          ok: false,
+          error: `Video encoding not supported: ${resolved.fallbackReason ?? 'Unknown reason'}`,
+        };
+      }
+
+      activeSessionId = nextSessionId;
+      activeCaptureQuality = quality;
+      chunkCount = 0;
+      webcodecsStreamHighWater = 0;
+      if (webcodecsManifestTimer) {
+        clearTimeout(webcodecsManifestTimer);
+        webcodecsManifestTimer = null;
+      }
+
+      manifest = {
+        sessionId: nextSessionId,
+        startTime: Date.now(),
+        recordingQuality: quality,
+        mimeType: resolved.outputMimeType,
+        chunks: [],
+        totalDuration: 0,
+        status: 'recording',
+        recordingKind: 'webcodecs-opfs',
+        streamBytesWritten: 0,
+        webCodecsOpfsStreamFile: resolved.opfsStreamFile,
+      };
+      await writeManifest();
+
+      const streamSessionId = nextSessionId;
+      const opfsStreamFile = resolved.opfsStreamFile;
+      const persistWrite = async (position: number, data: ArrayBuffer) => {
+        await opfsBridge.writeWebCodecsRange(streamSessionId, position, data, opfsStreamFile);
+        webcodecsStreamHighWater = Math.max(webcodecsStreamHighWater, position + data.byteLength);
+        scheduleWebcodecsManifestUpdate();
+      };
+
+      webcodecsPipeline = new WebCodecsPipeline({
+        quality,
+        resolvedFormat: resolved,
+        opfsPersist: {
+          writeRange: persistWrite,
+          readComplete: () => opfsBridge.readWebCodecsStream(streamSessionId, opfsStreamFile),
+        },
+        onProgress: (stats) => {
+          // Emit progress events to background
+          void emitEvent(OffscreenEventType.CHUNK_WRITTEN, {
+            chunkCount: Math.floor(stats.framesEncoded / 300), // ~10 seconds at 30fps
+          });
+          void emitEvent(OffscreenEventType.WEBCODECS_STATS, {
+            webCodecsStats: {
+              framesEncoded: stats.framesEncoded,
+              bytesWritten: stats.bytesWritten,
+              droppedFrames: stats.droppedFrames,
+              hardwareAccelerated: stats.hardwareAccelerated,
+              memoryPressureTier: stats.memoryPressureTier,
+              videoBitrateBps: stats.videoBitrateBps,
+            },
+          });
+        },
+        onError: (error) => {
+          console.error('[WebCodecs] Pipeline error', error);
+          void emitEvent(OffscreenEventType.ERROR, { error: error.message });
+          // Auto-stop on fatal errors (e.g. stream ended, encoder crashed)
+          // Emit a signal so background can trigger a graceful stop
+          void emitRuntimeSignal({
+            type: RuntimeMessageType.WEBCODECS_FATAL_ERROR,
+            error: error.message,
+          });
+        },
+      });
+
+      await webcodecsPipeline.start(stream);
+      webcodecsPipelineStartTime = Date.now();
+
+      return {
+        ok: true,
+        hardwareAccelerated: resolved.hardwareAcceleration,
+      };
+    } catch (error) {
+      console.error('[WebCodecs] Failed to start', error);
+      cleanupWebCodecsPipeline();
+      return {
+        ok: false,
+        error: toNamedErrorMessage(error),
+      };
+    }
+  }
+
+  async function stopWebCodecsRecording() {
+    if (!webcodecsPipeline) {
+      return { ok: false, error: 'No WebCodecs recording in progress' };
+    }
+
+    try {
+      const stopStartTime = performance.now();
+
+      const outputBuffer = await webcodecsPipeline.stop();
+      const stopDurationMs = performance.now() - stopStartTime;
+      const finalStats = webcodecsPipeline.getStats();
+
+      const outMime = finalStats.outputMimeType;
+      const outExt = finalStats.fileExtension;
+
+      // Create blob and URL
+      const blob = new Blob([outputBuffer], { type: outMime });
+
+      if (lastOutputUrl) {
+        URL.revokeObjectURL(lastOutputUrl);
+      }
+      lastOutputBlob = blob;
+      lastOutputUrl = URL.createObjectURL(blob);
+
+      // Validate the output
+      const validation = await validateWebCodecsOutput(blob);
+
+      if (manifest?.recordingKind === 'webcodecs-opfs') {
+        if (webcodecsManifestTimer) {
+          clearTimeout(webcodecsManifestTimer);
+          webcodecsManifestTimer = null;
+        }
+        manifest.status = 'complete';
+        manifest.streamBytesWritten = outputBuffer.byteLength;
+        await writeManifest();
+      }
+
+      cleanupWebCodecsPipeline();
+
+      // Emit final event
+      await emitEvent(OffscreenEventType.FINAL_CHUNK_WRITTEN, {
+        sessionId: activeSessionId,
+        chunkCount: Math.floor(finalStats.framesEncoded / 300),
+      });
+
+      return {
+        ok: true,
+        outputUrl: lastOutputUrl,
+        fileName: `${activeSessionId ?? 'recording'}.${outExt}`,
+        outputSize: outputBuffer.byteLength,
+        stopDurationMs,
+        stats: finalStats,
+        validation,
+      };
+    } catch (error) {
+      console.error('[WebCodecs] Failed to stop', error);
+      cleanupWebCodecsPipeline();
+      return {
+        ok: false,
+        error: toNamedErrorMessage(error),
+      };
+    }
+  }
+
+  async function validateWebCodecsOutput(blob: Blob): Promise<ValidationResult> {
+    const checks = {
+      size: blob.size > 1000,
+      header: false,
+      duration: false,
+    };
+
+    try {
+      const isWebm = blob.type.includes('webm');
+      checks.header = isWebm ? await hasWebmEbmlHeader(blob) : await hasMp4FtypHeader(blob);
+
+      const videoUrl = URL.createObjectURL(blob);
+      try {
+        const duration = await new Promise<number>((resolve, reject) => {
+          const video = document.createElement('video');
+          video.preload = 'metadata';
+          video.onloadedmetadata = () => resolve(video.duration);
+          video.onerror = () => reject(new Error('Failed to load video metadata'));
+          video.src = videoUrl;
+        });
+        checks.duration = duration > 0 && Number.isFinite(duration);
+      } finally {
+        URL.revokeObjectURL(videoUrl);
+      }
+    } catch {
+      // Validation checks remain false
+    }
+
+    return {
+      passed: checks.size && checks.header && checks.duration,
+      checks,
+    };
+  }
+
+  function cleanupWebCodecsPipeline() {
+    if (webcodecsManifestTimer) {
+      clearTimeout(webcodecsManifestTimer);
+      webcodecsManifestTimer = null;
+    }
+    webcodecsPipeline = null;
+    webcodecsPipelineStartTime = null;
+  }
+
+  function isWebCodecsRecording() {
+    return webcodecsPipeline?.isRunning() ?? false;
   }
 });

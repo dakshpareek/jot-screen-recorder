@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { RuntimeMessageType, type CaptureQuality } from '@/lib/messages';
 import type { RecordingSnapshot, RecordingState } from '@/lib/recording';
+import { debugWarn } from '@/lib/runtime-log';
 import { MicToggleCard } from './components/MicToggleCard';
 import { useRecorderCommands } from './hooks/useRecorderCommands';
 import { useRecorderSnapshot } from './hooks/useRecorderSnapshot';
@@ -71,6 +72,13 @@ export default function App() {
   const [processingStartedAtMs, setProcessingStartedAtMs] = useState<number | null>(null);
   const initializedRecoverySessionRef = useRef<string | null>(null);
 
+  // Experimental WebCodecs state
+  const [useWebCodecs, setUseWebCodecs] = useState(false);
+  const [webCodecsSupport, setWebCodecsSupport] = useState<{
+    supported: boolean;
+    hardwareAccelerated: boolean;
+  } | null>(null);
+
   useEffect(() => {
     if (snapshot.state !== 'recovery') {
       initializedRecoverySessionRef.current = null;
@@ -101,6 +109,45 @@ export default function App() {
     }
     setProcessingStartedAtMs(null);
   }, [snapshot.state]);
+
+  // Load experimental flags and check WebCodecs support on mount
+  useEffect(() => {
+    async function loadFlags() {
+      try {
+        const flags = await chrome.runtime.sendMessage({
+          type: RuntimeMessageType.GET_EXPERIMENTAL_FLAGS,
+        });
+        if (flags?.useWebCodecs !== undefined) {
+          setUseWebCodecs(flags.useWebCodecs);
+        }
+      } catch {
+        // Ignore errors loading flags
+      }
+    }
+    
+    async function checkSupport() {
+      try {
+        const result = await chrome.runtime.sendMessage({
+          type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
+          quality: '1080p',
+        });
+        if (result) {
+          setWebCodecsSupport({
+            supported: result.videoSupported === true && result.audioSupported === true,
+            hardwareAccelerated: result.hardwareAcceleration === true,
+          });
+        } else {
+          setWebCodecsSupport({ supported: false, hardwareAccelerated: false });
+        }
+      } catch (error) {
+        debugWarn('[Popup] WebCodecs check error:', error);
+        setWebCodecsSupport({ supported: false, hardwareAccelerated: false });
+      }
+    }
+
+    void loadFlags();
+    void checkSupport();
+  }, []);
 
   async function handleStart(nextIncludeMicInput?: boolean | unknown) {
     const nextIncludeMic =
@@ -267,6 +314,18 @@ export default function App() {
     setShowSettings(true);
   }
 
+  async function handleWebCodecsChange(enabled: boolean) {
+    setUseWebCodecs(enabled);
+    try {
+      await chrome.runtime.sendMessage({
+        type: RuntimeMessageType.SET_EXPERIMENTAL_FLAGS,
+        flags: { useWebCodecs: enabled },
+      });
+    } catch {
+      // Ignore errors saving flags
+    }
+  }
+
   async function handleRecordAgain() {
     const result = await send(RuntimeMessageType.RESET_TO_IDLE);
     if (!result?.ok) {
@@ -335,6 +394,9 @@ export default function App() {
             setQuality(q);
             setShowSettings(false);
           }}
+          useWebCodecs={useWebCodecs}
+          onWebCodecsChange={handleWebCodecsChange}
+          webCodecsSupport={webCodecsSupport}
         />
       ) : null}
 

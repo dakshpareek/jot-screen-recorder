@@ -20,7 +20,7 @@ States:
 - `error`
 
 Authoritative transition table lives in:
-- `entrypoints/background.ts` (`ALLOWED_TRANSITIONS`)
+- `entrypoints/background/state/transitions.ts` (`ALLOWED_TRANSITIONS`)
 
 ## Popup -> Background Commands
 - `GET_STATE`
@@ -39,6 +39,9 @@ Authoritative transition table lives in:
 - `REFRESH_ORPHANS`
 - `DOWNLOAD_RAW_CHUNKS` (`sessionId`)
 - `OPEN_MIC_SETTINGS`
+- `GET_EXPERIMENTAL_FLAGS`
+- `SET_EXPERIMENTAL_FLAGS` (`flags.useWebCodecs`)
+- `WEBCODECS_CHECK_SUPPORT` (`quality`)
 
 ## Background -> Offscreen Commands
 - `OFFSCREEN_STATUS`
@@ -54,6 +57,9 @@ Authoritative transition table lives in:
 - `OFFSCREEN_RECOVERY_INSPECT` (`sessionId`)
 - `OFFSCREEN_DOWNLOAD_RAW_CHUNKS` (`sessionId`)
 - `OFFSCREEN_CLEAR_SESSION` (`sessionId`)
+- `OFFSCREEN_START_WEBCODECS` (`sessionId`, `streamId`, `quality`, `audioSource`, optional `micDeviceId`)
+- `OFFSCREEN_STOP_WEBCODECS`
+- `WEBCODECS_CHECK_SUPPORT` (`quality`)
 
 ## Async Events
 Offscreen -> Background:
@@ -64,12 +70,14 @@ Offscreen -> Background:
   - `PROCESS_PROGRESS`
   - `PROCESS_METRICS`
   - `ERROR`
+  - `WEBCODECS_STATS`
 - `SYSTEM_AUDIO_OK`
 - `SYSTEM_AUDIO_SILENT`
 - `SYSTEM_AUDIO_ABSENT`
 - `LOW_STORAGE_WARNING`
 - `AUTO_STOP_LOW_STORAGE`
 - `MIC_MIX_FAILED`
+- `WEBCODECS_FATAL_ERROR`
 
 Background -> Popup:
 - `STATE_CHANGE` (`snapshot`)
@@ -77,3 +85,7 @@ Background -> Popup:
 ## Snapshot Contract
 The popup consumes `RecordingSnapshot` from `lib/recording.ts`.
 Fields must remain backward-compatible during refactors.
+
+## Audio Preflight Semantics
+- `audioPreflight.systemAudioStatus` is `pending` only when runtime system-audio verification is active (MediaRecorder path with `audioSource` of `both` or `tab`).
+- WebCodecs mode does not currently run runtime system-audio verification, so `audioPreflight.systemAudioStatus` remains `idle` unless explicit system-audio runtime signals are added in the future.
