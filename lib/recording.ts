@@ -1,4 +1,4 @@
-import type { CaptureQuality } from './messages';
+import type { CaptureQuality, CaptureResolvedQuality } from './messages';
 
 export type RecordingState =
   | 'idle'
@@ -85,6 +85,9 @@ export interface RecordingSnapshot {
   storageWarningMessage: string | null;
   canDownload: boolean;
   outputFileName: string | null;
+  requestedPreset: CaptureQuality;
+  resolvedPreset: CaptureResolvedQuality | null;
+  /** Backward-compatible alias of the selected preset. Prefer `requestedPreset`. */
   recordingQuality: CaptureQuality;
   validation: ValidationResult | null;
   processingMetrics: ProcessingMetrics | null;

@@ -5,6 +5,7 @@ import {
   getSystemAudioPreflightSnapshot,
   normalizeAudioSource,
   normalizeCaptureQuality,
+  normalizeResolvedCaptureQuality,
   normalizeMicDeviceId,
   normalizeSystemAudioStatus,
   toErrorMessage,
@@ -30,10 +31,22 @@ describe('background utils', () => {
   });
 
   it('normalizes capture quality safely', () => {
-    expect(normalizeCaptureQuality('720p')).toBe('720p');
-    expect(normalizeCaptureQuality('1080p')).toBe('1080p');
-    expect(normalizeCaptureQuality('unexpected')).toBe('1080p');
-    expect(normalizeCaptureQuality(undefined)).toBe('1080p');
+    expect(normalizeCaptureQuality('auto')).toBe('auto');
+    expect(normalizeCaptureQuality('1080p30')).toBe('1080p30');
+    expect(normalizeCaptureQuality('1080p60')).toBe('1080p60');
+    expect(normalizeCaptureQuality('4k30')).toBe('4k30');
+    expect(normalizeCaptureQuality('720p')).toBe('1080p30');
+    expect(normalizeCaptureQuality('1080p')).toBe('1080p30');
+    expect(normalizeCaptureQuality('unexpected')).toBe('auto');
+    expect(normalizeCaptureQuality(undefined)).toBe('auto');
+  });
+
+  it('normalizes resolved capture quality including internal fallbacks', () => {
+    expect(normalizeResolvedCaptureQuality('1080p30')).toBe('1080p30');
+    expect(normalizeResolvedCaptureQuality('1080p60')).toBe('1080p60');
+    expect(normalizeResolvedCaptureQuality('1440p30')).toBe('1440p30');
+    expect(normalizeResolvedCaptureQuality('4k30')).toBe('4k30');
+    expect(normalizeResolvedCaptureQuality('legacy')).toBe('1080p30');
   });
 
   it('derives system-audio preflight status from source + pipeline', () => {

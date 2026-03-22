@@ -1,41 +1,57 @@
-import type { CaptureQuality } from '@/lib/messages';
+import type { CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
+import {
+  getCaptureProfile as getSharedCaptureProfile,
+  getRuntimeHintsFromNavigator,
+  normalizeCaptureQuality as normalizeCaptureQualityShared,
+  resolveCapturePreset,
+  type CapturePresetResolution,
+  type CaptureRuntimeHints,
+} from '@/lib/capture-presets';
 
 export interface CaptureProfile {
   maxWidth: number;
   maxHeight: number;
   maxFrameRate: number;
   videoBitsPerSecond: number;
+  minVideoBitsPerSecond: number;
 }
 
-const CAPTURE_PROFILES: Record<CaptureQuality, CaptureProfile> = {
-  '720p': {
-    maxWidth: 1280,
-    maxHeight: 720,
-    maxFrameRate: 30,
-    videoBitsPerSecond: 2_500_000,
-  },
-  '1080p': {
-    maxWidth: 1920,
-    maxHeight: 1080,
-    maxFrameRate: 30,
-    videoBitsPerSecond: 4_000_000,
-  },
-};
+export interface ResolvedCapturePlan extends CapturePresetResolution {
+  requestedPreset: CaptureQuality;
+  fallbackChain: CaptureResolvedQuality[];
+}
 
 export function normalizeCaptureQuality(value: unknown): CaptureQuality {
-  if (value === '720p') {
-    return value;
-  }
-  return '1080p';
+  return normalizeCaptureQualityShared(value);
+}
+
+export function resolveCapturePlan(value: unknown, hints?: CaptureRuntimeHints): ResolvedCapturePlan {
+  const requestedPreset = normalizeCaptureQuality(value);
+  const runtimeHints = hints ?? getRuntimeHintsFromNavigator();
+  return resolveCapturePreset(requestedPreset, runtimeHints);
+}
+
+export function getCaptureProfileByPreset(value: CaptureResolvedQuality): CaptureProfile {
+  const profile = getSharedCaptureProfile(value);
+  return {
+    maxWidth: profile.width,
+    maxHeight: profile.height,
+    maxFrameRate: profile.fps,
+    videoBitsPerSecond: profile.bitrateBps,
+    minVideoBitsPerSecond: profile.minBitrateBps,
+  };
 }
 
 export function getCaptureProfile(value: unknown): CaptureProfile {
-  const quality = normalizeCaptureQuality(value);
-  return CAPTURE_PROFILES[quality];
+  const plan = resolveCapturePlan(value);
+  return getCaptureProfileByPreset(plan.fallbackChain[0]);
 }
 
-export function buildTabCaptureConstraints(streamId: string, value: unknown): MediaTrackConstraints {
-  const profile = getCaptureProfile(value);
+export function buildTabCaptureConstraints(
+  streamId: string,
+  value: CaptureResolvedQuality,
+): MediaTrackConstraints {
+  const profile = getCaptureProfileByPreset(value);
   return {
     mandatory: {
       chromeMediaSource: 'tab',

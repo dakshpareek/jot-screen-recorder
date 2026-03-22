@@ -9,15 +9,23 @@ import {
   RuntimeMessageType,
   type AudioSource,
   type CaptureQuality,
+  type CaptureResolvedQuality,
   type OffscreenEventTypeValue,
 } from '@/lib/messages';
 import { debugInfo, debugWarn } from '@/lib/runtime-log';
+import {
+  getRuntimeHintsFromNavigator,
+  normalizeResolvedCaptureQuality,
+  resolveCapturePreset,
+  toResolvedQualityLabel,
+} from '@/lib/capture-presets';
 import { OpfsBridge } from './offscreen/storage/opfs-bridge';
 import type { FFmpegClass, RawDownloadItem, SessionManifest } from './offscreen/types';
 import {
   buildTabCaptureConstraints,
-  getCaptureProfile,
+  getCaptureProfileByPreset,
   normalizeCaptureQuality,
+  resolveCapturePlan,
 } from './offscreen/utils';
 import {
   resolveWebCodecsRecordingFormat,
@@ -51,7 +59,8 @@ export default defineUnlistedScript(() => {
 
   let activeSessionId: string | null = null;
   let manifest: SessionManifest | null = null;
-  let activeCaptureQuality: CaptureQuality = '1080p';
+  let activeCaptureQuality: CaptureQuality = 'auto';
+  let activeResolvedPreset: CaptureResolvedQuality = '1080p30';
   let chunkCount = 0;
   let webcodecsStreamHighWater = 0;
   let webcodecsManifestTimer: ReturnType<typeof setTimeout> | null = null;
@@ -203,14 +212,21 @@ export default defineUnlistedScript(() => {
           }
 
           // Get the tab capture stream using the same method as MediaRecorder
-          const tabStream = await getTabStreamById(streamId, quality);
+          const tabStreamResolution = await getTabStreamByIdWithFallback(streamId, quality);
+          const tabStream = tabStreamResolution.stream;
           tabCaptureStream = tabStream;
 
           // Build capture stream with audio mixing (reuses the same logic as MediaRecorder path)
           const stream = await buildCaptureStream(tabStream, audioSource, micDeviceId);
           captureStream = stream;
 
-          const result = await startWebCodecsRecording(sessionId, stream, quality);
+          const result = await startWebCodecsRecording(
+            sessionId,
+            stream,
+            tabStreamResolution.requestedPreset,
+            tabStreamResolution.resolvedPreset,
+            tabStreamResolution.fallbackReason,
+          );
 
           if (!result.ok) {
             debugWarn('[Offscreen] WebCodecs start failed:', result.error);
@@ -258,6 +274,58 @@ export default defineUnlistedScript(() => {
     return trimmed;
   }
 
+  function formatPresetShortLabel(preset: CaptureResolvedQuality) {
+    return toResolvedQualityLabel(preset).replace(' • ', ' ');
+  }
+
+  function buildCaptureFallbackReason(
+    requestedPreset: CaptureQuality,
+    autoSelectedPreset: CaptureQuality,
+    attemptedPreset: CaptureResolvedQuality,
+    fallbackChain: CaptureResolvedQuality[],
+    previousErrors: string[],
+  ): string | null {
+    if (previousErrors.length > 0) {
+      const initial = fallbackChain[0] ?? attemptedPreset;
+      return `Fell back from ${formatPresetShortLabel(initial)} to ${formatPresetShortLabel(
+        attemptedPreset,
+      )}.`;
+    }
+    if (requestedPreset === 'auto') {
+      return `Auto selected ${formatPresetShortLabel(autoSelectedPreset)} based on this device.`;
+    }
+    return null;
+  }
+
+  async function getTabStreamByIdWithFallback(streamId: string, captureQuality: CaptureQuality) {
+    const plan = resolveCapturePlan(captureQuality, getRuntimeHintsFromNavigator());
+    const attemptErrors: string[] = [];
+
+    for (const preset of plan.fallbackChain) {
+      try {
+        const stream = await getTabStreamByPreset(streamId, preset);
+        return {
+          stream,
+          requestedPreset: plan.requestedPreset,
+          resolvedPreset: preset,
+          fallbackReason: buildCaptureFallbackReason(
+            plan.requestedPreset,
+            plan.autoSelectedPreset,
+            preset,
+            plan.fallbackChain,
+            attemptErrors,
+          ),
+        };
+      } catch (error) {
+        attemptErrors.push(`${preset}: ${toNamedErrorMessage(error)}`);
+      }
+    }
+
+    throw new Error(
+      `Unable to start tab capture for "${plan.requestedPreset}" (${attemptErrors.join(' | ')})`,
+    );
+  }
+
   async function startRecording(
     nextSessionId: string,
     streamId: string,
@@ -274,9 +342,11 @@ export default defineUnlistedScript(() => {
     }
 
     try {
-      activeCaptureQuality = normalizeCaptureQuality(captureQuality);
-      const captureProfile = getCaptureProfile(activeCaptureQuality);
-      tabCaptureStream = await getTabStreamById(streamId, activeCaptureQuality);
+      const streamResolution = await getTabStreamByIdWithFallback(streamId, captureQuality);
+      activeCaptureQuality = streamResolution.requestedPreset;
+      activeResolvedPreset = streamResolution.resolvedPreset;
+      const captureProfile = getCaptureProfileByPreset(activeResolvedPreset);
+      tabCaptureStream = streamResolution.stream;
       captureStream = await buildCaptureStream(tabCaptureStream, audioSource, micDeviceId);
 
       activeSessionId = nextSessionId;
@@ -289,6 +359,7 @@ export default defineUnlistedScript(() => {
         sessionId: nextSessionId,
         startTime: Date.now(),
         recordingQuality: activeCaptureQuality,
+        recordingResolvedQuality: activeResolvedPreset,
         chunks: [],
         totalDuration: 0,
         status: 'recording',
@@ -338,7 +409,12 @@ export default defineUnlistedScript(() => {
           debugWarn('[Offscreen] ffmpeg prewarm failed:', toNamedErrorMessage(error));
         });
       }
-      return { ok: true };
+      return {
+        ok: true,
+        requestedPreset: activeCaptureQuality,
+        resolvedPreset: activeResolvedPreset,
+        fallbackReason: streamResolution.fallbackReason,
+      };
     } catch (error) {
       console.error('[Offscreen] startRecording failed:', toNamedErrorMessage(error));
       await cleanupMedia();
@@ -888,6 +964,10 @@ export default defineUnlistedScript(() => {
 
     try {
       const manifestData = await readManifest(sessionId);
+      const requestedPreset = normalizeCaptureQuality(manifestData.recordingQuality);
+      const resolvedPreset = normalizeResolvedCaptureQuality(
+        manifestData.recordingResolvedQuality ?? manifestData.recordingQuality,
+      );
 
       if (manifestData.recordingKind === 'webcodecs-opfs') {
         try {
@@ -908,7 +988,8 @@ export default defineUnlistedScript(() => {
                 included: true,
               },
             ],
-            recordingQuality: normalizeCaptureQuality(manifestData.recordingQuality),
+            recordingQuality: requestedPreset,
+            recordingResolvedQuality: resolvedPreset,
           };
         } catch {
           return {
@@ -923,7 +1004,8 @@ export default defineUnlistedScript(() => {
                 included: false,
               },
             ],
-            recordingQuality: normalizeCaptureQuality(manifestData.recordingQuality),
+            recordingQuality: requestedPreset,
+            recordingResolvedQuality: resolvedPreset,
           };
         }
       }
@@ -958,7 +1040,8 @@ export default defineUnlistedScript(() => {
       return {
         ok: true,
         chunks: checks,
-        recordingQuality: normalizeCaptureQuality(manifestData.recordingQuality),
+        recordingQuality: requestedPreset,
+        recordingResolvedQuality: resolvedPreset,
       };
     } catch (error) {
       return {
@@ -1529,8 +1612,8 @@ export default defineUnlistedScript(() => {
     return high * 2 ** 32 + low;
   }
 
-  async function getTabStreamById(streamId: string, captureQuality: CaptureQuality) {
-    const video = buildTabCaptureConstraints(streamId, captureQuality);
+  async function getTabStreamByPreset(streamId: string, resolvedPreset: CaptureResolvedQuality) {
+    const video = buildTabCaptureConstraints(streamId, resolvedPreset);
 
     const audio = {
       mandatory: {
@@ -1785,6 +1868,52 @@ export default defineUnlistedScript(() => {
   let webcodecsPipeline: WebCodecsPipeline | null = null;
   let webcodecsPipelineStartTime: number | null = null;
 
+  async function resolveWebCodecsFormatForPreset(
+    requestedPreset: CaptureQuality,
+    preferredResolvedPreset?: CaptureResolvedQuality,
+  ) {
+    const plan = resolveCapturePreset(requestedPreset, getRuntimeHintsFromNavigator());
+    const planFallbackChain = [...plan.fallbackChain];
+    const preferredIndex =
+      preferredResolvedPreset == null ? -1 : planFallbackChain.indexOf(preferredResolvedPreset);
+    const candidateTail =
+      preferredIndex >= 0 ? planFallbackChain.slice(preferredIndex) : planFallbackChain;
+    const orderedCandidates: CaptureResolvedQuality[] = [];
+    if (preferredResolvedPreset) {
+      orderedCandidates.push(preferredResolvedPreset);
+    }
+    for (const candidate of candidateTail) {
+      if (!orderedCandidates.includes(candidate)) {
+        orderedCandidates.push(candidate);
+      }
+    }
+
+    let lastFailure: string | null = null;
+    for (const resolvedPreset of orderedCandidates) {
+      const resolved = await resolveWebCodecsRecordingFormat(resolvedPreset);
+      if (resolved.videoSupported) {
+        const fallbackReason =
+          resolvedPreset !== orderedCandidates[0]
+            ? `WebCodecs fell back to ${formatPresetShortLabel(resolvedPreset)}.`
+            : null;
+        return {
+          resolved,
+          resolvedPreset,
+          fallbackReason,
+          requestedPreset: plan.requestedPreset,
+        };
+      }
+      lastFailure = resolved.fallbackReason ?? `Unsupported format for ${resolvedPreset}`;
+    }
+
+    return {
+      resolved: null,
+      resolvedPreset: orderedCandidates[orderedCandidates.length - 1] ?? '1080p30',
+      fallbackReason: lastFailure ?? 'No supported WebCodecs format found',
+      requestedPreset: plan.requestedPreset,
+    };
+  }
+
   async function checkWebCodecsSupport(quality: CaptureQuality) {
     try {
       // Check if WebCodecs APIs exist
@@ -1801,13 +1930,34 @@ export default defineUnlistedScript(() => {
           container: 'mp4' as const,
           outputMimeType: 'video/mp4',
           opfsStreamFile: 'webcodecs-stream.mp4',
+          resolvedPreset: '1080p30' as const,
         };
       }
 
-      const result = await WebCodecsPipeline.checkCapabilities(quality);
+      const formatResolution = await resolveWebCodecsFormatForPreset(quality);
+      if (!formatResolution.resolved) {
+        return {
+          ok: false,
+          error: formatResolution.fallbackReason ?? 'No supported WebCodecs format found',
+          videoSupported: false,
+          audioSupported: false,
+          hardwareAcceleration: false,
+          fallbackReason: formatResolution.fallbackReason,
+          container: 'mp4' as const,
+          outputMimeType: 'video/mp4',
+          opfsStreamFile: 'webcodecs-stream.mp4',
+          resolvedPreset: formatResolution.resolvedPreset,
+        };
+      }
+
+      const result = await WebCodecsPipeline.checkCapabilities(formatResolution.resolvedPreset);
       return {
         ok: true,
         ...result,
+        requestedPreset: formatResolution.requestedPreset,
+        resolvedPreset: formatResolution.resolvedPreset,
+        fallbackReason:
+          formatResolution.fallbackReason ?? result.fallbackReason ?? null,
       };
     } catch (error) {
       debugWarn('[Offscreen] checkWebCodecsSupport error:', error);
@@ -1821,6 +1971,7 @@ export default defineUnlistedScript(() => {
         container: 'mp4' as const,
         outputMimeType: 'video/mp4',
         opfsStreamFile: 'webcodecs-stream.mp4',
+        resolvedPreset: '1080p30' as const,
       };
     }
   }
@@ -1828,23 +1979,30 @@ export default defineUnlistedScript(() => {
   async function startWebCodecsRecording(
     nextSessionId: string,
     stream: MediaStream,
-    quality: CaptureQuality,
+    requestedPreset: CaptureQuality,
+    preferredResolvedPreset: CaptureResolvedQuality,
+    captureFallbackReason: string | null,
   ) {
     if (webcodecsPipeline?.isRunning()) {
       return { ok: false, error: 'WebCodecs pipeline already running' };
     }
 
     try {
-      const resolved = await resolveWebCodecsRecordingFormat(quality);
-      if (!resolved.videoSupported) {
+      const formatResolution = await resolveWebCodecsFormatForPreset(
+        requestedPreset,
+        preferredResolvedPreset,
+      );
+      if (!formatResolution.resolved?.videoSupported) {
         return {
           ok: false,
-          error: `Video encoding not supported: ${resolved.fallbackReason ?? 'Unknown reason'}`,
+          error: `Video encoding not supported: ${formatResolution.fallbackReason ?? 'Unknown reason'}`,
         };
       }
+      const resolved = formatResolution.resolved;
 
       activeSessionId = nextSessionId;
-      activeCaptureQuality = quality;
+      activeCaptureQuality = formatResolution.requestedPreset;
+      activeResolvedPreset = formatResolution.resolvedPreset;
       chunkCount = 0;
       webcodecsStreamHighWater = 0;
       if (webcodecsManifestTimer) {
@@ -1855,7 +2013,8 @@ export default defineUnlistedScript(() => {
       manifest = {
         sessionId: nextSessionId,
         startTime: Date.now(),
-        recordingQuality: quality,
+        recordingQuality: activeCaptureQuality,
+        recordingResolvedQuality: activeResolvedPreset,
         mimeType: resolved.outputMimeType,
         chunks: [],
         totalDuration: 0,
@@ -1875,7 +2034,8 @@ export default defineUnlistedScript(() => {
       };
 
       webcodecsPipeline = new WebCodecsPipeline({
-        quality,
+        requestedPreset: activeCaptureQuality,
+        resolvedPreset: activeResolvedPreset,
         resolvedFormat: resolved,
         opfsPersist: {
           writeRange: persistWrite,
@@ -1915,6 +2075,12 @@ export default defineUnlistedScript(() => {
       return {
         ok: true,
         hardwareAccelerated: resolved.hardwareAcceleration,
+        requestedPreset: activeCaptureQuality,
+        resolvedPreset: activeResolvedPreset,
+        fallbackReason:
+          [captureFallbackReason, formatResolution.fallbackReason, resolved.fallbackReason]
+            .filter((reason): reason is string => Boolean(reason))
+            .join(' ') || null,
       };
     } catch (error) {
       console.error('[WebCodecs] Failed to start', error);

@@ -1,4 +1,4 @@
-import type { CaptureQuality } from '@/lib/messages';
+import type { CaptureResolvedQuality } from '@/lib/messages';
 import { debugWarn } from '@/lib/runtime-log';
 import {
   VIDEO_ENCODER_PROFILES,
@@ -25,7 +25,7 @@ export class WebCodecsPipeline {
   private videoReader: ReadableStreamDefaultReader<VideoFrame> | null = null;
   private audioReader: ReadableStreamDefaultReader<AudioData> | null = null;
 
-  private quality: CaptureQuality;
+  private resolvedPreset: CaptureResolvedQuality;
   private options: WebCodecsPipelineOptions;
 
   private frameCount = 0;
@@ -62,11 +62,11 @@ export class WebCodecsPipeline {
 
   constructor(options: WebCodecsPipelineOptions) {
     this.options = options;
-    this.quality = options.quality;
+    this.resolvedPreset = options.resolvedPreset;
   }
 
-  static async checkCapabilities(quality: CaptureQuality): Promise<EncoderCapabilityResult> {
-    const f = await resolveWebCodecsRecordingFormat(quality);
+  static async checkCapabilities(resolvedPreset: CaptureResolvedQuality): Promise<EncoderCapabilityResult> {
+    const f = await resolveWebCodecsRecordingFormat(resolvedPreset);
     return {
       videoSupported: f.videoSupported,
       audioSupported: f.audioSupported,
@@ -75,6 +75,7 @@ export class WebCodecsPipeline {
       container: f.container,
       outputMimeType: f.outputMimeType,
       opfsStreamFile: f.opfsStreamFile,
+      resolvedPreset: f.resolvedPreset,
     };
   }
 
@@ -86,10 +87,10 @@ export class WebCodecsPipeline {
     this.pendingOpfsWrites = Promise.resolve();
     this.opfsFatalError = null;
 
-    const profile = VIDEO_ENCODER_PROFILES[this.quality];
+    const profile = VIDEO_ENCODER_PROFILES[this.resolvedPreset];
 
     const format =
-      this.options.resolvedFormat ?? (await resolveWebCodecsRecordingFormat(this.quality));
+      this.options.resolvedFormat ?? (await resolveWebCodecsRecordingFormat(this.resolvedPreset));
     if (!format.videoSupported) {
       throw new Error(format.fallbackReason ?? 'Recording format not supported');
     }
@@ -182,7 +183,7 @@ export class WebCodecsPipeline {
 
   private initializeMemoryPressureBaseline(profile: WebCodecsEncoderConfig): void {
     this.currentVideoBitrate = profile.bitrate;
-    this.minVideoBitrateBps = this.quality === '1080p' ? 1_200_000 : 900_000;
+    this.minVideoBitrateBps = profile.minBitrateBps ?? 900_000;
     const deviceMemory =
       typeof navigator !== 'undefined' && 'deviceMemory' in navigator
         ? (navigator as Navigator & { deviceMemory?: number }).deviceMemory
@@ -259,7 +260,7 @@ export class WebCodecsPipeline {
 
   private async initVideoEncoder(
     track: MediaStreamTrack,
-    profile: typeof VIDEO_ENCODER_PROFILES['1080p'],
+    profile: typeof VIDEO_ENCODER_PROFILES['1080p30'],
     format: ResolvedWebCodecsFormat,
   ): Promise<void> {
     const selectedCodec = format.selectedVideoCodec;
@@ -335,7 +336,7 @@ export class WebCodecsPipeline {
   private async processVideoFrames(): Promise<void> {
     if (!this.videoReader || !this.videoEncoder) return;
 
-    const profile = VIDEO_ENCODER_PROFILES[this.quality];
+    const profile = VIDEO_ENCODER_PROFILES[this.resolvedPreset];
 
     try {
       while (this.running && !this.stopping) {
@@ -523,7 +524,7 @@ export class WebCodecsPipeline {
         : 0,
       hardwareAccelerated: this.hardwareAccelerated,
       memoryPressureTier: this.memoryPressureTier,
-      videoBitrateBps: this.currentVideoBitrate || VIDEO_ENCODER_PROFILES[this.quality].bitrate,
+      videoBitrateBps: this.currentVideoBitrate || VIDEO_ENCODER_PROFILES[this.resolvedPreset].bitrate,
       container,
       outputMimeType: fmt?.outputMimeType ?? 'video/mp4',
       fileExtension: container === 'webm' ? 'webm' : 'mp4',

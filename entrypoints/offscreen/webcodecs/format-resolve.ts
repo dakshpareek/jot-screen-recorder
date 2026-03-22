@@ -1,4 +1,4 @@
-import type { CaptureQuality } from '@/lib/messages';
+import type { CaptureResolvedQuality } from '@/lib/messages';
 import {
   VIDEO_ENCODER_PROFILES,
   AUDIO_ENCODER_CONFIG,
@@ -30,7 +30,7 @@ export function matroskaVideoCodecId(webCodec: string): 'V_VP8' | 'V_VP9' {
 
 async function isVideoCodecSupported(
   codec: string,
-  profile: (typeof VIDEO_ENCODER_PROFILES)[CaptureQuality],
+  profile: (typeof VIDEO_ENCODER_PROFILES)[CaptureResolvedQuality],
   preferHardware: boolean,
 ): Promise<boolean> {
   try {
@@ -50,7 +50,7 @@ async function isVideoCodecSupported(
 }
 
 async function pickVideoCodecWithAudio(
-  profile: (typeof VIDEO_ENCODER_PROFILES)[CaptureQuality],
+  profile: (typeof VIDEO_ENCODER_PROFILES)[CaptureResolvedQuality],
 ): Promise<{ codec: string; useHardware: boolean } | null> {
   const codecsToTry = [profile.codec, ...FALLBACK_CODECS.filter((c) => c !== profile.codec)];
 
@@ -93,9 +93,9 @@ async function isAudioSupported(config: WebCodecsAudioConfig): Promise<boolean> 
 }
 
 export async function resolveWebCodecsRecordingFormat(
-  quality: CaptureQuality,
+  resolvedPreset: CaptureResolvedQuality,
 ): Promise<ResolvedWebCodecsFormat> {
-  const profile = VIDEO_ENCODER_PROFILES[quality];
+  const profile = VIDEO_ENCODER_PROFILES[resolvedPreset];
 
   const base: ResolvedWebCodecsFormat = {
     videoSupported: false,
@@ -107,6 +107,7 @@ export async function resolveWebCodecsRecordingFormat(
     outputMimeType: 'video/mp4',
     opfsStreamFile: 'webcodecs-stream.mp4',
     audioEncoderConfig: AUDIO_ENCODER_CONFIG,
+    resolvedPreset,
   };
 
   const picked = await pickVideoCodecWithAudio(profile);
@@ -126,6 +127,7 @@ export async function resolveWebCodecsRecordingFormat(
   base.audioEncoderConfig = audioEncoderConfig;
   base.outputMimeType = container === 'webm' ? 'video/webm' : 'video/mp4';
   base.opfsStreamFile = container === 'webm' ? 'webcodecs-stream.webm' : 'webcodecs-stream.mp4';
+  base.resolvedPreset = resolvedPreset;
 
   if (!picked.useHardware && container === 'mp4') {
     base.fallbackReason = 'Using software encoder';

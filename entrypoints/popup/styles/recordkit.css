@@ -473,6 +473,8 @@
 
   .rk-quality-row {
     display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
     justify-content: center;
     margin-bottom: 14px;
   }

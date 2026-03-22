@@ -24,8 +24,8 @@ Authoritative transition table lives in:
 
 ## Popup -> Background Commands
 - `GET_STATE`
-- `PREPARE_START` (`includeMic`, optional `micDeviceId`)
-- `START` (`audioSource`, optional `micDeviceId`)
+- `PREPARE_START` (`includeMic`, optional `micDeviceId`, optional `quality`)
+- `START` (`audioSource`, optional `micDeviceId`, optional `quality`)
 - `STOP`
 - `DOWNLOAD`
 - `RESET_TO_IDLE`
@@ -85,6 +85,11 @@ Background -> Popup:
 ## Snapshot Contract
 The popup consumes `RecordingSnapshot` from `lib/recording.ts`.
 Fields must remain backward-compatible during refactors.
+
+Quality preset fields:
+- `requestedPreset`: user-selected preset (`auto`, `1080p30`, `1080p60`, `4k30`).
+- `resolvedPreset`: actual recording preset after runtime fallback (`1080p30`, `1080p60`, `1440p30`, `4k30`, or `null` before start).
+- `recordingQuality`: backward-compatible alias of `requestedPreset`.
 
 ## Audio Preflight Semantics
 - `audioPreflight.systemAudioStatus` is `pending` only when runtime system-audio verification is active (MediaRecorder path with `audioSource` of `both` or `tab`).

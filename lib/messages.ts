@@ -1,7 +1,8 @@
 import type { ProcessingMetrics, RecordingSnapshot, RecoveryChunkCheck, ValidationResult } from './recording';
 
 export type AudioSource = 'both' | 'mic' | 'tab' | 'silent';
-export type CaptureQuality = '720p' | '1080p';
+export type CaptureQuality = 'auto' | '1080p30' | '1080p60' | '4k30';
+export type CaptureResolvedQuality = CaptureQuality | '1440p30';
 
 export const RuntimeMessageType = {
   GET_STATE: 'GET_STATE',
@@ -95,6 +96,9 @@ export type OffscreenResponse = {
   outputUrl?: string;
   fileName?: string;
   validation?: ValidationResult;
+  requestedPreset?: CaptureQuality;
+  resolvedPreset?: CaptureResolvedQuality;
+  fallbackReason?: string | null;
 };
 
 export type MicPreflightResponse = {
@@ -109,6 +113,7 @@ export type RecoveryInspectResponse = {
   error?: string;
   chunks?: RecoveryChunkCheck[];
   recordingQuality?: CaptureQuality;
+  recordingResolvedQuality?: CaptureResolvedQuality;
 };
 
 export type StateChangeMessage = {

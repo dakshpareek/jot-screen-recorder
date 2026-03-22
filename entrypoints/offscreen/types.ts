@@ -1,5 +1,5 @@
 import type { OrphanedSession } from '@/lib/recording';
-import type { CaptureQuality } from '@/lib/messages';
+import type { CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
 
 export interface ManifestChunk {
   index: number;
@@ -13,6 +13,7 @@ export interface SessionManifest {
   sessionId: string;
   startTime: number;
   recordingQuality?: CaptureQuality;
+  recordingResolvedQuality?: CaptureResolvedQuality;
   mimeType?: string;
   chunks: ManifestChunk[];
   totalDuration: number;

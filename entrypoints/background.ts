@@ -10,6 +10,7 @@ import type {
 import type {
   AudioSource,
   CaptureQuality,
+  CaptureResolvedQuality,
   MicMixFailedMessage,
   MicPreflightResponse,
   OffscreenEventMessage,
@@ -36,6 +37,7 @@ import {
   getSystemAudioPreflightSnapshot,
   normalizeAudioSource,
   normalizeCaptureQuality,
+  normalizeResolvedCaptureQuality,
   normalizeMicDeviceId,
   normalizeSystemAudioStatus,
   toErrorMessage,
@@ -78,7 +80,8 @@ let processingPipelineRunning = false;
 let recordingTabId: number | null = null;
 let activeAudioSource: AudioSource = 'both';
 let selectedMicDeviceId: string | null = null;
-let recordingQuality: CaptureQuality = '1080p';
+let recordingQuality: CaptureQuality = 'auto';
+let resolvedPreset: CaptureResolvedQuality | null = null;
 let usingWebCodecs = false;
 let webCodecsStats: RecordingSnapshot['webCodecsStats'] = null;
 const offscreenClient = new OffscreenClient();
@@ -314,7 +317,9 @@ async function hydrateContext() {
     orphanedSessions = Array.isArray(stored.orphanedSessions) ? stored.orphanedSessions : [];
     recoverySessionId = stored.recoverySessionId ?? null;
     recoveryChunks = Array.isArray(stored.recoveryChunks) ? stored.recoveryChunks : [];
-    recordingQuality = normalizeCaptureQuality(stored.recordingQuality);
+    recordingQuality = normalizeCaptureQuality(stored.requestedPreset ?? stored.recordingQuality);
+    resolvedPreset =
+      stored.resolvedPreset == null ? null : normalizeResolvedCaptureQuality(stored.resolvedPreset);
     usingWebCodecs = stored.usingWebCodecs ?? false;
     webCodecsStats = stored.webCodecsStats ?? null;
     outputUrl = null;
@@ -414,6 +419,8 @@ function buildSnapshot(): RecordingSnapshot {
     storageWarningMessage,
     canDownload: Boolean(outputUrl) && (state === 'done' || state === 'recovery'),
     outputFileName,
+    requestedPreset: recordingQuality,
+    resolvedPreset,
     recordingQuality,
     validation,
     processingMetrics,
@@ -475,6 +482,8 @@ async function persistContext() {
     micWarningMessage,
     storageWarningMessage,
     outputFileName,
+    requestedPreset: recordingQuality,
+    resolvedPreset,
     recordingQuality,
     usingWebCodecs,
     validation,
@@ -559,6 +568,7 @@ function resetSessionMetadata(nextSessionId: string) {
   recoverySessionId = null;
   recoveryChunks = [];
   webCodecsStats = null;
+  resolvedPreset = null;
   audioPreflight = {
     ...audioPreflight,
     systemAudioStatus: 'idle',
@@ -585,6 +595,7 @@ function resetAttemptMetadata() {
   audioPreflight = { ...DEFAULT_AUDIO_PREFLIGHT };
   activeAudioSource = 'both';
   selectedMicDeviceId = null;
+  resolvedPreset = null;
   usingWebCodecs = false;
   webCodecsStats = null;
 }
@@ -592,7 +603,7 @@ function resetAttemptMetadata() {
 async function handleStart(
   audioSource: AudioSource = 'both',
   micDeviceId: string | null = null,
-  quality: CaptureQuality = '1080p',
+  quality: CaptureQuality = 'auto',
 ) {
   if (state !== 'armed') {
     return { ok: false, error: `Cannot start from state "${state}"`, snapshot: buildSnapshot() };
@@ -601,6 +612,7 @@ async function handleStart(
   activeAudioSource = audioSource;
   selectedMicDeviceId = audioSource === 'both' || audioSource === 'mic' ? micDeviceId : null;
   recordingQuality = normalizeCaptureQuality(quality);
+  resolvedPreset = null;
   const nextSessionId = createSessionId();
   resetSessionMetadata(nextSessionId);
 
@@ -650,6 +662,10 @@ async function handleStart(
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
     }
 
+    recordingQuality = normalizeCaptureQuality(result.requestedPreset ?? recordingQuality);
+    resolvedPreset =
+      result.resolvedPreset == null ? null : normalizeResolvedCaptureQuality(result.resolvedPreset);
+
     recordingStartTime = Date.now();
     audioPreflight = {
       ...audioPreflight,
@@ -671,11 +687,12 @@ async function handleStart(
 async function handlePrepareStart(
   includeMic = true,
   micDeviceId: string | null = null,
-  quality: CaptureQuality = '1080p',
+  quality: CaptureQuality = 'auto',
 ) {
   try {
     if (state === 'armed') {
       recordingQuality = normalizeCaptureQuality(quality);
+      resolvedPreset = null;
       await persistContext();
       await broadcastSnapshot();
       return { ok: true, snapshot: buildSnapshot() };
@@ -686,6 +703,7 @@ async function handlePrepareStart(
     }
 
     recordingQuality = normalizeCaptureQuality(quality);
+    resolvedPreset = null;
     resetAttemptMetadata();
     await persistContext();
     await broadcastSnapshot();
@@ -1255,6 +1273,10 @@ async function handleRecoverOrphan(targetSessionId: string, chunkIndexes?: numbe
       }
 
       recordingQuality = normalizeCaptureQuality(inspect.recordingQuality);
+      resolvedPreset =
+        inspect.recordingResolvedQuality == null
+          ? null
+          : normalizeResolvedCaptureQuality(inspect.recordingResolvedQuality);
 
       const inspectedChunks = Array.isArray(inspect.chunks) ? inspect.chunks : [];
       const suspectChunks = inspectedChunks.filter((chunk) => chunk.status !== 'ok');

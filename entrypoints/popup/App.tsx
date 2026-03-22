@@ -33,7 +33,9 @@ const EMPTY_SNAPSHOT: RecordingSnapshot = {
   storageWarningMessage: null,
   canDownload: false,
   outputFileName: null,
-  recordingQuality: '1080p',
+  requestedPreset: 'auto',
+  resolvedPreset: null,
+  recordingQuality: 'auto',
   validation: null,
   processingMetrics: null,
   orphanedSessions: [],
@@ -99,8 +101,8 @@ export default function App() {
   }, [snapshot.recoveryChunks, snapshot.recoverySessionId, snapshot.sessionId, snapshot.state]);
 
   useEffect(() => {
-    setQuality(snapshot.recordingQuality ?? '1080p');
-  }, [snapshot.recordingQuality]);
+    setQuality(snapshot.requestedPreset ?? snapshot.recordingQuality ?? 'auto');
+  }, [snapshot.requestedPreset, snapshot.recordingQuality]);
 
   useEffect(() => {
     if (snapshot.state === 'processing') {
@@ -129,7 +131,7 @@ export default function App() {
       try {
         const result = await chrome.runtime.sendMessage({
           type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
-          quality: '1080p',
+          quality: 'auto',
         });
         if (result) {
           setWebCodecsSupport({
@@ -433,7 +435,7 @@ export default function App() {
           snapshot={snapshot}
           onStop={handleStop}
           isBusy={isBusy}
-          quality={snapshot.recordingQuality}
+          quality={snapshot.resolvedPreset ?? snapshot.requestedPreset ?? snapshot.recordingQuality}
         />
       ) : null}
 

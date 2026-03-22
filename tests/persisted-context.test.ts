@@ -18,7 +18,9 @@ function createSampleContext(): PersistedContext {
     micWarningMessage: null,
     storageWarningMessage: null,
     outputFileName: null,
-    recordingQuality: '720p',
+    requestedPreset: '1080p30',
+    resolvedPreset: '1080p30',
+    recordingQuality: '1080p30',
     usingWebCodecs: true,
     validation: null,
     processingMetrics: null,
@@ -71,6 +73,23 @@ describe('persisted-context storage contract', () => {
 
     expect(getMock).toHaveBeenCalledWith(CONTEXT_KEY);
     expect(result).toBeUndefined();
+  });
+
+  it('migrates legacy persisted quality values on load', async () => {
+    getMock.mockResolvedValue({
+      [CONTEXT_KEY]: {
+        ...createSampleContext(),
+        recordingQuality: '720p',
+        requestedPreset: undefined,
+        resolvedPreset: undefined,
+      },
+    });
+
+    const result = await loadPersistedContext();
+
+    expect(result?.requestedPreset).toBe('1080p30');
+    expect(result?.recordingQuality).toBe('1080p30');
+    expect(result?.resolvedPreset).toBeNull();
   });
 
   it('writes payload under the expected storage key', async () => {

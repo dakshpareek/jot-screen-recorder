@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
-import type { CaptureQuality } from '@/lib/messages';
+import type { CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
+import { toCaptureQualityLabel, toResolvedQualityLabel } from '@/lib/capture-presets';
 import {
   type AudioPreflightSnapshot,
   type OrphanedSession,
@@ -118,6 +119,13 @@ function formatOrphanTime(ms: number): string {
     minute: '2-digit',
   });
 }
+
+const QUALITY_PRESET_OPTIONS: Array<{ id: CaptureQuality; title: string; subtitle: string }> = [
+  { id: 'auto', title: 'Auto', subtitle: 'Best stable preset' },
+  { id: '1080p30', title: '1080p • 30fps', subtitle: 'Balanced quality' },
+  { id: '1080p60', title: '1080p • 60fps', subtitle: 'Smoother motion' },
+  { id: '4k30', title: '4K • 30fps', subtitle: 'Highest detail' },
+];
 
 export function Header({
   state,
@@ -305,18 +313,15 @@ export function IdleScreen({
           <div className="rk-settings-body">
             <div className="rk-settings-section">Recording quality</div>
             <div className="rk-quality-grid">
-              <button
-                className={`rk-quality-btn${quality === '720p' ? ' active' : ''}`}
-                onClick={() => onQualityChange('720p')}>
-                <div className="rk-quality-val">720p</div>
-                <div className="rk-quality-sub">Smaller file size</div>
-              </button>
-              <button
-                className={`rk-quality-btn${quality === '1080p' ? ' active' : ''}`}
-                onClick={() => onQualityChange('1080p')}>
-                <div className="rk-quality-val">1080p</div>
-                <div className="rk-quality-sub">Recommended</div>
-              </button>
+              {QUALITY_PRESET_OPTIONS.map((preset) => (
+                <button
+                  key={preset.id}
+                  className={`rk-quality-btn${quality === preset.id ? ' active' : ''}`}
+                  onClick={() => onQualityChange(preset.id)}>
+                  <div className="rk-quality-val">{preset.title}</div>
+                  <div className="rk-quality-sub">{preset.subtitle}</div>
+                </button>
+              ))}
             </div>
 
             <div className="rk-settings-section" style={{ marginTop: 16 }}>
@@ -601,15 +606,20 @@ export function RecordingScreen({
   snapshot,
   onStop,
   isBusy,
-  quality = snapshot.recordingQuality,
+  quality = snapshot.resolvedPreset ?? snapshot.requestedPreset ?? snapshot.recordingQuality,
 }: {
   snapshot: RecordingSnapshot;
   onStop: () => void;
   isBusy: boolean;
-  quality?: CaptureQuality;
+  quality?: CaptureResolvedQuality;
 }) {
   const safeSeconds = snapshot.chunkCount * 10;
   const hasSavedData = snapshot.chunkCount > 0;
+  const requestedPreset = snapshot.requestedPreset ?? snapshot.recordingQuality;
+  const resolvedPreset = snapshot.resolvedPreset ?? quality;
+  const requestedLabel = toCaptureQualityLabel(requestedPreset);
+  const resolvedLabel = toResolvedQualityLabel(resolvedPreset);
+  const showActualUsed = resolvedPreset !== requestedPreset;
 
   return (
     <>
@@ -653,8 +663,16 @@ export function RecordingScreen({
         <div className="rk-quality-row">
           <div className="rk-quality-pill">
             <div className="rk-quality-pill-dot" />
-            {quality} · 30fps · Local only
+            Requested: {requestedLabel}
           </div>
+          {showActualUsed && (
+            <div
+              className="rk-quality-pill"
+              style={{ background: 'rgba(255,214,10,0.14)', color: 'rgba(120,90,10,0.95)' }}>
+              <div className="rk-quality-pill-dot" style={{ background: 'rgba(214,153,0,0.95)' }} />
+              Actual used: {resolvedLabel}
+            </div>
+          )}
           {snapshot.webCodecsStats && (
             <div className="rk-quality-pill" style={{ background: 'rgba(52,199,89,0.12)', color: 'rgba(52,199,89,0.9)' }}>
               <div className="rk-quality-pill-dot" style={{ background: 'rgba(52,199,89,0.9)' }} />
@@ -911,7 +929,11 @@ export function DoneScreen({
     : snapshot.webCodecsStats?.bytesWritten
       ? formatBytes(snapshot.webCodecsStats.bytesWritten)
       : '—';
-  const qualityLabel = snapshot.recordingQuality ?? '1080p';
+  const requestedPreset = snapshot.requestedPreset ?? snapshot.recordingQuality;
+  const resolvedPreset = snapshot.resolvedPreset ?? requestedPreset;
+  const requestedLabel = toCaptureQualityLabel(requestedPreset);
+  const qualityLabel = toResolvedQualityLabel(resolvedPreset);
+  const showFallbackQuality = resolvedPreset !== requestedPreset;
 
   return (
     <>
@@ -946,8 +968,11 @@ export function DoneScreen({
                 <rect x="1" y="1.5" width="8" height="7" rx="1" strokeWidth="1.4" strokeLinecap="round" />
                 <polygon points="3.5,3.5 3.5,6.5 7,5" fill="currentColor" stroke="none" />
               </svg>
-              {qualityLabel} · 30fps
+              {showFallbackQuality ? `Requested: ${requestedLabel}` : qualityLabel}
             </div>
+            {showFallbackQuality && (
+              <div className="rk-done-pill">Actual: {qualityLabel}</div>
+            )}
             <div className="rk-done-pill">
               <svg viewBox="0 0 10 10">
                 <path d="M2 5h6M5 2l3 3-3 3" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />

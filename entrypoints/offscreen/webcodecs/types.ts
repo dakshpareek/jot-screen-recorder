@@ -1,4 +1,4 @@
-import type { CaptureQuality } from '@/lib/messages';
+import type { CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
 
 // MediaStreamTrackProcessor is part of the Insertable Streams API (MediaCapture Transform)
 // Not all TypeScript configurations include these types by default
@@ -25,6 +25,7 @@ export interface WebCodecsEncoderConfig {
   width: number;
   height: number;
   bitrate: number;
+  minBitrateBps?: number;
   framerate: number;
   hardwareAcceleration: HardwareAcceleration;
   latencyMode: LatencyMode;
@@ -45,22 +46,57 @@ export interface WebCodecsAudioConfig {
 // - 64 = High profile
 // - 00 = no constraints
 // - Level: 1f=3.1, 20=3.2, 28=4.0, 29=4.1, 32=5.0, 33=5.1, 34=5.2
-export const VIDEO_ENCODER_PROFILES: Record<CaptureQuality, WebCodecsEncoderConfig> = {
-  '720p': {
-    codec: 'avc1.4d0020', // H.264 Main Profile Level 3.2 (widely supported)
-    width: 1280,
-    height: 720,
-    bitrate: 2_500_000,
-    framerate: 30,
-    hardwareAcceleration: 'prefer-hardware',
-    latencyMode: 'realtime',
-    keyframeIntervalFrames: 150, // keyframe every 5s at 30fps
-  },
-  '1080p': {
+export const VIDEO_ENCODER_PROFILES: Record<CaptureResolvedQuality, WebCodecsEncoderConfig> = {
+  auto: {
     codec: 'avc1.4d0028', // H.264 Main Profile Level 4.0 (1080p standard)
     width: 1920,
     height: 1080,
     bitrate: 4_000_000,
+    minBitrateBps: 1_200_000,
+    framerate: 30,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+    keyframeIntervalFrames: 150,
+  },
+  '1080p30': {
+    codec: 'avc1.4d0028',
+    width: 1920,
+    height: 1080,
+    bitrate: 4_000_000,
+    minBitrateBps: 1_200_000,
+    framerate: 30,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+    keyframeIntervalFrames: 150,
+  },
+  '1080p60': {
+    codec: 'avc1.4d0032', // H.264 Main Profile Level 5.0 for 1080p60
+    width: 1920,
+    height: 1080,
+    bitrate: 7_000_000,
+    minBitrateBps: 1_800_000,
+    framerate: 60,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+    keyframeIntervalFrames: 300, // keyframe every 5s at 60fps
+  },
+  '1440p30': {
+    codec: 'avc1.640032', // H.264 High Profile Level 5.0 for 1440p
+    width: 2560,
+    height: 1440,
+    bitrate: 9_000_000,
+    minBitrateBps: 2_500_000,
+    framerate: 30,
+    hardwareAcceleration: 'prefer-hardware',
+    latencyMode: 'realtime',
+    keyframeIntervalFrames: 150,
+  },
+  '4k30': {
+    codec: 'avc1.640033', // H.264 High Profile Level 5.1 for 4K
+    width: 3840,
+    height: 2160,
+    bitrate: 14_000_000,
+    minBitrateBps: 4_000_000,
     framerate: 30,
     hardwareAcceleration: 'prefer-hardware',
     latencyMode: 'realtime',
@@ -91,6 +127,7 @@ export interface EncoderCapabilityResult {
   container: 'mp4' | 'webm';
   outputMimeType: string;
   opfsStreamFile: string;
+  resolvedPreset: CaptureResolvedQuality;
 }
 
 export interface MuxerChunk {
@@ -133,10 +170,12 @@ export interface ResolvedWebCodecsFormat {
   outputMimeType: string;
   opfsStreamFile: string;
   audioEncoderConfig: WebCodecsAudioConfig;
+  resolvedPreset: CaptureResolvedQuality;
 }
 
 export interface WebCodecsPipelineOptions {
-  quality: CaptureQuality;
+  requestedPreset: CaptureQuality;
+  resolvedPreset: CaptureResolvedQuality;
   /** When set (e.g. from offscreen), must match manifest / OPFS stream file. */
   resolvedFormat?: ResolvedWebCodecsFormat;
   onProgress?: (stats: WebCodecsPipelineStats) => void;

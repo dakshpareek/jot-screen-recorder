@@ -7,7 +7,8 @@ import type {
   RecoveryChunkCheck,
   ValidationResult,
 } from '@/lib/recording';
-import type { CaptureQuality } from '@/lib/messages';
+import type { CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
+import { normalizeCaptureQuality, normalizeResolvedCaptureQuality } from '@/lib/capture-presets';
 
 const CONTEXT_KEY = 'phase2-recording-context';
 const EXPERIMENTAL_FLAGS_KEY = 'experimental-flags';
@@ -22,6 +23,8 @@ export interface PersistedContext {
   micWarningMessage: string | null;
   storageWarningMessage: string | null;
   outputFileName: string | null;
+  requestedPreset?: CaptureQuality;
+  resolvedPreset?: CaptureResolvedQuality | null;
   recordingQuality?: CaptureQuality;
   usingWebCodecs?: boolean;
   validation: ValidationResult | null;
@@ -42,7 +45,24 @@ const DEFAULT_EXPERIMENTAL_FLAGS: ExperimentalFlags = {
 };
 
 export async function loadPersistedContext(): Promise<PersistedContext | undefined> {
-  return (await chrome.storage.local.get(CONTEXT_KEY))[CONTEXT_KEY] as PersistedContext | undefined;
+  const payload = (await chrome.storage.local.get(CONTEXT_KEY))[CONTEXT_KEY] as
+    | PersistedContext
+    | undefined;
+  if (!payload) return payload;
+
+  const migratedRequestedPreset = normalizeCaptureQuality(
+    payload.requestedPreset ?? payload.recordingQuality,
+  );
+  const hasExplicitResolved = payload.resolvedPreset !== undefined && payload.resolvedPreset !== null;
+
+  return {
+    ...payload,
+    requestedPreset: migratedRequestedPreset,
+    resolvedPreset: hasExplicitResolved
+      ? normalizeResolvedCaptureQuality(payload.resolvedPreset)
+      : null,
+    recordingQuality: migratedRequestedPreset,
+  };
 }
 
 export async function savePersistedContext(payload: PersistedContext): Promise<void> {

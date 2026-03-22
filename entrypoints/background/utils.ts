@@ -1,5 +1,9 @@
-import type { AudioSource, CaptureQuality } from '@/lib/messages';
+import type { AudioSource, CaptureQuality, CaptureResolvedQuality } from '@/lib/messages';
 import type { AudioPreflightSnapshot, SystemAudioStatus } from '@/lib/recording';
+import {
+  normalizeCaptureQuality as normalizeCaptureQualityShared,
+  normalizeResolvedCaptureQuality as normalizeResolvedCaptureQualityShared,
+} from '@/lib/capture-presets';
 
 export function normalizeSystemAudioStatus(value: unknown): SystemAudioStatus {
   if (value === 'pending' || value === 'ok' || value === 'absent' || value === 'silent') {
@@ -16,10 +20,11 @@ export function normalizeAudioSource(value: unknown): AudioSource {
 }
 
 export function normalizeCaptureQuality(value: unknown): CaptureQuality {
-  if (value === '720p') {
-    return value;
-  }
-  return '1080p';
+  return normalizeCaptureQualityShared(value);
+}
+
+export function normalizeResolvedCaptureQuality(value: unknown): CaptureResolvedQuality {
+  return normalizeResolvedCaptureQualityShared(value);
 }
 
 export function getSystemAudioPreflightSnapshot(
