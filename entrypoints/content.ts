@@ -24,7 +24,7 @@ function showOverlay() {
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = `
-      @keyframes rk-recording-breathe {
+      @keyframes jot-recording-breathe {
         0%, 100% {
           box-shadow:
             inset 0 0 0 3px rgba(255, 59, 48, 0.85),
@@ -52,7 +52,7 @@ function showOverlay() {
     box-shadow:
       inset 0 0 0 3px rgba(255, 59, 48, 0.85),
       inset 0 0 20px rgba(255, 59, 48, 0.12);
-    animation: rk-recording-breathe 2s ease-in-out infinite;
+    animation: jot-recording-breathe 2s ease-in-out infinite;
   `;
 
   const parent = document.body ?? document.documentElement;

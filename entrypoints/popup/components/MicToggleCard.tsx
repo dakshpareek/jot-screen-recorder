@@ -62,35 +62,35 @@ export function MicToggleCard({
 
   return (
     <>
-      <div className={`rk-mic-card ${statusClass}`}>
-        <div className="rk-mic-top">
+      <div className={`jot-mic-card ${statusClass}`}>
+        <div className="jot-mic-top">
           <div>
-            <div className="rk-mic-label">Include microphone</div>
-            <div className={`rk-mic-sub ${subClass}`}>{subtitle}</div>
+            <div className="jot-mic-label">Include microphone</div>
+            <div className={`jot-mic-sub ${subClass}`}>{subtitle}</div>
           </div>
           <button
-            className={`rk-mic-toggle${includeMic ? ' on' : ''}${status === 'ok' ? ' ok' : ''}`}
+            className={`jot-mic-toggle${includeMic ? ' on' : ''}${status === 'ok' ? ' ok' : ''}`}
             onClick={handleToggle}
             aria-label={includeMic ? 'Disable microphone' : 'Enable microphone'}
           />
         </div>
 
         {includeMic && (
-          <div className="rk-mic-detail">
+          <div className="jot-mic-detail">
             {status === 'checking' && (
-              <div className="rk-mic-checking">
-                <div className="rk-mic-spinner" />
+              <div className="jot-mic-checking">
+                <div className="jot-mic-spinner" />
                 <span>Checking microphone...</span>
               </div>
             )}
 
             {status === 'ok' && (
-              <div className="rk-device-row">
-                <div className="rk-inline-bars">
+              <div className="jot-device-row">
+                <div className="jot-inline-bars">
                   {levelBars.map((h, i) => (
                     <div
                       key={i}
-                      className={`rk-ib${h > 5 ? ' rk-ib-lit' : ''}`}
+                      className={`jot-ib${h > 5 ? ' jot-ib-lit' : ''}`}
                       style={{ height: Math.round(h) }}
                     />
                   ))}
@@ -98,7 +98,7 @@ export function MicToggleCard({
 
                 {audioDevices.length > 1 ? (
                   <select
-                    className="rk-device-select"
+                    className="jot-device-select"
                     value={selectedDeviceId}
                     onChange={(e) => handleDeviceChange(e.target.value)}>
                     {audioDevices.map((device, index) => (
@@ -108,28 +108,28 @@ export function MicToggleCard({
                     ))}
                   </select>
                 ) : (
-                  <span className="rk-device-name">{deviceName}</span>
+                  <span className="jot-device-name">{deviceName}</span>
                 )}
 
-                <span className="rk-device-active">Active</span>
+                <span className="jot-device-active">Active</span>
               </div>
             )}
 
             {(status === 'waiting' || status === 'not_found') && (
-              <div className="rk-mic-wait">
+              <div className="jot-mic-wait">
                 No microphone detected. Connect a device and we will auto-check again every 2 seconds.
               </div>
             )}
 
             {status === 'denied' && (
-              <div className="rk-mic-error">
-                <div className="rk-mic-error-title">Microphone permission blocked</div>
-                <div className="rk-mic-error-body">
+              <div className="jot-mic-error">
+                <div className="jot-mic-error-title">Microphone permission blocked</div>
+                <div className="jot-mic-error-body">
                   Allow microphone access in Chrome, or turn this toggle off to record without voice.
                 </div>
-                <div className="rk-mic-error-btns">
+                <div className="jot-mic-error-btns">
                   <button
-                    className="rk-mic-error-btn"
+                    className="jot-mic-error-btn"
                     onClick={() =>
                       void chrome.runtime.sendMessage({
                         type: RuntimeMessageType.OPEN_MIC_SETTINGS,
@@ -137,7 +137,7 @@ export function MicToggleCard({
                     }>
                     Open settings
                   </button>
-                  <button className="rk-mic-error-btn" onClick={() => void runCheck()}>
+                  <button className="jot-mic-error-btn" onClick={() => void runCheck()}>
                     Retry
                   </button>
                 </div>
@@ -145,13 +145,13 @@ export function MicToggleCard({
             )}
 
             {status === 'in_use' && (
-              <div className="rk-mic-error">
-                <div className="rk-mic-error-title">Microphone is currently in use</div>
-                <div className="rk-mic-error-body">
+              <div className="jot-mic-error">
+                <div className="jot-mic-error-title">Microphone is currently in use</div>
+                <div className="jot-mic-error-body">
                   Close other apps using the mic, or turn this toggle off to continue without voice.
                 </div>
-                <div className="rk-mic-error-btns">
-                  <button className="rk-mic-error-btn" onClick={() => void runCheck()}>
+                <div className="jot-mic-error-btns">
+                  <button className="jot-mic-error-btn" onClick={() => void runCheck()}>
                     Retry
                   </button>
                 </div>
@@ -162,7 +162,7 @@ export function MicToggleCard({
       </div>
 
       {startDisabled && (
-        <div className="rk-mic-hint">Turn off the microphone toggle to proceed without voice recording.</div>
+        <div className="jot-mic-hint">Turn off the microphone toggle to proceed without voice recording.</div>
       )}
     </>
   );

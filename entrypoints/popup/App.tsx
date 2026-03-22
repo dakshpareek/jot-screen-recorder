@@ -19,7 +19,7 @@ import {
   RecoveryScreen,
   StoppingScreen,
 } from './screens/RecorderScreens';
-import './styles/recordkit.css';
+import './styles/jot.css';
 
 const EMPTY_SNAPSHOT: RecordingSnapshot = {
   state: 'idle',
@@ -376,7 +376,7 @@ export default function App() {
       : null;
 
   return (
-    <div className="rk-root">
+    <div className="jot-root">
       <Header state={state} onSettings={handleSettings} />
 
       {state === 'idle' || (state === 'done' && snapshot.orphanedSessions.length > 0) ? (

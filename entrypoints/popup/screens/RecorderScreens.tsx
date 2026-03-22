@@ -31,16 +31,16 @@ function RecDot() {
 }
 
 function StopSquare() {
-  return <div style={{ width: 9, height: 9, background: 'var(--rk-red)', borderRadius: 2, flexShrink: 0 }} />;
+  return <div style={{ width: 9, height: 9, background: 'var(--jot-red)', borderRadius: 2, flexShrink: 0 }} />;
 }
 
 function MicLevelBars({ level }: { level: number | null }) {
   const heights = [10, 16, 8, 20, 14, 22, 6, 18, 12, 24, 8, 16];
   const litCount = level === null ? 0 : Math.max(1, Math.min(12, Math.round((level / 30) * 12)));
   return (
-    <div className="rk-pf-bars">
+    <div className="jot-pf-bars">
       {heights.map((h, i) => (
-        <div key={i} className={`rk-pf-bar${i < litCount ? ' lit' : ''}`} style={{ height: h }} />
+        <div key={i} className={`jot-pf-bar${i < litCount ? ' lit' : ''}`} style={{ height: h }} />
       ))}
     </div>
   );
@@ -54,12 +54,12 @@ function Waveform() {
     return (
       <div
         key={i}
-        className="rk-wave-bar"
+        className="jot-wave-bar"
         style={{ height: h, animationDelay: `${delay}s`, animationDuration: `${dur}s` }}
       />
     );
   });
-  return <div className="rk-waveform">{bars}</div>;
+  return <div className="jot-waveform">{bars}</div>;
 }
 
 function Timer({ seconds }: { seconds: number }) {
@@ -68,19 +68,19 @@ function Timer({ seconds }: { seconds: number }) {
   const s = seconds % 60;
   if (h > 0) {
     return (
-      <div className="rk-timer">
+      <div className="jot-timer">
         {h}
-        <span className="rk-timer-sep">:</span>
+        <span className="jot-timer-sep">:</span>
         {String(m).padStart(2, '0')}
-        <span className="rk-timer-sep">:</span>
+        <span className="jot-timer-sep">:</span>
         {String(s).padStart(2, '0')}
       </div>
     );
   }
   return (
-    <div className="rk-timer">
+    <div className="jot-timer">
       {m}
-      <span className="rk-timer-sep">:</span>
+      <span className="jot-timer-sep">:</span>
       {String(s).padStart(2, '0')}
     </div>
   );
@@ -90,9 +90,9 @@ function ChunkDots({ count, safeCount }: { count: number; safeCount: number }) {
   const maxDots = 8;
   const display = Math.min(count + 1, maxDots);
   return (
-    <div className="rk-chunk-dots">
+    <div className="jot-chunk-dots">
       {Array.from({ length: display }, (_, i) => (
-        <div key={i} className={`rk-chunk-dot${i >= safeCount ? ' pending' : ''}`} />
+        <div key={i} className={`jot-chunk-dot${i >= safeCount ? ' pending' : ''}`} />
       ))}
     </div>
   );
@@ -139,23 +139,23 @@ export function Header({
   const isDone = state === 'done';
 
   return (
-    <div className="rk-header">
-      <div className="rk-header-left">
-        <div className="rk-logo-mark">
+    <div className="jot-header">
+      <div className="jot-header-left">
+        <div className="jot-logo-mark">
           <svg viewBox="0 0 12 12">
             <circle cx="6" cy="6" r="3.5" />
             <line x1="6" y1="2.5" x2="6" y2="6" />
             <line x1="6" y1="6" x2="8.5" y2="6" />
           </svg>
         </div>
-        <span className="rk-header-name">RecordKit</span>
+        <span className="jot-header-name">Jot — Screen Recorder</span>
       </div>
-      <div className="rk-header-right">
-        {isRecording && <span className="rk-badge rk-badge-rec">● REC</span>}
-        {isProcessing && <span className="rk-badge rk-badge-proc">◐ Processing</span>}
-        {isDone && <span className="rk-badge rk-badge-done">✓ Ready</span>}
+      <div className="jot-header-right">
+        {isRecording && <span className="jot-badge jot-badge-rec">● REC</span>}
+        {isProcessing && <span className="jot-badge jot-badge-proc">◐ Processing</span>}
+        {isDone && <span className="jot-badge jot-badge-done">✓ Ready</span>}
         {(state === 'idle' || state === 'done' || state === 'error') && (
-          <button className="rk-icon-btn" onClick={onSettings} title="Settings">
+          <button className="jot-icon-btn" onClick={onSettings} title="Settings">
             <SettingsIcon />
           </button>
         )}
@@ -166,9 +166,9 @@ export function Header({
 
 function Footer({ label }: { label: string }) {
   return (
-    <div className="rk-footer">
-      <span className="rk-footer-lbl">{label}</span>
-      <div className="rk-footer-local">
+    <div className="jot-footer">
+      <span className="jot-footer-lbl">{label}</span>
+      <div className="jot-footer-local">
         <LockIcon />
         <span>Local only</span>
       </div>
@@ -216,23 +216,23 @@ export function IdleScreen({
 
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1 }}>
-      <div className="rk-body">
+      <div className="jot-body">
         {orphan && (
-          <div className="rk-orphan-card">
-            <div className="rk-orphan-title">Interrupted recording found</div>
-            <div className="rk-orphan-meta">
+          <div className="jot-orphan-card">
+            <div className="jot-orphan-title">Interrupted recording found</div>
+            <div className="jot-orphan-meta">
               {formatOrphanTime(orphan.startTime)} · {orphan.chunkCount} chunks ·{' '}
               {formatBytes(orphan.totalSize)}
             </div>
-            <div className="rk-orphan-btns">
+            <div className="jot-orphan-btns">
               <button
-                className="rk-orphan-p"
+                className="jot-orphan-p"
                 disabled={isBusy}
                 onClick={() => onRecoverOrphan(orphan.sessionId)}>
                 Process &amp; Download
               </button>
               <button
-                className="rk-orphan-s"
+                className="jot-orphan-s"
                 disabled={isBusy}
                 onClick={() => onDiscardOrphan(orphan.sessionId)}>
                 Discard
@@ -242,37 +242,37 @@ export function IdleScreen({
         )}
 
         {orphan && (
-          <div className="rk-divider">
-            <div className="rk-divider-label">New recording</div>
+          <div className="jot-divider">
+            <div className="jot-divider-label">New recording</div>
           </div>
         )}
 
         {!orphan && (
-          <div className="rk-hero">
-            <div className="rk-hero-eyebrow">
-              <div className="rk-hero-eyebrow-dot" />
+          <div className="jot-hero">
+            <div className="jot-hero-eyebrow">
+              <div className="jot-hero-eyebrow-dot" />
               Your recordings are always safe
             </div>
-            <div className="rk-hero-title">
+            <div className="jot-hero-title">
               Record anything.
               <br />
               <em>Lose nothing.</em>
             </div>
-            <div className="rk-outcomes">
-              <div className="rk-outcome rk-outcome-green">
+            <div className="jot-outcomes">
+              <div className="jot-outcome jot-outcome-green">
                 <svg viewBox="0 0 10 10" fill="none" strokeWidth="1.6" strokeLinecap="round">
                   <path d="M2 5l2 2 4-4" />
                 </svg>
                 Never lose a recording
               </div>
-              <div className="rk-outcome rk-outcome-blue">
+              <div className="jot-outcome jot-outcome-blue">
                 <svg viewBox="0 0 10 10" fill="none" strokeWidth="1.5" strokeLinecap="round">
                   <rect x="2" y="4.5" width="6" height="4.5" rx="1" />
                   <path d="M3.5 4.5V3a1.5 1.5 0 013 0v1.5" />
                 </svg>
                 Stays on your device
               </div>
-              <div className="rk-outcome rk-outcome-amber">
+              <div className="jot-outcome jot-outcome-amber">
                 <svg viewBox="0 0 10 10" fill="none" strokeWidth="1.5" strokeLinecap="round">
                   <rect x="1" y="2" width="8" height="6" rx="1" />
                   <polygon points="3.5,3.5 3.5,6.5 7,5" />
@@ -284,11 +284,11 @@ export function IdleScreen({
         )}
 
         {storageWarning && (
-          <div className="rk-storage-warn">
+          <div className="jot-storage-warn">
             <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
               <path d="M6 1L11 10H1L6 1z" />
               <line x1="6" y1="5" x2="6" y2="7.5" />
-              <circle cx="6" cy="9" r="0.5" fill="var(--rk-amb)" stroke="none" />
+              <circle cx="6" cy="9" r="0.5" fill="var(--jot-amb)" stroke="none" />
             </svg>
             <span>{storageWarning}</span>
           </div>
@@ -296,7 +296,7 @@ export function IdleScreen({
 
         {micControl}
 
-        <button className="rk-btn-record" disabled={isBusy || !canStartRecording} onClick={onStart}>
+        <button className="jot-btn-record" disabled={isBusy || !canStartRecording} onClick={onStart}>
           <RecDot />
           {startButtonLabel}
         </button>
@@ -304,36 +304,36 @@ export function IdleScreen({
       <Footer label="Ready to record" />
 
       {showSettings && (
-        <div className="rk-settings-overlay">
-          <div className="rk-settings-header">
-            <span className="rk-settings-title">Settings</span>
-            <button className="rk-settings-close" onClick={onSettingsClose}>
+        <div className="jot-settings-overlay">
+          <div className="jot-settings-header">
+            <span className="jot-settings-title">Settings</span>
+            <button className="jot-settings-close" onClick={onSettingsClose}>
               <svg viewBox="0 0 10 10" fill="none">
                 <path d="M1 1l8 8M9 1L1 9" stroke="currentColor" />
               </svg>
             </button>
           </div>
-          <div className="rk-settings-body">
-            <div className="rk-settings-section">Recording quality</div>
-            <div className="rk-quality-grid">
+          <div className="jot-settings-body">
+            <div className="jot-settings-section">Recording quality</div>
+            <div className="jot-quality-grid">
               {QUALITY_PRESET_OPTIONS.map((preset) => (
                 <button
                   key={preset.id}
-                  className={`rk-quality-btn${quality === preset.id ? ' active' : ''}`}
+                  className={`jot-quality-btn${quality === preset.id ? ' active' : ''}`}
                   onClick={() => onQualityChange(preset.id)}>
-                  <div className="rk-quality-val">{preset.title}</div>
-                  <div className="rk-quality-sub">{preset.subtitle}</div>
+                  <div className="jot-quality-val">{preset.title}</div>
+                  <div className="jot-quality-sub">{preset.subtitle}</div>
                 </button>
               ))}
             </div>
 
-            <div className="rk-settings-section" style={{ marginTop: 16 }}>
+            <div className="jot-settings-section" style={{ marginTop: 16 }}>
               Encoding engine
             </div>
-            <label className="rk-toggle-row">
-              <span className="rk-toggle-label">
+            <label className="jot-toggle-row">
+              <span className="jot-toggle-label">
                 <span>Use legacy encoder (MediaRecorder)</span>
-                <span className="rk-toggle-desc">
+                <span className="jot-toggle-desc">
                   {webCodecsSupport === null
                     ? 'Checking...'
                     : webCodecsUnavailable
@@ -345,14 +345,14 @@ export function IdleScreen({
               </span>
               <input
                 type="checkbox"
-                className="rk-toggle-input"
+                className="jot-toggle-input"
                 checked={useLegacyEncoder}
                 disabled={webCodecsUnavailable}
                 onChange={(e) =>
                   onEncoderBackendChange(e.target.checked ? 'mediarecorder' : 'webcodecs')
                 }
               />
-              <span className="rk-toggle-switch" />
+              <span className="jot-toggle-switch" />
             </label>
           </div>
         </div>
@@ -387,62 +387,62 @@ export function PreflightScreen({
 
   return (
     <>
-      <div className="rk-body">
-        <div className="rk-pf-title">Checking audio</div>
-        <div className="rk-pf-sub">
+      <div className="jot-body">
+        <div className="jot-pf-title">Checking audio</div>
+        <div className="jot-pf-sub">
           We verify your audio before every recording so you never start silent.
         </div>
 
-        <div className={`rk-pf-check ${micClass}`}>
-          <div className="rk-pf-icon">
+        <div className={`jot-pf-check ${micClass}`}>
+          <div className="jot-pf-icon">
             <svg
               width="14"
               height="14"
               viewBox="0 0 14 14"
               fill="none"
-              stroke={micOk ? 'var(--rk-grn)' : 'var(--rk-red2)'}
+              stroke={micOk ? 'var(--jot-grn)' : 'var(--jot-red2)'}
               strokeWidth="1.5"
               strokeLinecap="round">
               <path d="M7 1.5C5 1.5 3.5 3 3.5 5v2.5C3.5 9.5 5 11 7 11s3.5-1.5 3.5-3.5V5C10.5 3 9 1.5 7 1.5z" />
               <path d="M5 12.5h4M7 11v1.5" />
             </svg>
           </div>
-          <div className="rk-pf-info">
-            <div className="rk-pf-name">Microphone</div>
-            <div className="rk-pf-status">{micStatus}</div>
+          <div className="jot-pf-info">
+            <div className="jot-pf-name">Microphone</div>
+            <div className="jot-pf-status">{micStatus}</div>
             {includeMic && micOk && <MicLevelBars level={audioPreflight.micLevel} />}
           </div>
         </div>
 
-        <div className="rk-pf-check pending">
-          <div className="rk-pf-icon">
+        <div className="jot-pf-check pending">
+          <div className="jot-pf-icon">
             <svg
               width="14"
               height="14"
               viewBox="0 0 14 14"
               fill="none"
-              stroke="var(--rk-amb)"
+              stroke="var(--jot-amb)"
               strokeWidth="1.5"
               strokeLinecap="round">
               <rect x="1.5" y="3" width="11" height="8" rx="1.5" />
               <path d="M4.5 10.5v1.5M9.5 10.5v1.5M3 12h8" />
             </svg>
           </div>
-          <div className="rk-pf-info">
-            <div className="rk-pf-name">System audio</div>
-            <div className="rk-pf-status">Verified after capture starts</div>
+          <div className="jot-pf-info">
+            <div className="jot-pf-name">System audio</div>
+            <div className="jot-pf-status">Verified after capture starts</div>
           </div>
         </div>
 
-        <div style={{ fontSize: 10, color: 'var(--rk-t3)', lineHeight: 1.5, marginTop: 2 }}>
+        <div style={{ fontSize: 10, color: 'var(--jot-t3)', lineHeight: 1.5, marginTop: 2 }}>
           After you click start, Chrome will open the share picker. The popup may close while you
           choose what to share.
         </div>
 
-        <button className="rk-btn-primary" onClick={onConfirm} disabled={isBusy || (includeMic && !micOk)}>
+        <button className="jot-btn-primary" onClick={onConfirm} disabled={isBusy || (includeMic && !micOk)}>
           Start Recording →
         </button>
-        <button className="rk-btn-secondary" onClick={onBack}>
+        <button className="jot-btn-secondary" onClick={onBack}>
           ← Back
         </button>
       </div>
@@ -515,37 +515,37 @@ export function PreflightErrorScreen({
 
   return (
     <>
-      <div className="rk-body">
-        <div className="rk-pf-title">{info.title}</div>
-        <div className="rk-pf-sub" style={{ marginBottom: 12 }}>
+      <div className="jot-body">
+        <div className="jot-pf-title">{info.title}</div>
+        <div className="jot-pf-sub" style={{ marginBottom: 12 }}>
           Action required before recording.
         </div>
 
-        <div className="rk-err-box">
-          <div className="rk-err-title">{micError ?? 'MIC_ERROR'}</div>
-          <div className="rk-err-body">{info.body}</div>
-          <button className="rk-err-action" onClick={handleAction} disabled={isBusy}>
+        <div className="jot-err-box">
+          <div className="jot-err-title">{micError ?? 'MIC_ERROR'}</div>
+          <div className="jot-err-body">{info.body}</div>
+          <button className="jot-err-action" onClick={handleAction} disabled={isBusy}>
             {info.action}
           </button>
         </div>
 
-        <div className="rk-pf-check fail">
-          <div className="rk-pf-icon">
+        <div className="jot-pf-check fail">
+          <div className="jot-pf-icon">
             <svg
               width="14"
               height="14"
               viewBox="0 0 14 14"
               fill="none"
-              stroke="var(--rk-red2)"
+              stroke="var(--jot-red2)"
               strokeWidth="1.5"
               strokeLinecap="round">
               <path d="M7 1.5C5 1.5 3.5 3 3.5 5v2.5C3.5 9.5 5 11 7 11s3.5-1.5 3.5-3.5V5C10.5 3 9 1.5 7 1.5z" />
               <path d="M5 12.5h4M7 11v1.5" />
             </svg>
           </div>
-          <div className="rk-pf-info">
-            <div className="rk-pf-name">Microphone</div>
-            <div className="rk-pf-status">
+          <div className="jot-pf-info">
+            <div className="jot-pf-name">Microphone</div>
+            <div className="jot-pf-status">
               {micError === 'MIC_PERMISSION_DENIED'
                 ? 'Permission denied by Chrome'
                 : micError === 'MIC_NOT_FOUND'
@@ -557,11 +557,11 @@ export function PreflightErrorScreen({
           </div>
         </div>
 
-        <button className="rk-btn-secondary" onClick={onBack}>
+        <button className="jot-btn-secondary" onClick={onBack}>
           ← Back
         </button>
         {includeMic && (
-          <button className="rk-btn-secondary" onClick={onContinueWithoutMic} disabled={isBusy}>
+          <button className="jot-btn-secondary" onClick={onContinueWithoutMic} disabled={isBusy}>
             Continue without mic
           </button>
         )}
@@ -574,9 +574,9 @@ export function PreflightErrorScreen({
 export function ArmedScreen({ onCancel }: { onCancel: () => void }) {
   return (
     <>
-      <div className="rk-body">
-        <div className="rk-armed-center">
-          <div className="rk-armed-icon">
+      <div className="jot-body">
+        <div className="jot-armed-center">
+          <div className="jot-armed-icon">
             <svg
               width="22"
               height="22"
@@ -589,16 +589,16 @@ export function ArmedScreen({ onCancel }: { onCancel: () => void }) {
               <path d="M8 19h6M11 16v3" />
             </svg>
           </div>
-          <div className="rk-armed-title">Choose what to record</div>
-          <div className="rk-armed-sub">
+          <div className="jot-armed-title">Choose what to record</div>
+          <div className="jot-armed-sub">
             Select a tab, window, or screen from Chrome&apos;s share dialog
           </div>
-          <div className="rk-armed-indicator">
-            <div className="rk-armed-pulse" />
-            <span style={{ fontSize: 11, color: 'var(--rk-t2)' }}>Share picker should be open now</span>
+          <div className="jot-armed-indicator">
+            <div className="jot-armed-pulse" />
+            <span style={{ fontSize: 11, color: 'var(--jot-t2)' }}>Share picker should be open now</span>
           </div>
         </div>
-        <button className="rk-btn-secondary" onClick={onCancel}>
+        <button className="jot-btn-secondary" onClick={onCancel}>
           Cancel
         </button>
       </div>
@@ -628,13 +628,13 @@ export function RecordingScreen({
 
   return (
     <>
-      <div className="rk-body-sm">
+      <div className="jot-body-sm">
         {snapshot.micWarningMessage && (
-          <div className="rk-storage-warn" style={{ marginBottom: 10 }}>
+          <div className="jot-storage-warn" style={{ marginBottom: 10 }}>
             <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
               <path d="M6 1L11 10H1L6 1z" />
               <line x1="6" y1="5" x2="6" y2="7.5" />
-              <circle cx="6" cy="9" r="0.5" fill="var(--rk-amb)" stroke="none" />
+              <circle cx="6" cy="9" r="0.5" fill="var(--jot-amb)" stroke="none" />
             </svg>
             <span>{snapshot.micWarningMessage}</span>
           </div>
@@ -643,44 +643,44 @@ export function RecordingScreen({
         <Timer seconds={snapshot.elapsedSeconds} />
         <Waveform />
 
-        <div className="rk-safety-card">
-          <div className="rk-safety-left">
-            <div className="rk-safety-icon">
+        <div className="jot-safety-card">
+          <div className="jot-safety-left">
+            <div className="jot-safety-icon">
               <svg viewBox="0 0 14 14">
                 <path d="M7 1.5L2 4v4.5C2 11.5 4.5 13.5 7 14c2.5-.5 5-2.5 5-5.5V4L7 1.5z" />
                 <path d="M4.5 7.5l2 2 3-3.5" />
               </svg>
             </div>
             <div>
-              <div className="rk-safety-label">
+              <div className="jot-safety-label">
                 {hasSavedData ? 'Saving as you record' : 'Recording in progress'}
               </div>
-              <div className="rk-safety-sub">
+              <div className="jot-safety-sub">
                 {hasSavedData ? '10-second chunks — always recoverable' : 'First save in a few seconds'}
               </div>
             </div>
           </div>
-          <div className={`rk-safety-time${hasSavedData ? '' : ' pending'}`}>
+          <div className={`jot-safety-time${hasSavedData ? '' : ' pending'}`}>
             {hasSavedData ? `${safeSeconds}s` : '—'}
           </div>
         </div>
 
-        <div className="rk-quality-row">
-          <div className="rk-quality-pill">
-            <div className="rk-quality-pill-dot" />
+        <div className="jot-quality-row">
+          <div className="jot-quality-pill">
+            <div className="jot-quality-pill-dot" />
             Requested: {requestedLabel}
           </div>
           {showActualUsed && (
             <div
-              className="rk-quality-pill"
+              className="jot-quality-pill"
               style={{ background: 'rgba(255,214,10,0.14)', color: 'rgba(120,90,10,0.95)' }}>
-              <div className="rk-quality-pill-dot" style={{ background: 'rgba(214,153,0,0.95)' }} />
+              <div className="jot-quality-pill-dot" style={{ background: 'rgba(214,153,0,0.95)' }} />
               Actual used: {resolvedLabel}
             </div>
           )}
           {snapshot.webCodecsStats && (
-            <div className="rk-quality-pill" style={{ background: 'rgba(52,199,89,0.12)', color: 'rgba(52,199,89,0.9)' }}>
-              <div className="rk-quality-pill-dot" style={{ background: 'rgba(52,199,89,0.9)' }} />
+            <div className="jot-quality-pill" style={{ background: 'rgba(52,199,89,0.12)', color: 'rgba(52,199,89,0.9)' }}>
+              <div className="jot-quality-pill-dot" style={{ background: 'rgba(52,199,89,0.9)' }} />
               {snapshot.webCodecsStats.hardwareAccelerated ? 'HW Accelerated' : 'Software Encoding'}
               {snapshot.webCodecsStats.bytesWritten > 0 && ` · ${formatBytes(snapshot.webCodecsStats.bytesWritten)}`}
               {snapshot.webCodecsStats.videoBitrateBps != null &&
@@ -691,7 +691,7 @@ export function RecordingScreen({
           )}
         </div>
 
-        <button className="rk-btn-stop" disabled={isBusy} onClick={onStop}>
+        <button className="jot-btn-stop" disabled={isBusy} onClick={onStop}>
           <StopSquare />
           Stop Recording
         </button>
@@ -716,18 +716,18 @@ export function AudioWarningScreen({
 }) {
   return (
     <>
-      <div className="rk-body-sm">
-        <div className="rk-rec-indicator">
-          <div className="rk-rec-dot" />
-          <span className="rk-rec-label">Recording</span>
+      <div className="jot-body-sm">
+        <div className="jot-rec-indicator">
+          <div className="jot-rec-dot" />
+          <span className="jot-rec-label">Recording</span>
         </div>
 
         {snapshot.micWarningMessage && (
-          <div className="rk-storage-warn" style={{ marginBottom: 10 }}>
+          <div className="jot-storage-warn" style={{ marginBottom: 10 }}>
             <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
               <path d="M6 1L11 10H1L6 1z" />
               <line x1="6" y1="5" x2="6" y2="7.5" />
-              <circle cx="6" cy="9" r="0.5" fill="var(--rk-amb)" stroke="none" />
+              <circle cx="6" cy="9" r="0.5" fill="var(--jot-amb)" stroke="none" />
             </svg>
             <span>{snapshot.micWarningMessage}</span>
           </div>
@@ -735,23 +735,23 @@ export function AudioWarningScreen({
 
         <Timer seconds={snapshot.elapsedSeconds} />
 
-        <div className="rk-warn-box">
-          <div className="rk-warn-title">System audio not detected</div>
-          <div className="rk-warn-body">
+        <div className="jot-warn-box">
+          <div className="jot-warn-title">System audio not detected</div>
+          <div className="jot-warn-body">
             Tab audio is silent. You may have forgotten to enable audio sharing. Continue with mic only,
             or stop and retry.
           </div>
-          <div className="rk-warn-btns">
-            <button className="rk-warn-btn-p" disabled={isBusy} onClick={onContinueMicOnly}>
+          <div className="jot-warn-btns">
+            <button className="jot-warn-btn-p" disabled={isBusy} onClick={onContinueMicOnly}>
               Continue mic only
             </button>
-            <button className="rk-warn-btn-s" disabled={isBusy} onClick={onStopRetry}>
+            <button className="jot-warn-btn-s" disabled={isBusy} onClick={onStopRetry}>
               Stop and retry
             </button>
           </div>
         </div>
 
-        <button className="rk-btn-stop" disabled={isBusy} onClick={onStop}>
+        <button className="jot-btn-stop" disabled={isBusy} onClick={onStop}>
           <StopSquare />
           Stop Recording
         </button>
@@ -764,10 +764,10 @@ export function AudioWarningScreen({
 export function StoppingScreen({ snapshot }: { snapshot: RecordingSnapshot }) {
   return (
     <>
-      <div className="rk-body">
+      <div className="jot-body">
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '8px 0 4px' }}>
-          <div className="rk-proc-ring-wrap">
-            <div className="rk-proc-ring" />
+          <div className="jot-proc-ring-wrap">
+            <div className="jot-proc-ring" />
             <svg
               width="22"
               height="22"
@@ -779,9 +779,9 @@ export function StoppingScreen({ snapshot }: { snapshot: RecordingSnapshot }) {
               <path d="M8 8h6v6H8z" />
             </svg>
           </div>
-          <div className="rk-proc-title">Finalising</div>
-          <div className="rk-proc-sub">Writing final chunk to disk. Your recording is safe.</div>
-          <div className="rk-priv-note">
+          <div className="jot-proc-title">Finalising</div>
+          <div className="jot-proc-sub">Writing final chunk to disk. Your recording is safe.</div>
+          <div className="jot-priv-note">
             <LockIcon />
             <span>
               {snapshot.chunkCount} chunk{snapshot.chunkCount !== 1 ? 's' : ''} safely saved to your
@@ -831,9 +831,9 @@ export function ProcessingScreen({
 
   return (
     <>
-      <div className="rk-body" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-        <div className="rk-proc-ring-wrap">
-          <div className="rk-proc-ring" />
+      <div className="jot-body" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        <div className="jot-proc-ring-wrap">
+          <div className="jot-proc-ring" />
           {isValidating ? (
             <svg
               width="22"
@@ -864,16 +864,16 @@ export function ProcessingScreen({
           )}
         </div>
 
-        <div className="rk-proc-title">{title}</div>
-        <div className="rk-proc-sub">{subtitle}</div>
+        <div className="jot-proc-title">{title}</div>
+        <div className="jot-proc-sub">{subtitle}</div>
 
         <div style={{ width: '100%' }}>
-          <div className="rk-prog-track">
-            <div className="rk-prog-fill" style={{ width: `${progress}%` }} />
+          <div className="jot-prog-track">
+            <div className="jot-prog-fill" style={{ width: `${progress}%` }} />
           </div>
-          <div className="rk-prog-row">
-            <span className="rk-prog-pct">{Math.round(progress)}%</span>
-            <span className="rk-prog-eta">
+          <div className="jot-prog-row">
+            <span className="jot-prog-pct">{Math.round(progress)}%</span>
+            <span className="jot-prog-eta">
               {isValidating ? (
                 'Almost there...'
               ) : etaDisplay ? (
@@ -889,8 +889,8 @@ export function ProcessingScreen({
           </div>
         </div>
 
-        <div className="rk-priv-note">
-          <div className="rk-priv-note-icon">
+        <div className="jot-priv-note">
+          <div className="jot-priv-note-icon">
             <svg viewBox="0 0 12 12" fill="none">
               <rect x="2" y="5" width="8" height="6" rx="1" />
               <path d="M4 5V3.5a2 2 0 114 0V5" />
@@ -942,33 +942,33 @@ export function DoneScreen({
 
   return (
     <>
-      <div className="rk-body">
-        <div className="rk-done-head">
-          <div className="rk-done-icon">
+      <div className="jot-body">
+        <div className="jot-done-head">
+          <div className="jot-done-icon">
             <svg viewBox="0 0 16 16" fill="none" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M3 8l3.5 3.5 6.5-7" />
             </svg>
           </div>
           <div>
-            <div className="rk-done-title">Recording ready</div>
-            <div className="rk-done-sub">H.264 MP4 · Plays everywhere</div>
+            <div className="jot-done-title">Recording ready</div>
+            <div className="jot-done-sub">H.264 MP4 · Plays everywhere</div>
           </div>
         </div>
 
-        <div className="rk-done-meta-card">
-          <div className="rk-done-meta-top">
-            <div className="rk-done-meta-group">
-              <div className="rk-done-meta-group-lbl">Duration</div>
-              <div className="rk-done-meta-big">{durLabel}</div>
+        <div className="jot-done-meta-card">
+          <div className="jot-done-meta-top">
+            <div className="jot-done-meta-group">
+              <div className="jot-done-meta-group-lbl">Duration</div>
+              <div className="jot-done-meta-big">{durLabel}</div>
             </div>
-            <div className="rk-done-meta-group" style={{ textAlign: 'right' }}>
-              <div className="rk-done-meta-group-lbl">File size</div>
-              <div className="rk-done-meta-big">{sizeLabel}</div>
+            <div className="jot-done-meta-group" style={{ textAlign: 'right' }}>
+              <div className="jot-done-meta-group-lbl">File size</div>
+              <div className="jot-done-meta-big">{sizeLabel}</div>
             </div>
           </div>
 
-          <div className="rk-done-pills">
-            <div className="rk-done-pill">
+          <div className="jot-done-pills">
+            <div className="jot-done-pill">
               <svg viewBox="0 0 10 10">
                 <rect x="1" y="1.5" width="8" height="7" rx="1" strokeWidth="1.4" strokeLinecap="round" />
                 <polygon points="3.5,3.5 3.5,6.5 7,5" fill="currentColor" stroke="none" />
@@ -976,15 +976,15 @@ export function DoneScreen({
               {showFallbackQuality ? `Requested: ${requestedLabel}` : qualityLabel}
             </div>
             {showFallbackQuality && (
-              <div className="rk-done-pill">Actual: {qualityLabel}</div>
+              <div className="jot-done-pill">Actual: {qualityLabel}</div>
             )}
-            <div className="rk-done-pill">
+            <div className="jot-done-pill">
               <svg viewBox="0 0 10 10">
                 <path d="M2 5h6M5 2l3 3-3 3" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
               H.264 MP4
             </div>
-            <div className="rk-done-pill">
+            <div className="jot-done-pill">
               <svg viewBox="0 0 10 10">
                 <rect x="2" y="4" width="6" height="4.5" rx="1" strokeWidth="1.4" strokeLinecap="round" />
                 <path d="M3.5 4V3a1.5 1.5 0 013 0V4" strokeWidth="1.4" strokeLinecap="round" />
@@ -995,7 +995,7 @@ export function DoneScreen({
         </div>
 
         {snapshot.validation?.passed && (
-          <div className="rk-val-row">
+          <div className="jot-val-row">
             <svg viewBox="0 0 14 14" fill="none">
               <path d="M7 1.5L2 4v4.5C2 11.5 4.5 13.5 7 14c2.5-.5 5-2.5 5-5.5V4L7 1.5z" />
               <path d="M4.5 7.5l2 2 3-3.5" />
@@ -1004,7 +1004,7 @@ export function DoneScreen({
           </div>
         )}
 
-        <button className="rk-btn-download" disabled={isBusy} onClick={onDownload}>
+        <button className="jot-btn-download" disabled={isBusy} onClick={onDownload}>
           <svg viewBox="0 0 16 16" fill="none" strokeWidth="2" strokeLinecap="round">
             <path d="M8 2v9M4 8l4 4 4-4" />
             <path d="M2 14h12" />
@@ -1012,7 +1012,7 @@ export function DoneScreen({
           Download MP4
         </button>
 
-        <button className="rk-btn-record-again" onClick={onRecordAgain}>
+        <button className="jot-btn-record-again" onClick={onRecordAgain}>
           <svg viewBox="0 0 12 12">
             <circle cx="6" cy="6" r="4.5" strokeWidth="1.6" strokeLinecap="round" />
             <circle cx="6" cy="6" r="1.5" fill="currentColor" stroke="none" />
@@ -1044,42 +1044,42 @@ export function RecoveryScreen({
 }) {
   return (
     <>
-      <div className="rk-body">
-        <div className="rk-recovery-box">
-          <div className="rk-recovery-title">Processing failed — your data is safe</div>
-          <div className="rk-recovery-sub">
+      <div className="jot-body">
+        <div className="jot-recovery-box">
+          <div className="jot-recovery-title">Processing failed — your data is safe</div>
+          <div className="jot-recovery-sub">
             The MP4 could not be validated. Your raw recording chunks are intact on your device. Select
             which chunks to include and try again.
           </div>
-          <div className="rk-chunk-list">
+          <div className="jot-chunk-list">
             {snapshot.recoveryChunks.map((chunk) => {
               const canInclude = chunk.status !== 'missing';
               const checked = selectedChunks.includes(chunk.index);
               return (
-                <div key={chunk.index} className="rk-chunk-item">
+                <div key={chunk.index} className="jot-chunk-item">
                   <input
                     type="checkbox"
-                    className="rk-chunk-cb"
+                    className="jot-chunk-cb"
                     disabled={!canInclude || isBusy}
                     checked={checked}
                     onChange={(e) => onToggleChunk(chunk.index, e.currentTarget.checked)}
                   />
-                  <span className="rk-chunk-name">chunk-{chunk.index}.webm</span>
-                  <span className={`rk-chunk-status ${chunk.status}`}>{chunk.status}</span>
+                  <span className="jot-chunk-name">chunk-{chunk.index}.webm</span>
+                  <span className={`jot-chunk-status ${chunk.status}`}>{chunk.status}</span>
                 </div>
               );
             })}
           </div>
-          <div className="rk-recovery-actions">
+          <div className="jot-recovery-actions">
             <button
-              className="rk-btn-primary"
+              className="jot-btn-primary"
               style={{ margin: 0, flex: 2, height: 38, fontSize: 11 }}
               disabled={isBusy}
               onClick={onProcessSelected}>
               Process selected
             </button>
             <button
-              className="rk-btn-secondary"
+              className="jot-btn-secondary"
               style={{ margin: 0, flex: 1, height: 38 }}
               disabled={isBusy}
               onClick={onDownloadRaw}>
@@ -1087,14 +1087,14 @@ export function RecoveryScreen({
             </button>
           </div>
           <button
-            className="rk-btn-secondary"
+            className="jot-btn-secondary"
             style={{ marginTop: 8, height: 34 }}
             disabled={isBusy}
             onClick={onClearState}>
             Clear state
           </button>
         </div>
-        {snapshot.sessionId && <div className="rk-session-id">Session: {snapshot.sessionId}</div>}
+        {snapshot.sessionId && <div className="jot-session-id">Session: {snapshot.sessionId}</div>}
       </div>
       <Footer label="Validation failed" />
     </>
@@ -1112,7 +1112,7 @@ export function ErrorScreen({
 }) {
   return (
     <>
-      <div className="rk-body">
+      <div className="jot-body">
         <div
           style={{
             display: 'flex',
@@ -1138,19 +1138,19 @@ export function ErrorScreen({
               height="22"
               viewBox="0 0 22 22"
               fill="none"
-              stroke="var(--rk-red2)"
+              stroke="var(--jot-red2)"
               strokeWidth="1.4"
               strokeLinecap="round">
               <circle cx="11" cy="11" r="8" />
               <line x1="11" y1="7" x2="11" y2="12" />
-              <circle cx="11" cy="14.5" r="0.8" fill="var(--rk-red2)" stroke="none" />
+              <circle cx="11" cy="14.5" r="0.8" fill="var(--jot-red2)" stroke="none" />
             </svg>
           </div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--rk-t)', letterSpacing: '-0.02em' }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--jot-t)', letterSpacing: '-0.02em' }}>
             Something went wrong
           </div>
-          <div style={{ fontSize: 11, color: 'var(--rk-t2)', lineHeight: 1.5, maxWidth: 220 }}>{message}</div>
-          <button className="rk-btn-primary" style={{ marginTop: 8 }} disabled={isBusy} onClick={onRetry}>
+          <div style={{ fontSize: 11, color: 'var(--jot-t2)', lineHeight: 1.5, maxWidth: 220 }}>{message}</div>
+          <button className="jot-btn-primary" style={{ marginTop: 8 }} disabled={isBusy} onClick={onRetry}>
             Try again
           </button>
         </div>
