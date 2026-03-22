@@ -163,6 +163,45 @@ describe('persisted-context storage contract', () => {
     expect(settings).toEqual({ encoderBackend: 'mediarecorder' });
   });
 
+  it('prefers recorder-settings over legacy experimental flags when both exist', async () => {
+    getMock.mockResolvedValue({
+      [RECORDER_SETTINGS_KEY]: { encoderBackend: 'webcodecs' },
+      [LEGACY_EXPERIMENTAL_FLAGS_KEY]: { useWebCodecs: false },
+    });
+
+    const settings = await loadRecorderSettings();
+
+    expect(settings).toEqual({ encoderBackend: 'webcodecs' });
+  });
+
+  it('normalizes malformed backend values safely during load and save', async () => {
+    const store: Record<string, unknown> = {
+      [RECORDER_SETTINGS_KEY]: { encoderBackend: 'unexpected-backend' },
+    };
+    getMock.mockImplementation(async (key: string | string[]) => {
+      if (Array.isArray(key)) {
+        return key.reduce(
+          (acc, k) => ({ ...acc, [k]: store[k] }),
+          {} as Record<string, unknown>,
+        );
+      }
+      return { [key]: store[key] };
+    });
+    setMock.mockImplementation(async (value: Record<string, unknown>) => {
+      Object.assign(store, value);
+    });
+    removeMock.mockResolvedValue(undefined);
+
+    const loaded = await loadRecorderSettings();
+    expect(loaded).toEqual({ encoderBackend: 'webcodecs' });
+
+    const updated = await saveRecorderSettings({
+      encoderBackend: 'still-invalid' as unknown as 'webcodecs',
+    });
+    expect(updated).toEqual({ encoderBackend: 'webcodecs' });
+    expect(store[RECORDER_SETTINGS_KEY]).toEqual({ encoderBackend: 'webcodecs' });
+  });
+
   it('saves and returns merged recorder settings', async () => {
     const store: Record<string, unknown> = {
       [RECORDER_SETTINGS_KEY]: { encoderBackend: 'mediarecorder' },
@@ -189,5 +228,16 @@ describe('persisted-context storage contract', () => {
     expect(updated).toEqual({ encoderBackend: 'webcodecs' });
     expect(store[RECORDER_SETTINGS_KEY]).toEqual({ encoderBackend: 'webcodecs' });
     expect(store[LEGACY_EXPERIMENTAL_FLAGS_KEY]).toBeUndefined();
+  });
+
+  it('propagates settings storage failures', async () => {
+    getMock.mockRejectedValueOnce(new Error('settings-read-failed'));
+    await expect(loadRecorderSettings()).rejects.toThrow('settings-read-failed');
+
+    getMock.mockResolvedValue({});
+    setMock.mockRejectedValueOnce(new Error('settings-write-failed'));
+    await expect(saveRecorderSettings({ encoderBackend: 'mediarecorder' })).rejects.toThrow(
+      'settings-write-failed',
+    );
   });
 });

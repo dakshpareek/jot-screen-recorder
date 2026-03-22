@@ -15,6 +15,7 @@ describe('RuntimeMessageType', () => {
     expect(RuntimeMessageType.WEBCODECS_FATAL_ERROR).toBe('WEBCODECS_FATAL_ERROR');
     expect(RuntimeMessageType.GET_ENCODER_SETTINGS).toBe('GET_ENCODER_SETTINGS');
     expect(RuntimeMessageType.SET_ENCODER_SETTINGS).toBe('SET_ENCODER_SETTINGS');
+    expect(RuntimeMessageType.RECORDING_BANNER).toBe('RECORDING_BANNER');
   });
 
   it('does not contain duplicate message values', () => {
