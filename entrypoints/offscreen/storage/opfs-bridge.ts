@@ -6,6 +6,45 @@ export class OpfsBridge {
   private worker: Worker | null = null;
   private queue: Promise<unknown> = Promise.resolve();
 
+  async writeWebCodecsRange(
+    sessionId: string,
+    position: number,
+    data: ArrayBuffer,
+    streamFile = 'webcodecs-stream.mp4',
+  ) {
+    await this.callWorker(
+      {
+        type: 'write-webcodecs-range',
+        sessionId,
+        position,
+        data,
+        streamFile,
+      },
+      ['webcodecs-range-written'],
+      [data],
+    );
+  }
+
+  async readWebCodecsStream(
+    sessionId: string,
+    streamFile = 'webcodecs-stream.mp4',
+  ): Promise<ArrayBuffer> {
+    const response = await this.callWorker(
+      {
+        type: 'read-webcodecs-stream',
+        sessionId,
+        streamFile,
+      },
+      ['webcodecs-stream-data', 'webcodecs-stream-not-found'],
+    );
+
+    if (response.type !== 'webcodecs-stream-data' || !response.data) {
+      throw new Error('WebCodecs stream file not found or empty');
+    }
+
+    return response.data;
+  }
+
   async writeChunk(sessionId: string, chunkIndex: number, data: ArrayBuffer) {
     await this.callWorker(
       {

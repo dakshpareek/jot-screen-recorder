@@ -17,6 +17,12 @@ export interface SessionManifest {
   chunks: ManifestChunk[];
   totalDuration: number;
   status: 'recording' | 'stopping' | 'complete';
+  /** When set, chunks[] may be empty; data lives in webcodecs-stream.mp4 (range writes). */
+  recordingKind?: 'mediarecorder' | 'webcodecs-opfs';
+  /** High-water byte length persisted for WebCodecs OPFS stream (crash recovery / orphans). */
+  streamBytesWritten?: number;
+  /** OPFS stream object name (e.g. webcodecs-stream.mp4 vs .webm). */
+  webCodecsOpfsStreamFile?: string;
 }
 
 export interface WorkerResponse {

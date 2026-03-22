@@ -825,3 +825,65 @@
 
   .rk-divider { border-top: 1px solid var(--rk-b); padding-top: 12px; margin-top: 2px; }
   .rk-divider-label { font-size: 12px; font-weight: 600; color: var(--rk-t); margin-bottom: 12px; }
+
+  /* Toggle switch */
+  .rk-toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 0;
+    cursor: pointer;
+  }
+  .rk-toggle-row:has(.rk-toggle-input:disabled) {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .rk-toggle-label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+  }
+  .rk-toggle-label > span:first-child {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--rk-t);
+  }
+  .rk-toggle-desc {
+    font-size: 10px;
+    color: var(--rk-t3);
+    font-weight: 500;
+  }
+  .rk-toggle-input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+  }
+  .rk-toggle-switch {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    background: var(--rk-bg3);
+    border-radius: 10px;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .rk-toggle-switch::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    background: white;
+    border-radius: 50%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    transition: transform 0.2s;
+  }
+  .rk-toggle-input:checked + .rk-toggle-switch {
+    background: var(--rk-red);
+  }
+  .rk-toggle-input:checked + .rk-toggle-switch::after {
+    transform: translateX(16px);
+  }

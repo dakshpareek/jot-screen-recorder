@@ -92,6 +92,14 @@ export interface RecordingSnapshot {
   orphanedSessions: OrphanedSession[];
   recoverySessionId: string | null;
   recoveryChunks: RecoveryChunkCheck[];
+  webCodecsStats?: {
+    framesEncoded: number;
+    bytesWritten: number;
+    droppedFrames: number;
+    hardwareAccelerated: boolean;
+    memoryPressureTier?: number;
+    videoBitrateBps?: number;
+  } | null;
 }
 
 export function formatDuration(seconds: number): string {

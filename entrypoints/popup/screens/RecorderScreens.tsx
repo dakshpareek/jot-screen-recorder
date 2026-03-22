@@ -182,6 +182,9 @@ export function IdleScreen({
   onSettingsClose,
   quality,
   onQualityChange,
+  useWebCodecs,
+  onWebCodecsChange,
+  webCodecsSupport,
 }: {
   micControl: ReactNode;
   onStart: () => void;
@@ -196,6 +199,9 @@ export function IdleScreen({
   onSettingsClose: () => void;
   quality: CaptureQuality;
   onQualityChange: (q: CaptureQuality) => void;
+  useWebCodecs: boolean;
+  onWebCodecsChange: (enabled: boolean) => void;
+  webCodecsSupport: { supported: boolean; hardwareAccelerated: boolean } | null;
 }) {
   return (
     <div style={{ position: 'relative', display: 'flex', flexDirection: 'column', flex: 1 }}>
@@ -312,6 +318,32 @@ export function IdleScreen({
                 <div className="rk-quality-sub">Recommended</div>
               </button>
             </div>
+
+            <div className="rk-settings-section" style={{ marginTop: 16 }}>
+              Experimental
+            </div>
+            <label className="rk-toggle-row">
+              <span className="rk-toggle-label">
+                <span>Use WebCodecs pipeline</span>
+                <span className="rk-toggle-desc">
+                  {webCodecsSupport === null
+                    ? 'Checking...'
+                    : webCodecsSupport.supported
+                      ? webCodecsSupport.hardwareAccelerated
+                        ? 'GPU-accelerated • Faster stop'
+                        : 'Software encoding • Faster stop'
+                      : 'Not supported on this device'}
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                className="rk-toggle-input"
+                checked={useWebCodecs}
+                disabled={!webCodecsSupport?.supported}
+                onChange={(e) => onWebCodecsChange(e.target.checked)}
+              />
+              <span className="rk-toggle-switch" />
+            </label>
           </div>
         </div>
       )}
@@ -623,6 +655,17 @@ export function RecordingScreen({
             <div className="rk-quality-pill-dot" />
             {quality} · 30fps · Local only
           </div>
+          {snapshot.webCodecsStats && (
+            <div className="rk-quality-pill" style={{ background: 'rgba(52,199,89,0.12)', color: 'rgba(52,199,89,0.9)' }}>
+              <div className="rk-quality-pill-dot" style={{ background: 'rgba(52,199,89,0.9)' }} />
+              {snapshot.webCodecsStats.hardwareAccelerated ? 'HW Accelerated' : 'Software Encoding'}
+              {snapshot.webCodecsStats.bytesWritten > 0 && ` · ${formatBytes(snapshot.webCodecsStats.bytesWritten)}`}
+              {snapshot.webCodecsStats.videoBitrateBps != null &&
+                snapshot.webCodecsStats.videoBitrateBps > 0 &&
+                ` · ${(snapshot.webCodecsStats.videoBitrateBps / 1_000_000).toFixed(1)} Mb/s`}
+              {(snapshot.webCodecsStats.memoryPressureTier ?? 0) > 0 && ' · reducing load'}
+            </div>
+          )}
         </div>
 
         <button className="rk-btn-stop" disabled={isBusy} onClick={onStop}>
@@ -863,7 +906,11 @@ export function DoneScreen({
   const durMin = Math.floor(durationSec / 60);
   const durSec = durationSec % 60;
   const durLabel = durationSec > 0 ? `${durMin}:${String(durSec).padStart(2, '0')}` : '—';
-  const sizeLabel = metrics?.outputBytes ? formatBytes(metrics.outputBytes) : '—';
+  const sizeLabel = metrics?.outputBytes
+    ? formatBytes(metrics.outputBytes)
+    : snapshot.webCodecsStats?.bytesWritten
+      ? formatBytes(snapshot.webCodecsStats.bytesWritten)
+      : '—';
   const qualityLabel = snapshot.recordingQuality ?? '1080p';
 
   return (

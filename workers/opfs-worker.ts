@@ -4,6 +4,7 @@
 
 const MANIFEST_FILE = 'manifest.json';
 const MANIFEST_TMP_FILE = 'manifest.tmp';
+const DEFAULT_WEBCODECS_STREAM_FILE = 'webcodecs-stream.mp4';
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
@@ -101,14 +102,18 @@ function toFiniteNumber(value, fallback = 0) {
 
 function buildOrphanSummary(directoryName, manifest) {
   const chunks = Array.isArray(manifest?.chunks) ? manifest.chunks : [];
-  const totalSize = chunks.reduce((sum, chunk) => sum + toFiniteNumber(chunk?.size), 0);
+  const streamBytes = toFiniteNumber(manifest?.streamBytesWritten);
+  const isWebCodecs = manifest?.recordingKind === 'webcodecs-opfs';
+  const totalSize = isWebCodecs
+    ? streamBytes
+    : chunks.reduce((sum, chunk) => sum + toFiniteNumber(chunk?.size), 0);
   return {
     sessionId:
       typeof manifest?.sessionId === 'string' && manifest.sessionId.length
         ? manifest.sessionId
         : directoryName,
     startTime: toFiniteNumber(manifest?.startTime),
-    chunkCount: chunks.length,
+    chunkCount: isWebCodecs ? (streamBytes > 0 ? 1 : 0) : chunks.length,
     totalSize,
   };
 }
@@ -136,12 +141,46 @@ async function scanOrphanedSessions(root) {
 }
 
 self.onmessage = async (e) => {
-  const { type, sessionId, chunkIndex, data, manifest } = e.data;
+  const { type, sessionId, chunkIndex, data, manifest, position, streamFile } = e.data;
 
   try {
     const root = await navigator.storage.getDirectory();
 
-    if (type === 'write-chunk') {
+    if (type === 'write-webcodecs-range') {
+      const fileName =
+        typeof streamFile === 'string' && streamFile.length > 0
+          ? streamFile
+          : DEFAULT_WEBCODECS_STREAM_FILE;
+      const sessionDir = await root.getDirectoryHandle(sessionId, { create: true });
+      const fileHandle = await sessionDir.getFileHandle(fileName, { create: true });
+      const handle = await fileHandle.createSyncAccessHandle();
+      try {
+        const bytes = new Uint8Array(data);
+        handle.write(bytes, { at: toFiniteNumber(position, 0) });
+        handle.flush();
+      } finally {
+        handle.close();
+      }
+      self.postMessage({ type: 'webcodecs-range-written' });
+    }
+
+    else if (type === 'read-webcodecs-stream') {
+      try {
+        const fileName =
+          typeof streamFile === 'string' && streamFile.length > 0
+            ? streamFile
+            : DEFAULT_WEBCODECS_STREAM_FILE;
+        const sessionDir = await root.getDirectoryHandle(sessionId);
+        const fileHandle = await sessionDir.getFileHandle(fileName);
+        const file = await fileHandle.getFile();
+        const buffer = await file.arrayBuffer();
+        self.postMessage({ type: 'webcodecs-stream-data', data: buffer }, [buffer]);
+      } catch {
+        self.postMessage({ type: 'webcodecs-stream-not-found' });
+      }
+    }
+
+    else if (type === 'write-chunk') {
       const sessionDir = await root.getDirectoryHandle(sessionId, { create: true });
       const chunkFile = await sessionDir.getFileHandle(`chunk-${chunkIndex}.bin`, { create: true });
 

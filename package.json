@@ -21,8 +21,10 @@
     "@ffmpeg/core": "^0.12.10",
     "@ffmpeg/ffmpeg": "^0.12.15",
     "@ffmpeg/util": "^0.12.2",
+    "mp4-muxer": "^5.2.2",
     "react": "^19.2.4",
-    "react-dom": "^19.2.4"
+    "react-dom": "^19.2.4",
+    "webm-muxer": "5.1.4"
   },
   "devDependencies": {
     "@testing-library/react": "^16.3.2",

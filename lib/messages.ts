@@ -40,6 +40,14 @@ export const RuntimeMessageType = {
   OFFSCREEN_READY: 'OFFSCREEN_READY',
   OFFSCREEN_EVENT: 'OFFSCREEN_EVENT',
 
+  // Experimental WebCodecs pipeline
+  WEBCODECS_CHECK_SUPPORT: 'WEBCODECS_CHECK_SUPPORT',
+  OFFSCREEN_START_WEBCODECS: 'OFFSCREEN_START_WEBCODECS',
+  OFFSCREEN_STOP_WEBCODECS: 'OFFSCREEN_STOP_WEBCODECS',
+  WEBCODECS_FATAL_ERROR: 'WEBCODECS_FATAL_ERROR',
+  GET_EXPERIMENTAL_FLAGS: 'GET_EXPERIMENTAL_FLAGS',
+  SET_EXPERIMENTAL_FLAGS: 'SET_EXPERIMENTAL_FLAGS',
+
   SYSTEM_AUDIO_OK: 'SYSTEM_AUDIO_OK',
   SYSTEM_AUDIO_SILENT: 'SYSTEM_AUDIO_SILENT',
   SYSTEM_AUDIO_ABSENT: 'SYSTEM_AUDIO_ABSENT',
@@ -59,6 +67,7 @@ export const OffscreenEventType = {
   PROCESS_PROGRESS: 'PROCESS_PROGRESS',
   PROCESS_METRICS: 'PROCESS_METRICS',
   ERROR: 'ERROR',
+  WEBCODECS_STATS: 'WEBCODECS_STATS',
 } as const;
 
 export type OffscreenEventTypeValue = (typeof OffscreenEventType)[keyof typeof OffscreenEventType];
@@ -70,6 +79,14 @@ export type OffscreenEventMessage = {
   progress?: number;
   error?: string;
   metrics?: ProcessingMetrics;
+  webCodecsStats?: {
+    framesEncoded: number;
+    bytesWritten: number;
+    droppedFrames: number;
+    hardwareAccelerated: boolean;
+    memoryPressureTier?: number;
+    videoBitrateBps?: number;
+  };
 };
 
 export type OffscreenResponse = {
