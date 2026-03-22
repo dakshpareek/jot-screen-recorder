@@ -25,3 +25,15 @@ Local-first Chrome extension screen recorder with:
 ## Refactor Safety
 - Smoke checklist: `docs/architecture/phase0-smoke-checklist.md`
 - Runtime contract baseline: `docs/architecture/runtime-contract.md`
+
+## Privacy Policy URL (Chrome Web Store)
+- Policy text (Markdown): `docs/privacy-policy.md`
+- Hosted page (HTML): `docs/privacy-policy.html`
+
+To publish this as a URL:
+1. In GitHub repo settings, open `Pages`.
+2. Set source to `Deploy from a branch`.
+3. Choose branch `main` and folder `/docs`.
+
+Then use:
+- `https://<your-github-username>.github.io/<repo-name>/privacy-policy.html`
