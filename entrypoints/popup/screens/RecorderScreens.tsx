@@ -700,7 +700,7 @@ export function StoppingScreen({ snapshot }: { snapshot: RecordingSnapshot }) {
   return (
     <>
       <div className="rk-body">
-        <div className="rk-proc-center">
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '8px 0 4px' }}>
           <div className="rk-proc-ring-wrap">
             <div className="rk-proc-ring" />
             <svg
@@ -739,66 +739,106 @@ export function ProcessingScreen({
   phase: 'processing' | 'validating';
   etaSeconds: number | null;
 }) {
-  const progress = phase === 'validating' ? 100 : Math.max(0, Math.min(100, snapshot.processingProgress ?? 0));
-  const title = phase === 'validating' ? 'Validating output' : 'Converting to MP4';
-  const subtitle =
-    phase === 'validating'
-      ? 'Running final integrity checks (headers, size, duration).'
-      : `Stitching ${snapshot.chunkCount} chunks and encoding to H.264.`;
+  const progress =
+    phase === 'validating' ? 100 : Math.max(0, Math.min(100, snapshot.processingProgress ?? 0));
+
+  const isNearlyDone = progress >= 90 && phase === 'processing';
+  const isValidating = phase === 'validating';
+
+  const title = isValidating ? 'Checking your file' : isNearlyDone ? 'Almost done' : 'Converting to MP4';
+
+  const subtitle = isValidating
+    ? 'Running a quick validation to make sure everything looks right.'
+    : `Encoding ${snapshot.chunkCount} chunk${snapshot.chunkCount !== 1 ? 's' : ''} to H.264. Your recording is safe on disk.`;
+
+  const etaDisplay = (() => {
+    if (isValidating) return null;
+    if (etaSeconds === null) return null;
+    if (etaSeconds <= 0) return null;
+    return `~${etaSeconds}s`;
+  })();
+
+  const footerLabel = isValidating
+    ? 'Validating output...'
+    : isNearlyDone
+      ? 'Finishing up...'
+      : `Converting · ${snapshot.chunkCount} chunk${snapshot.chunkCount !== 1 ? 's' : ''}`;
 
   return (
     <>
-      <div className="rk-body">
-        <div className="rk-proc-center">
-          <div className="rk-proc-ring-wrap">
-            <div className="rk-proc-ring" />
+      <div className="rk-body" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+        <div className="rk-proc-ring-wrap">
+          <div className="rk-proc-ring" />
+          {isValidating ? (
             <svg
               width="22"
               height="22"
               viewBox="0 0 22 22"
               fill="none"
-              stroke="rgba(255,255,255,0.35)"
+              stroke="#9a9aaa"
               strokeWidth="1.4"
-              strokeLinecap="round">
-              <path d="M5 11l4.5 4.5L17 7" />
+              strokeLinecap="round"
+              strokeLinejoin="round">
+              <path d="M11 2L4 5.5v5c0 4 3 7.5 7 8.5 4-1 7-4.5 7-8.5v-5L11 2z" />
+              <path d="M7.5 11l2.5 2.5 4.5-4.5" />
             </svg>
+          ) : (
+            <svg
+              width="22"
+              height="22"
+              viewBox="0 0 22 22"
+              fill="none"
+              stroke="#9a9aaa"
+              strokeWidth="1.4"
+              strokeLinecap="round"
+              strokeLinejoin="round">
+              <path d="M13 2H6a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8l-5-6z" />
+              <path d="M13 2v6h6" />
+              <path d="M8 13h6M8 17h4" />
+            </svg>
+          )}
+        </div>
+
+        <div className="rk-proc-title">{title}</div>
+        <div className="rk-proc-sub">{subtitle}</div>
+
+        <div style={{ width: '100%' }}>
+          <div className="rk-prog-track">
+            <div className="rk-prog-fill" style={{ width: `${progress}%` }} />
           </div>
-          <div className="rk-proc-title">{title}</div>
-          <div className="rk-proc-sub">
-            {subtitle}
-            {phase === 'processing' &&
-              (etaSeconds === null
-                ? ' Estimating remaining time...'
-                : etaSeconds > 0
-                  ? ` About ${etaSeconds}s remaining.`
-                  : ' Almost done.')}
-          </div>
-          <div style={{ width: '100%' }}>
-            <div className="rk-prog-track">
-              <div className="rk-prog-fill" style={{ width: `${progress}%` }} />
-            </div>
-            <div className="rk-prog-row">
-              <span className="rk-prog-pct">{Math.round(progress)}%</span>
-              <span className="rk-prog-eta">
-                {phase === 'validating'
-                  ? 'Final checks...'
-                  : etaSeconds === null
-                    ? 'Estimating...'
-                    : etaSeconds > 0
-                      ? `~${etaSeconds}s remaining`
-                      : 'Finishing...'}
-              </span>
-            </div>
-          </div>
-          <div className="rk-priv-note">
-            <LockIcon />
-            <span>
-              Processing happens entirely on your device. Your recording never leaves your computer.
+          <div className="rk-prog-row">
+            <span className="rk-prog-pct">{Math.round(progress)}%</span>
+            <span className="rk-prog-eta">
+              {isValidating ? (
+                'Almost there...'
+              ) : etaDisplay ? (
+                <>
+                  <strong>{etaDisplay}</strong> remaining
+                </>
+              ) : etaSeconds === 0 ? (
+                'Finishing...'
+              ) : (
+                'Estimating...'
+              )}
             </span>
           </div>
         </div>
+
+        <div className="rk-priv-note">
+          <div className="rk-priv-note-icon">
+            <svg viewBox="0 0 12 12" fill="none">
+              <rect x="2" y="5" width="8" height="6" rx="1" />
+              <path d="M4 5V3.5a2 2 0 114 0V5" />
+            </svg>
+          </div>
+          <span>
+            <strong>Stays on your device.</strong> Processing is fully local — your recording is never
+            uploaded.
+          </span>
+        </div>
       </div>
-      <Footer label="Converting..." />
+
+      <Footer label={footerLabel} />
     </>
   );
 }
