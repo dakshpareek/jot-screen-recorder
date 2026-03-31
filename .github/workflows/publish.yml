@@ -1,0 +1,47 @@
+name: Publish to Chrome Web Store
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm compile
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build & zip extension
+        run: pnpm zip
+
+      - name: Upload to Chrome Web Store
+        run: |
+          npm install -g chrome-webstore-upload-cli
+          chrome-webstore-upload upload \
+            --source .output/*-chrome.zip \
+            --extension-id ${{ secrets.CHROME_EXTENSION_ID }} \
+            --client-id ${{ secrets.CHROME_CLIENT_ID }} \
+            --client-secret ${{ secrets.CHROME_CLIENT_SECRET }} \
+            --refresh-token ${{ secrets.CHROME_REFRESH_TOKEN }}
+
+      - name: Upload zip as release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-${{ github.ref_name }}
+          path: .output/*-chrome.zip
