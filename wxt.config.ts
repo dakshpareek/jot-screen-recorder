@@ -20,7 +20,7 @@ export default defineConfig({
         '128': 'logo/icon-128.png',
       },
     },
-    permissions: ['offscreen', 'storage', 'downloads', 'tabs', 'tabCapture', 'scripting'],
+    permissions: ['offscreen', 'storage', 'downloads', 'tabCapture', 'scripting'],
     content_security_policy: {
       extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
     },
