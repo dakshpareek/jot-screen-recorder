@@ -49,6 +49,8 @@ type RawDownloadItem = {
   filename: string;
 };
 const PREFLIGHT_RESULT_MIN_VISIBLE_MS = 1_500;
+const BLOCKED_TAB_CAPTURE_SCHEMES = ['chrome:', 'chrome-extension:', 'devtools:', 'edge:', 'about:'];
+const BLOCKED_TAB_CAPTURE_HOSTS = new Set(['chromewebstore.google.com']);
 
 const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
   micChecked: false,
@@ -189,7 +191,9 @@ export default defineBackground(() => {
     }
 
     if (message.type === RuntimeMessageType.OPEN_MIC_SETTINGS) {
-      void chrome.tabs.create({ url: 'chrome://settings/content/microphone' }).then(() => {
+      const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
+      const settingsUrl = `chrome://settings/content/siteDetails?site=${encodeURIComponent(extensionOrigin)}`;
+      void chrome.tabs.create({ url: settingsUrl }).then(() => {
         sendResponse({ ok: true });
       });
       return true;
@@ -627,7 +631,10 @@ async function handleStart(
     const targetTabId = await getStartTargetTabId();
     const streamId = await getTabCaptureStreamId(targetTabId);
     if (!streamId) {
-      errorMessage = 'Failed to start tab capture.';
+      errorMessage = formatCodedStartError(
+        'TAB_CAPTURE_STREAM_UNAVAILABLE',
+        'Could not create a capture stream for the current tab. Reload the tab and try again.',
+      );
       setState('preflight_error');
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
     }
@@ -691,7 +698,7 @@ async function handleStart(
 
     if (!result?.ok) {
       recordingTabId = null;
-      errorMessage = result?.error ?? 'Failed to start recorder';
+      errorMessage = normalizeStartFailureMessage(result?.error ?? 'Failed to start recorder');
       setState('preflight_error');
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
     }
@@ -711,7 +718,7 @@ async function handleStart(
     return { ok: true, snapshot: buildSnapshot() };
   } catch (error) {
     recordingTabId = null;
-    errorMessage = toErrorMessage(error);
+    errorMessage = normalizeStartFailureMessage(toErrorMessage(error));
     setState('preflight_error');
     return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
   }
@@ -1592,7 +1599,19 @@ async function getStartTargetTabId() {
   });
 
   if (!activeTab?.id) {
-    throw new Error('No active tab available for capture.');
+    throw new Error(
+      formatCodedStartError(
+        'TAB_NOT_AVAILABLE',
+        'No active tab is available to record. Focus a browser tab and try again.',
+      ),
+    );
+  }
+
+  if (typeof activeTab.url === 'string' && activeTab.url.trim()) {
+    const capturable = isTabUrlCapturable(activeTab.url);
+    if (!capturable.ok) {
+      throw new Error(formatCodedStartError(capturable.code, capturable.message, activeTab.url));
+    }
   }
   return activeTab.id;
 }
@@ -1608,4 +1627,98 @@ async function getTabCaptureStreamId(targetTabId: number): Promise<string> {
       resolve(streamId);
     });
   });
+}
+
+function formatCodedStartError(code: string, message: string, detail?: string | null) {
+  const nextDetail = typeof detail === 'string' ? detail.trim() : '';
+  if (!nextDetail) {
+    return `${code}: ${message}`;
+  }
+  return `${code}: ${message} (${nextDetail})`;
+}
+
+function normalizeStartFailureMessage(rawMessage: string | null | undefined) {
+  const raw = typeof rawMessage === 'string' ? rawMessage.trim() : '';
+  if (!raw) {
+    return formatCodedStartError('TAB_CAPTURE_START_FAILED', 'Unable to start recording.');
+  }
+
+  if (/^[A-Z0-9_]+:/.test(raw)) {
+    return raw;
+  }
+
+  const lower = raw.toLowerCase();
+
+  if (
+    lower.includes('cannot be captured') ||
+    lower.includes('chrome://') ||
+    lower.includes('devtools://') ||
+    lower.includes('chrome-extension://')
+  ) {
+    return formatCodedStartError(
+      'TAB_NOT_CAPTURABLE',
+      'This page cannot be recorded. Open a regular webpage (http/https) and try again.',
+      raw,
+    );
+  }
+
+  if (
+    lower.includes('unable to start tab capture') ||
+    lower.includes('error starting tab capture') ||
+    lower.includes('aborterror')
+  ) {
+    return formatCodedStartError(
+      'TAB_CAPTURE_START_FAILED',
+      'Could not attach to the current tab. Refresh the tab and try again.',
+      raw,
+    );
+  }
+
+  if (
+    lower.includes('missing tab stream id') ||
+    lower.includes('failed to start tab capture') ||
+    lower.includes('stream id')
+  ) {
+    return formatCodedStartError(
+      'TAB_CAPTURE_STREAM_UNAVAILABLE',
+      'Could not create a capture stream for the current tab.',
+      raw,
+    );
+  }
+
+  if (lower.includes('no active tab')) {
+    return formatCodedStartError(
+      'TAB_NOT_AVAILABLE',
+      'No active tab is available to record. Focus a browser tab and try again.',
+      raw,
+    );
+  }
+
+  return raw;
+}
+
+function isTabUrlCapturable(urlString: string): { ok: true } | { ok: false; code: string; message: string } {
+  try {
+    const parsed = new URL(urlString);
+    if (BLOCKED_TAB_CAPTURE_SCHEMES.includes(parsed.protocol)) {
+      return {
+        ok: false,
+        code: 'TAB_NOT_CAPTURABLE',
+        message: 'This page cannot be recorded. Open a regular webpage (http/https) and try again.',
+      };
+    }
+
+    if (BLOCKED_TAB_CAPTURE_HOSTS.has(parsed.hostname)) {
+      return {
+        ok: false,
+        code: 'TAB_NOT_CAPTURABLE',
+        message: 'Chrome Web Store pages cannot be recorded. Open another tab and try again.',
+      };
+    }
+
+    return { ok: true };
+  } catch {
+    // If URL parsing fails, do not block capture preemptively.
+    return { ok: true };
+  }
 }

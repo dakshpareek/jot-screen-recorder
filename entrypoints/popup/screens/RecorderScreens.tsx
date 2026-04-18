@@ -453,6 +453,7 @@ export function PreflightScreen({
 
 export function PreflightErrorScreen({
   audioPreflight,
+  errorMessage,
   includeMic,
   onRetry,
   onBack,
@@ -460,6 +461,7 @@ export function PreflightErrorScreen({
   isBusy,
 }: {
   audioPreflight: RecordingSnapshot['audioPreflight'];
+  errorMessage: string | null;
   includeMic: boolean;
   onRetry: () => void;
   onBack: () => void;
@@ -468,39 +470,90 @@ export function PreflightErrorScreen({
 }) {
   const { micError } = audioPreflight;
 
-  const errorContent: Record<string, { title: string; body: string; action: string }> = {
+  const micErrorContent: Record<string, { title: string; body: string; action: string; status: string }> = {
     MIC_PERMISSION_DENIED: {
       title: 'Microphone blocked',
       body: 'Chrome has blocked microphone access for this extension. Open Chrome settings and allow microphone access, then try again.',
       action: 'Open microphone settings',
+      status: 'Permission denied by Chrome',
     },
     MIC_PERMISSION_PROMPT: {
       title: 'Microphone permission needed',
       body: 'We need microphone access to record audio. Grant access when Chrome prompts you.',
       action: 'Grant microphone access',
+      status: 'Permission prompt pending',
     },
     MIC_NOT_FOUND: {
       title: 'No microphone detected',
       body: 'No microphone was found. Please connect a microphone and try again.',
       action: 'Try again',
+      status: 'Device not found',
     },
     MIC_IN_USE: {
       title: 'Microphone in use',
       body: 'Your microphone is being used by another application. Close other apps using the mic, then try again.',
       action: 'Try again',
+      status: 'In use by another app',
     },
   };
 
-  const info = errorContent[micError ?? ''] ?? {
-    title: 'Audio check failed',
-    body: 'An unexpected error occurred during audio pre-flight. Check your microphone and try again.',
-    action: 'Try again',
+  const captureErrorContent: Record<string, { title: string; body: string; status: string }> = {
+    TAB_NOT_CAPTURABLE: {
+      title: 'This tab cannot be recorded',
+      body: 'Open a regular webpage (http/https) and try again.',
+      status: 'Current page is not capturable',
+    },
+    TAB_CAPTURE_START_FAILED: {
+      title: 'Screen capture failed',
+      body: 'Could not attach to the current tab. Refresh the tab and try again.',
+      status: 'Unable to attach capture stream',
+    },
+    TAB_CAPTURE_STREAM_UNAVAILABLE: {
+      title: 'Screen capture failed',
+      body: 'Could not create a capture stream for this tab. Try again.',
+      status: 'Capture stream unavailable',
+    },
+    TAB_NOT_AVAILABLE: {
+      title: 'No tab available to record',
+      body: 'Focus a browser tab and try again.',
+      status: 'No active tab selected',
+    },
   };
 
+  const parsedError = (() => {
+    if (!errorMessage) return null;
+    const match = errorMessage.match(/^([A-Z0-9_]+):\s*(.+)$/s);
+    if (!match) return null;
+    return {
+      code: match[1],
+      detail: match[2]?.trim() || null,
+    };
+  })();
+
+  const isMicSpecificError = Boolean(micError && micErrorContent[micError]);
+  const captureInfo = parsedError?.code ? captureErrorContent[parsedError.code] : null;
+
+  const info = isMicSpecificError
+    ? micErrorContent[micError ?? '']
+    : {
+        title: captureInfo?.title ?? 'Capture check failed',
+        body:
+          parsedError?.detail ??
+          captureInfo?.body ??
+          errorMessage ??
+          'An unexpected error occurred before recording could start. Try again.',
+        action: 'Try again',
+        status: captureInfo?.status ?? 'Start check failed',
+      };
+
+  const errorCode = isMicSpecificError
+    ? (micError ?? 'MIC_ERROR')
+    : (parsedError?.code ?? 'PRECHECK_ERROR');
+
   const handleAction = async () => {
-    if (micError === 'MIC_PERMISSION_DENIED') {
+    if (isMicSpecificError && micError === 'MIC_PERMISSION_DENIED') {
       void chrome.runtime.sendMessage({ type: 'OPEN_MIC_SETTINGS' });
-    } else if (micError === 'MIC_PERMISSION_PROMPT') {
+    } else if (isMicSpecificError && micError === 'MIC_PERMISSION_PROMPT') {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         stream.getTracks().forEach((t) => t.stop());
@@ -522,7 +575,7 @@ export function PreflightErrorScreen({
         </div>
 
         <div className="jot-err-box">
-          <div className="jot-err-title">{micError ?? 'MIC_ERROR'}</div>
+          <div className="jot-err-title">{errorCode}</div>
           <div className="jot-err-body">{info.body}</div>
           <button className="jot-err-action" onClick={handleAction} disabled={isBusy}>
             {info.action}
@@ -544,23 +597,15 @@ export function PreflightErrorScreen({
             </svg>
           </div>
           <div className="jot-pf-info">
-            <div className="jot-pf-name">Microphone</div>
-            <div className="jot-pf-status">
-              {micError === 'MIC_PERMISSION_DENIED'
-                ? 'Permission denied by Chrome'
-                : micError === 'MIC_NOT_FOUND'
-                  ? 'Device not found'
-                  : micError === 'MIC_IN_USE'
-                    ? 'In use by another app'
-                    : 'Check failed'}
-            </div>
+            <div className="jot-pf-name">{isMicSpecificError ? 'Microphone' : 'Screen capture'}</div>
+            <div className="jot-pf-status">{info.status}</div>
           </div>
         </div>
 
         <button className="jot-btn-secondary" onClick={onBack}>
           ← Back
         </button>
-        {includeMic && (
+        {includeMic && isMicSpecificError && (
           <button className="jot-btn-secondary" onClick={onContinueWithoutMic} disabled={isBusy}>
             Continue without mic
           </button>

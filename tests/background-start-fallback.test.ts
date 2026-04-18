@@ -48,6 +48,7 @@ describe('background start fallback', () => {
   const onInstalledAddListenerMock = vi.fn();
   const runtimeSendMessageMock = vi.fn();
   const tabsQueryMock = vi.fn();
+  const tabsCreateMock = vi.fn();
   const tabsSendMessageMock = vi.fn();
   const setBadgeTextMock = vi.fn();
   const setBadgeBackgroundColorMock = vi.fn();
@@ -97,6 +98,7 @@ describe('background start fallback', () => {
     onInstalledAddListenerMock.mockReset();
     runtimeSendMessageMock.mockReset();
     tabsQueryMock.mockReset();
+    tabsCreateMock.mockReset();
     tabsSendMessageMock.mockReset();
     setBadgeTextMock.mockReset();
     setBadgeBackgroundColorMock.mockReset();
@@ -110,6 +112,7 @@ describe('background start fallback', () => {
     onInstalledAddListenerMock.mockImplementation(() => {});
     runtimeSendMessageMock.mockResolvedValue(undefined);
     tabsQueryMock.mockResolvedValue([{ id: 101 }]);
+    tabsCreateMock.mockResolvedValue({ id: 202 });
     tabsSendMessageMock.mockResolvedValue(true);
     tabCaptureGetMediaStreamIdMock.mockImplementation((_options: unknown, callback: (streamId: string) => void) => {
       callback('stream-101');
@@ -126,14 +129,18 @@ describe('background start fallback', () => {
     });
 
     (globalThis as { defineBackground?: unknown }).defineBackground = (callback: () => void) => callback();
-    (globalThis as { navigator?: unknown }).navigator = {
-      storage: {
-        estimate: vi.fn().mockResolvedValue({
-          quota: 10_000_000_000,
-          usage: 100_000_000,
-        }),
+    Object.defineProperty(globalThis, 'navigator', {
+      value: {
+        storage: {
+          estimate: vi.fn().mockResolvedValue({
+            quota: 10_000_000_000,
+            usage: 100_000_000,
+          }),
+        },
       },
-    };
+      configurable: true,
+      writable: true,
+    });
 
     (globalThis as { chrome?: unknown }).chrome = {
       runtime: {
@@ -151,6 +158,7 @@ describe('background start fallback', () => {
           addListener: onUpdatedAddListenerMock,
         },
         query: tabsQueryMock,
+        create: tabsCreateMock,
         sendMessage: tabsSendMessageMock,
       },
       tabCapture: {
@@ -237,5 +245,51 @@ describe('background start fallback', () => {
     expect(start?.snapshot?.state).toBe('preflight_error');
     expect(start?.error).toContain('WebCodecs start failed (wc failed)');
     expect(start?.error).toContain('MediaRecorder fallback also failed: legacy failed');
+  });
+
+  it('returns explicit tab-not-capturable error for browser-internal pages', async () => {
+    tabsQueryMock.mockResolvedValue([{ id: 101, url: 'chrome://extensions' }]);
+
+    await bootBackground();
+    offscreenSendMock.mockClear();
+
+    const prep = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.PREPARE_START,
+      includeMic: false,
+      quality: 'auto',
+    })) as { ok?: boolean };
+    expect(prep?.ok).toBe(true);
+
+    const start = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.START,
+      audioSource: 'tab',
+      quality: 'auto',
+    })) as { ok?: boolean; error?: string; snapshot?: { state?: string } };
+
+    expect(start?.ok).toBe(false);
+    expect(start?.snapshot?.state).toBe('preflight_error');
+    expect(start?.error).toContain('TAB_NOT_CAPTURABLE:');
+    expect(start?.error).toContain('regular webpage');
+    expect(offscreenSendMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS }),
+    );
+    expect(offscreenSendMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: RuntimeMessageType.OFFSCREEN_START }),
+    );
+  });
+
+  it('opens extension-specific microphone site settings', async () => {
+    (globalThis as { chrome?: { runtime?: { id?: string } } }).chrome!.runtime!.id = 'test-extension-id';
+
+    await bootBackground();
+
+    const response = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.OPEN_MIC_SETTINGS,
+    })) as { ok?: boolean };
+
+    expect(response?.ok).toBe(true);
+    expect(tabsCreateMock).toHaveBeenCalledWith({
+      url: 'chrome://settings/content/siteDetails?site=chrome-extension%3A%2F%2Ftest-extension-id',
+    });
   });
 });

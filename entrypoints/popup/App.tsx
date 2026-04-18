@@ -160,7 +160,10 @@ export default function App() {
     void checkSupport();
   }, []);
 
-  async function handleStart(nextIncludeMicInput?: boolean | unknown) {
+  async function handleStart(
+    nextIncludeMicInput?: boolean | unknown,
+    options?: { bypassMicReadyGate?: boolean },
+  ) {
     const nextIncludeMic =
       typeof nextIncludeMicInput === 'boolean' ? nextIncludeMicInput : includeMic;
 
@@ -170,7 +173,7 @@ export default function App() {
 
     const normalizedMicDeviceId = normalizeMicDeviceIdForPayload(selectedMicDeviceId);
 
-    if (nextIncludeMic && !snapshot.audioPreflight.micOk) {
+    if (nextIncludeMic && !snapshot.audioPreflight.micOk && !options?.bypassMicReadyGate) {
       return;
     }
 
@@ -240,6 +243,20 @@ export default function App() {
 
   async function handleStop() {
     await send(RuntimeMessageType.STOP);
+  }
+
+  async function handlePreflightBack() {
+    const result = await send(RuntimeMessageType.CANCEL_START);
+    if (!result?.ok) {
+      setSnapshot((prev) => ({ ...prev, state: 'idle' }));
+    }
+  }
+
+  async function handlePreflightErrorBack() {
+    const result = await send(RuntimeMessageType.RESET_TO_IDLE);
+    if (!result?.ok) {
+      setSnapshot((prev) => ({ ...prev, state: 'idle' }));
+    }
   }
 
   async function handleDownload() {
@@ -416,7 +433,7 @@ export default function App() {
           audioPreflight={snapshot.audioPreflight}
           includeMic={includeMic}
           onConfirm={handleStart}
-          onBack={() => setSnapshot((prev) => ({ ...prev, state: 'idle' }))}
+          onBack={() => void handlePreflightBack()}
           isBusy={isBusy}
         />
       ) : null}
@@ -424,9 +441,10 @@ export default function App() {
       {state === 'preflight_error' ? (
         <PreflightErrorScreen
           audioPreflight={snapshot.audioPreflight}
+          errorMessage={snapshot.errorMessage}
           includeMic={includeMic}
-          onRetry={handleStart}
-          onBack={() => setSnapshot((prev) => ({ ...prev, state: 'idle' }))}
+          onRetry={() => void handleStart(includeMic, { bypassMicReadyGate: true })}
+          onBack={() => void handlePreflightErrorBack()}
           onContinueWithoutMic={() => {
             setIncludeMic(false);
             void handleStart(false);
