@@ -8,6 +8,19 @@ import {
   type RecordingState,
 } from '@/lib/recording';
 
+function WarningBanner({ message, style }: { message: string; style?: React.CSSProperties }) {
+  return (
+    <div className="jot-storage-warn" style={style}>
+      <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
+        <path d="M6 1L11 10H1L6 1z" />
+        <line x1="6" y1="5" x2="6" y2="7.5" />
+        <circle cx="6" cy="9" r="0.5" fill="var(--jot-amb)" stroke="none" />
+      </svg>
+      <span>{message}</span>
+    </div>
+  );
+}
+
 function LockIcon() {
   return (
     <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
@@ -134,7 +147,7 @@ export function Header({
   state: RecordingState;
   onSettings: () => void;
 }) {
-  const isRecording = state === 'recording' || state === 'audio_warning' || state === 'stopping';
+  const isRecording = state === 'recording' || state === 'stopping';
   const isProcessing = state === 'processing' || state === 'validating';
   const isDone = state === 'done';
 
@@ -283,16 +296,7 @@ export function IdleScreen({
           </div>
         )}
 
-        {storageWarning && (
-          <div className="jot-storage-warn">
-            <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
-              <path d="M6 1L11 10H1L6 1z" />
-              <line x1="6" y1="5" x2="6" y2="7.5" />
-              <circle cx="6" cy="9" r="0.5" fill="var(--jot-amb)" stroke="none" />
-            </svg>
-            <span>{storageWarning}</span>
-          </div>
-        )}
+        {storageWarning && <WarningBanner message={storageWarning} />}
 
         {micControl}
 
@@ -435,8 +439,7 @@ export function PreflightScreen({
         </div>
 
         <div style={{ fontSize: 10, color: 'var(--jot-t3)', lineHeight: 1.5, marginTop: 2 }}>
-          After you click start, Chrome will open the share picker. The popup may close while you
-          choose what to share.
+          Start begins recording the active browser tab immediately.
         </div>
 
         <button className="jot-btn-primary" onClick={onConfirm} disabled={isBusy || (includeMic && !micOk)}>
@@ -634,20 +637,20 @@ export function ArmedScreen({ onCancel }: { onCancel: () => void }) {
               <path d="M8 19h6M11 16v3" />
             </svg>
           </div>
-          <div className="jot-armed-title">Choose what to record</div>
+          <div className="jot-armed-title">Starting tab capture</div>
           <div className="jot-armed-sub">
-            Select a tab, window, or screen from Chrome&apos;s share dialog
+            Attaching to the active tab recording stream
           </div>
           <div className="jot-armed-indicator">
             <div className="jot-armed-pulse" />
-            <span style={{ fontSize: 11, color: 'var(--jot-t2)' }}>Share picker should be open now</span>
+            <span style={{ fontSize: 11, color: 'var(--jot-t2)' }}>This should take only a moment</span>
           </div>
         </div>
         <button className="jot-btn-secondary" onClick={onCancel}>
           Cancel
         </button>
       </div>
-      <Footer label="Waiting for share selection..." />
+      <Footer label="Connecting recorder..." />
     </>
   );
 }
@@ -675,14 +678,7 @@ export function RecordingScreen({
     <>
       <div className="jot-body-sm">
         {snapshot.micWarningMessage && (
-          <div className="jot-storage-warn" style={{ marginBottom: 10 }}>
-            <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
-              <path d="M6 1L11 10H1L6 1z" />
-              <line x1="6" y1="5" x2="6" y2="7.5" />
-              <circle cx="6" cy="9" r="0.5" fill="var(--jot-amb)" stroke="none" />
-            </svg>
-            <span>{snapshot.micWarningMessage}</span>
-          </div>
+          <WarningBanner message={snapshot.micWarningMessage} style={{ marginBottom: 10 }} />
         )}
 
         <Timer seconds={snapshot.elapsedSeconds} />
@@ -742,66 +738,6 @@ export function RecordingScreen({
         </button>
       </div>
       <Footer label={hasSavedData ? `${safeSeconds}s safely saved` : 'Recording started'} />
-    </>
-  );
-}
-
-export function AudioWarningScreen({
-  snapshot,
-  onContinueMicOnly,
-  onStopRetry,
-  onStop,
-  isBusy,
-}: {
-  snapshot: RecordingSnapshot;
-  onContinueMicOnly: () => void;
-  onStopRetry: () => void;
-  onStop: () => void;
-  isBusy: boolean;
-}) {
-  return (
-    <>
-      <div className="jot-body-sm">
-        <div className="jot-rec-indicator">
-          <div className="jot-rec-dot" />
-          <span className="jot-rec-label">Recording</span>
-        </div>
-
-        {snapshot.micWarningMessage && (
-          <div className="jot-storage-warn" style={{ marginBottom: 10 }}>
-            <svg viewBox="0 0 12 12" fill="none" strokeWidth="1.4" strokeLinecap="round">
-              <path d="M6 1L11 10H1L6 1z" />
-              <line x1="6" y1="5" x2="6" y2="7.5" />
-              <circle cx="6" cy="9" r="0.5" fill="var(--jot-amb)" stroke="none" />
-            </svg>
-            <span>{snapshot.micWarningMessage}</span>
-          </div>
-        )}
-
-        <Timer seconds={snapshot.elapsedSeconds} />
-
-        <div className="jot-warn-box">
-          <div className="jot-warn-title">System audio not detected</div>
-          <div className="jot-warn-body">
-            Tab audio is silent. You may have forgotten to enable audio sharing. Continue with mic only,
-            or stop and retry.
-          </div>
-          <div className="jot-warn-btns">
-            <button className="jot-warn-btn-p" disabled={isBusy} onClick={onContinueMicOnly}>
-              Continue mic only
-            </button>
-            <button className="jot-warn-btn-s" disabled={isBusy} onClick={onStopRetry}>
-              Stop and retry
-            </button>
-          </div>
-        </div>
-
-        <button className="jot-btn-stop" disabled={isBusy} onClick={onStop}>
-          <StopSquare />
-          Stop Recording
-        </button>
-      </div>
-      <Footer label="Decision required" />
     </>
   );
 }
