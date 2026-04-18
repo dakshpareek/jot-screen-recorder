@@ -504,7 +504,7 @@ async function broadcastSnapshot() {
 async function syncRecordingBanner(next: RecordingState) {
   if (next === 'recording') {
     if (recordingTabId === null) return;
-    await sendRecordingBanner(recordingTabId, true);
+    await ensureRecordingBannerVisible(recordingTabId);
     return;
   }
 
@@ -527,23 +527,66 @@ async function sendRecordingBanner(tabId: number, visible: boolean) {
   }
 }
 
-async function handleRecordingTabUpdated(tabId: number, changeInfo: chrome.tabs.OnUpdatedInfo) {
-  if (recordingTabId === null || tabId !== recordingTabId) return;
-  if (state !== 'recording') return;
-  if (changeInfo.status !== 'complete') return;
-
+async function ensureRecordingBannerVisible(tabId: number) {
   const delivered = await sendRecordingBanner(tabId, true);
   if (delivered) return;
 
   try {
+    // Content script is not active (e.g. extension was reloaded).
+    // Inject the file to restore the message listener for future use,
+    // then directly execute the overlay function to avoid the async
+    // IIFE race where sendMessage fires before onMessage is registered.
     await chrome.scripting.executeScript({
       target: { tabId },
       files: ['content-scripts/content.js'],
     });
-    await sendRecordingBanner(tabId, true);
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const OVERLAY_ID = '__screen_recorder_recording_overlay__';
+        const STYLE_ID = '__screen_recorder_recording_overlay_styles__';
+        if (!document.documentElement || document.getElementById(OVERLAY_ID)) return;
+        if (!document.getElementById(STYLE_ID)) {
+          const style = document.createElement('style');
+          style.id = STYLE_ID;
+          style.textContent = `
+            @keyframes jot-recording-breathe {
+              0%, 100% {
+                box-shadow:
+                  inset 0 0 0 3px rgba(255, 59, 48, 0.85),
+                  inset 0 0 16px rgba(255, 59, 48, 0.12);
+              }
+              50% {
+                box-shadow:
+                  inset 0 0 0 3px rgba(255, 59, 48, 0.45),
+                  inset 0 0 28px rgba(255, 59, 48, 0.18);
+              }
+            }
+          `;
+          (document.head ?? document.documentElement).appendChild(style);
+        }
+        const overlay = document.createElement('div');
+        overlay.id = OVERLAY_ID;
+        overlay.style.cssText = `
+          position: fixed; inset: 0; pointer-events: none;
+          z-index: 2147483647; border-radius: 0;
+          box-shadow: inset 0 0 0 3px rgba(255, 59, 48, 0.85),
+                      inset 0 0 20px rgba(255, 59, 48, 0.12);
+          animation: jot-recording-breathe 2s ease-in-out infinite;
+        `;
+        (document.body ?? document.documentElement).appendChild(overlay);
+      },
+    });
   } catch {
     // Tab may still be navigating or disallow script injection.
   }
+}
+
+async function handleRecordingTabUpdated(tabId: number, changeInfo: chrome.tabs.OnUpdatedInfo) {
+  if (recordingTabId === null || tabId !== recordingTabId) return;
+  if (state !== 'recording') return;
+  if (changeInfo.status !== 'complete') return;
+  await ensureRecordingBannerVisible(tabId);
 }
 
 function resetSessionMetadata(nextSessionId: string) {

@@ -21,6 +21,7 @@ export default defineConfig({
       },
     },
     permissions: ['offscreen', 'storage', 'downloads', 'tabCapture', 'scripting'],
+    host_permissions: ['<all_urls>'],
     content_security_policy: {
       extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
     },
