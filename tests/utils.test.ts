@@ -56,7 +56,6 @@ describe('background utils', () => {
     expect(getSystemAudioPreflightSnapshot('silent', false).systemAudioStatus).toBe('idle');
     expect(getSystemAudioPreflightSnapshot('both', true).systemAudioStatus).toBe('idle');
     expect(getSystemAudioPreflightSnapshot('tab', true).systemAudioStatus).toBe('idle');
-    expect(getSystemAudioPreflightSnapshot('both', true).systemAudioMessage).toBeNull();
   });
 
   it('normalizes mic device ids', () => {

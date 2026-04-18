@@ -7,7 +7,6 @@ import { useRecorderCommands } from './hooks/useRecorderCommands';
 import { useRecorderSnapshot } from './hooks/useRecorderSnapshot';
 import {
   ArmedScreen,
-  AudioWarningScreen,
   DoneScreen,
   ErrorScreen,
   Header,
@@ -48,8 +47,6 @@ const EMPTY_SNAPSHOT: RecordingSnapshot = {
     micError: null,
     systemAudioStatus: 'idle',
     systemAudioLevel: null,
-    systemAudioMessage: null,
-    needsSystemAudioDecision: false,
   },
 };
 
@@ -263,14 +260,6 @@ export default function App() {
     await send(RuntimeMessageType.DOWNLOAD);
   }
 
-  async function handleContinueMicOnly() {
-    await send(RuntimeMessageType.SYSTEM_AUDIO_CONTINUE);
-  }
-
-  async function handleStopRetry() {
-    await send(RuntimeMessageType.SYSTEM_AUDIO_STOP_RETRY);
-  }
-
   async function handleRecoverOrphan(sessionId: string) {
     await send(RuntimeMessageType.RECOVER_ORPHAN, { sessionId });
   }
@@ -463,16 +452,6 @@ export default function App() {
           onStop={handleStop}
           isBusy={isBusy}
           quality={snapshot.resolvedPreset ?? snapshot.requestedPreset ?? snapshot.recordingQuality}
-        />
-      ) : null}
-
-      {state === 'audio_warning' ? (
-        <AudioWarningScreen
-          snapshot={snapshot}
-          onContinueMicOnly={handleContinueMicOnly}
-          onStopRetry={handleStopRetry}
-          onStop={handleStop}
-          isBusy={isBusy}
         />
       ) : null}
 

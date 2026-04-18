@@ -6,7 +6,6 @@ export type RecordingState =
   | 'preflight_error'
   | 'armed'
   | 'recording'
-  | 'audio_warning'
   | 'stopping'
   | 'processing'
   | 'validating'
@@ -51,8 +50,6 @@ export interface AudioPreflightSnapshot {
   micError: string | null;
   systemAudioStatus: SystemAudioStatus;
   systemAudioLevel: number | null;
-  systemAudioMessage: string | null;
-  needsSystemAudioDecision: boolean;
 }
 
 export interface OrphanedSession {

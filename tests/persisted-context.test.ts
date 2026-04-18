@@ -35,8 +35,6 @@ function createSampleContext(): PersistedContext {
       micError: null,
       systemAudioStatus: 'ok',
       systemAudioLevel: 0.7,
-      systemAudioMessage: null,
-      needsSystemAudioDecision: false,
     },
     orphanedSessions: [],
     recoverySessionId: null,

@@ -59,8 +59,6 @@ const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
   micError: null,
   systemAudioStatus: 'idle',
   systemAudioLevel: null,
-  systemAudioMessage: null,
-  needsSystemAudioDecision: false,
 };
 
 let state: RecordingState = 'idle';
@@ -157,16 +155,6 @@ export default defineBackground(() => {
 
     if (message.type === RuntimeMessageType.DOWNLOAD_RAW_CHUNKS) {
       void handleDownloadRawChunks(String(message.sessionId ?? '')).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.SYSTEM_AUDIO_CONTINUE) {
-      void handleSystemAudioContinue().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.SYSTEM_AUDIO_STOP_RETRY) {
-      void handleSystemAudioStopRetry().then(sendResponse);
       return true;
     }
 
@@ -351,7 +339,7 @@ async function hydrateContext() {
 }
 
 async function reconcileWithOffscreen() {
-  if (!['recording', 'audio_warning', 'stopping', 'processing'].includes(state)) return;
+  if (!['recording', 'stopping', 'processing'].includes(state)) return;
 
   try {
     const status = await offscreenClient.send<{
@@ -367,9 +355,7 @@ async function reconcileWithOffscreen() {
       return;
     }
 
-    const captureLive =
-      status.isRecording === true || status.isWebCodecsRecording === true;
-    // `audio_warning` can be shown before capture is running; only treat active `recording` as requiring live capture.
+    const captureLive = status.isRecording === true || status.isWebCodecsRecording === true;
     if (state === 'recording' && !captureLive) {
       errorMessage = 'Recording session was lost.';
       setState('recovery', { force: true });
@@ -387,7 +373,7 @@ async function reconcileWithOffscreen() {
 }
 
 function hasActiveRuntimeRecording() {
-  return ['recording', 'audio_warning', 'stopping', 'processing'].includes(state);
+  return ['recording', 'stopping', 'processing'].includes(state);
 }
 
 async function refreshOrphanedSessions() {
@@ -412,7 +398,7 @@ async function refreshOrphanedSessions() {
 
 function buildSnapshot(): RecordingSnapshot {
   const elapsedSeconds =
-    (state === 'recording' || state === 'audio_warning') && recordingStartTime
+    state === 'recording' && recordingStartTime
       ? Math.max(0, Math.floor((Date.now() - recordingStartTime) / 1000))
       : 0;
 
@@ -465,7 +451,6 @@ function setState(next: RecordingState, options?: { force?: boolean }) {
 function updateBadge(next: RecordingState) {
   const badges: Partial<Record<RecordingState, { text: string; color: string }>> = {
     recording: { text: '●', color: '#FF3B30' },
-    audio_warning: { text: '●', color: '#FF3B30' },
     stopping: { text: '◐', color: '#FFD60A' },
     processing: { text: '◐', color: '#FFD60A' },
     error: { text: '!', color: '#FF9F0A' },
@@ -517,7 +502,7 @@ async function broadcastSnapshot() {
 }
 
 async function syncRecordingBanner(next: RecordingState) {
-  if (next === 'recording' || next === 'audio_warning') {
+  if (next === 'recording') {
     if (recordingTabId === null) return;
     await sendRecordingBanner(recordingTabId, true);
     return;
@@ -544,7 +529,7 @@ async function sendRecordingBanner(tabId: number, visible: boolean) {
 
 async function handleRecordingTabUpdated(tabId: number, changeInfo: chrome.tabs.OnUpdatedInfo) {
   if (recordingTabId === null || tabId !== recordingTabId) return;
-  if (!['recording', 'audio_warning'].includes(state)) return;
+  if (state !== 'recording') return;
   if (changeInfo.status !== 'complete') return;
 
   const delivered = await sendRecordingBanner(tabId, true);
@@ -581,8 +566,6 @@ function resetSessionMetadata(nextSessionId: string) {
     ...audioPreflight,
     systemAudioStatus: 'idle',
     systemAudioLevel: null,
-    systemAudioMessage: null,
-    needsSystemAudioDecision: false,
   };
 }
 
@@ -771,8 +754,6 @@ async function handlePrepareStart(
         micError: null,
         systemAudioStatus: 'idle',
         systemAudioLevel: null,
-        systemAudioMessage: null,
-        needsSystemAudioDecision: false,
       };
       errorMessage = null;
       await persistContext();
@@ -791,8 +772,6 @@ async function handlePrepareStart(
       micError: micPreflight.error ?? null,
       systemAudioStatus: 'idle',
       systemAudioLevel: null,
-      systemAudioMessage: null,
-      needsSystemAudioDecision: false,
     };
     await persistContext();
     await broadcastSnapshot();
@@ -944,7 +923,7 @@ async function handleCancelStart() {
 }
 
 async function handleStop() {
-  if (!['recording', 'audio_warning'].includes(state)) {
+  if (state !== 'recording') {
     return { ok: false, error: `Cannot stop from state "${state}"`, snapshot: buildSnapshot() };
   }
 
@@ -1004,7 +983,7 @@ async function handleStop() {
 }
 
 async function handleWebCodecsFatalError(errorMsg?: string) {
-  if (!isUsingWebCodecsBackend() || !['recording', 'audio_warning'].includes(state)) {
+  if (!isUsingWebCodecsBackend() || state !== 'recording') {
     return { ok: true };
   }
 
@@ -1042,7 +1021,7 @@ async function handleDownload() {
 }
 
 async function handleResetToIdle() {
-  if (['recording', 'audio_warning', 'stopping', 'processing', 'validating', 'armed'].includes(state)) {
+  if (['recording', 'stopping', 'processing', 'validating', 'armed'].includes(state)) {
     return {
       ok: false,
       error: `Cannot reset while state is "${state}"`,
@@ -1127,7 +1106,7 @@ async function handleDownloadRawChunks(targetSessionId: string) {
 }
 
 async function handleSystemAudioSignal(message: SystemAudioSignalMessage) {
-  if (!['recording', 'audio_warning'].includes(state)) {
+  if (state !== 'recording') {
     return { ok: true };
   }
 
@@ -1136,75 +1115,38 @@ async function handleSystemAudioSignal(message: SystemAudioSignalMessage) {
       ...audioPreflight,
       systemAudioStatus: 'ok',
       systemAudioLevel: typeof message.level === 'number' ? message.level : null,
-      systemAudioMessage: null,
-      needsSystemAudioDecision: false,
     };
     errorMessage = null;
+    micWarningMessage = null;
     await persistContext();
     await broadcastSnapshot();
-    if (state === 'audio_warning') {
-      setState('recording');
-    }
     return { ok: true };
   }
 
-  const warningMessage =
-    message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
-      ? 'System audio track is missing. Recording continues with microphone.'
-      : 'System audio appears silent. Recording continues with microphone.';
+  const warningMessage = (() => {
+    if (activeAudioSource === 'both') {
+      return message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
+        ? 'System audio track is missing. Recording continues with microphone.'
+        : 'System audio appears silent. Recording continues with microphone.';
+    }
+    if (activeAudioSource === 'tab') {
+      return message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
+        ? 'System audio track is missing. The recording may not include tab audio.'
+        : 'System audio appears silent. Check the tab output volume.';
+    }
+    return null;
+  })();
 
   audioPreflight = {
     ...audioPreflight,
     systemAudioStatus: message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT ? 'absent' : 'silent',
     systemAudioLevel: typeof message.level === 'number' ? message.level : null,
-    // Non-blocking in simplified UX: only show informational warning when mic is enabled.
-    systemAudioMessage: activeAudioSource === 'both' ? warningMessage : null,
-    needsSystemAudioDecision: false,
   };
+  micWarningMessage = warningMessage;
   errorMessage = null;
-  if (state === 'audio_warning') {
-    setState('recording');
-  } else {
-    await persistContext();
-    await broadcastSnapshot();
-  }
+  await persistContext();
+  await broadcastSnapshot();
   return { ok: true };
-}
-
-async function handleSystemAudioContinue() {
-  if (state !== 'audio_warning') {
-    return { ok: false, error: `Cannot continue from state "${state}"`, snapshot: buildSnapshot() };
-  }
-
-  audioPreflight = {
-    ...audioPreflight,
-    needsSystemAudioDecision: false,
-    systemAudioMessage: 'Continuing with microphone audio.',
-  };
-  errorMessage = null;
-
-  try {
-    await offscreenClient.send<{ ok?: boolean }>({ type: RuntimeMessageType.OFFSCREEN_RESUME });
-  } catch {
-    // Resume is best-effort; keep the UI state consistent with user decision.
-  }
-
-  setState('recording');
-  return { ok: true, snapshot: buildSnapshot() };
-}
-
-async function handleSystemAudioStopRetry() {
-  if (!['recording', 'audio_warning'].includes(state)) {
-    return { ok: false, error: `Cannot stop from state "${state}"`, snapshot: buildSnapshot() };
-  }
-
-  audioPreflight = {
-    ...audioPreflight,
-    needsSystemAudioDecision: false,
-    systemAudioMessage: 'Stopped. Retry and enable tab audio in the share dialog.',
-  };
-  errorMessage = 'System audio was not detected. Recording stopped so you can retry.';
-  return await handleStop();
 }
 
 async function handleStorageSignal(message: StorageSignalMessage) {
@@ -1231,7 +1173,7 @@ async function handleStorageSignal(message: StorageSignalMessage) {
   await persistContext();
   await broadcastSnapshot();
 
-  if (['recording', 'audio_warning'].includes(state)) {
+  if (state === 'recording') {
     return await handleStop();
   }
 
@@ -1265,7 +1207,7 @@ async function handleRecoverOrphan(targetSessionId: string, chunkIndexes?: numbe
       return { ok: false, error: 'Missing session id', snapshot: buildSnapshot() };
     }
 
-    if (['preflight', 'armed', 'recording', 'audio_warning', 'stopping', 'processing'].includes(state)) {
+    if (['preflight', 'armed', 'recording', 'stopping', 'processing'].includes(state)) {
       return {
         ok: false,
         error: `Cannot recover while state is "${state}"`,
@@ -1467,7 +1409,7 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
 }
 
 async function handleMicMixFailed(message: MicMixFailedMessage) {
-  if (!['armed', 'recording', 'audio_warning', 'stopping'].includes(state)) {
+  if (!['armed', 'recording', 'stopping'].includes(state)) {
     return { ok: true };
   }
 

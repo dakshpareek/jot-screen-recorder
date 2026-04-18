@@ -11,7 +11,6 @@ States:
 - `preflight_error`
 - `armed`
 - `recording`
-- `audio_warning`
 - `stopping`
 - `processing`
 - `validating`
@@ -32,8 +31,6 @@ Authoritative transition table lives in:
 - `RUN_MIC_CHECK` (optional `micDeviceId`)
 - `RELEASE_MIC_CHECK`
 - `CANCEL_START`
-- `SYSTEM_AUDIO_CONTINUE`
-- `SYSTEM_AUDIO_STOP_RETRY`
 - `RECOVER_ORPHAN` (`sessionId`, optional `chunkIndexes`)
 - `DISCARD_ORPHAN` (`sessionId`)
 - `REFRESH_ORPHANS`

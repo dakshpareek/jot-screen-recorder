@@ -25,8 +25,6 @@ export function createSnapshot(overrides: Partial<RecordingSnapshot> = {}): Reco
       micError: null,
       systemAudioStatus: 'idle',
       systemAudioLevel: null,
-      systemAudioMessage: null,
-      needsSystemAudioDecision: false,
     },
     orphanedSessions: [],
     recoverySessionId: null,

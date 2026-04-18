@@ -8,7 +8,6 @@ const STATES: RecordingState[] = [
   'preflight_error',
   'armed',
   'recording',
-  'audio_warning',
   'stopping',
   'processing',
   'validating',
@@ -35,7 +34,6 @@ describe('ALLOWED_TRANSITIONS', () => {
 
   it('allows defined error and recovery paths', () => {
     expect(ALLOWED_TRANSITIONS.recording).toContain('error');
-    expect(ALLOWED_TRANSITIONS.audio_warning).toContain('recording');
     expect(ALLOWED_TRANSITIONS.validating).toContain('recovery');
     expect(ALLOWED_TRANSITIONS.recovery).toContain('idle');
     expect(ALLOWED_TRANSITIONS.error).toEqual(expect.arrayContaining(['idle', 'preflight']));
