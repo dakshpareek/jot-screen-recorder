@@ -50,6 +50,7 @@ describe('background start fallback', () => {
   const tabsQueryMock = vi.fn();
   const tabsCreateMock = vi.fn();
   const tabsSendMessageMock = vi.fn();
+  const executeScriptMock = vi.fn();
   const setBadgeTextMock = vi.fn();
   const setBadgeBackgroundColorMock = vi.fn();
   const tabCaptureGetMediaStreamIdMock = vi.fn();
@@ -100,6 +101,7 @@ describe('background start fallback', () => {
     tabsQueryMock.mockReset();
     tabsCreateMock.mockReset();
     tabsSendMessageMock.mockReset();
+    executeScriptMock.mockReset();
     setBadgeTextMock.mockReset();
     setBadgeBackgroundColorMock.mockReset();
     tabCaptureGetMediaStreamIdMock.mockReset();
@@ -169,7 +171,7 @@ describe('background start fallback', () => {
         setBadgeBackgroundColor: setBadgeBackgroundColorMock,
       },
       scripting: {
-        executeScript: vi.fn().mockResolvedValue(undefined),
+        executeScript: executeScriptMock.mockResolvedValue(undefined),
       },
       downloads: {
         download: vi.fn().mockResolvedValue(1),
@@ -291,5 +293,46 @@ describe('background start fallback', () => {
     expect(tabsCreateMock).toHaveBeenCalledWith({
       url: 'chrome://settings/content/siteDetails?site=chrome-extension%3A%2F%2Ftest-extension-id',
     });
+  });
+
+  it('injects content script fallback when recording banner target tab has no listener', async () => {
+    tabsSendMessageMock
+      .mockRejectedValueOnce(new Error('Could not establish connection. Receiving end does not exist.'))
+      .mockResolvedValue(true);
+
+    await bootBackground();
+    offscreenSendMock.mockClear();
+
+    offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
+      if (message.type === RuntimeMessageType.OFFSCREEN_START_WEBCODECS) {
+        return { ok: true, requestedPreset: 'auto', resolvedPreset: '1080p30' };
+      }
+      return { ok: true };
+    });
+
+    const prep = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.PREPARE_START,
+      includeMic: false,
+      quality: 'auto',
+    })) as { ok?: boolean };
+    expect(prep?.ok).toBe(true);
+
+    const start = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.START,
+      audioSource: 'tab',
+      quality: 'auto',
+    })) as { ok?: boolean; snapshot?: { state?: string } };
+
+    expect(start?.ok).toBe(true);
+    expect(start?.snapshot?.state).toBe('recording');
+    await flush();
+    expect(executeScriptMock).toHaveBeenCalledWith({
+      target: { tabId: 101 },
+      files: ['content-scripts/content.js'],
+    });
+    expect(tabsSendMessageMock).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({ type: RuntimeMessageType.RECORDING_BANNER, visible: true }),
+    );
   });
 });
