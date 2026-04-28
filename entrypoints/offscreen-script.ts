@@ -2100,8 +2100,14 @@ export default defineUnlistedScript(() => {
           });
         },
         onError: (error) => {
-          console.error('[WebCodecs] Pipeline error', error);
-          void emitEvent(OffscreenEventType.ERROR, { error: error.message });
+          const isExpectedInterruption =
+            error.message === 'Recording source ended because the tab was closed or navigated';
+          if (isExpectedInterruption) {
+            console.warn('[WebCodecs] Source tab ended, stopping recorder gracefully', error);
+          } else {
+            console.error('[WebCodecs] Pipeline error', error);
+            void emitEvent(OffscreenEventType.ERROR, { error: error.message });
+          }
           // Auto-stop on fatal errors (e.g. stream ended, encoder crashed)
           // Emit a signal so background can trigger a graceful stop
           void emitRuntimeSignal({

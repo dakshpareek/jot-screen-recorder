@@ -256,9 +256,9 @@ export class WebCodecsPipeline {
   private handleTrackEnded(kind: 'video' | 'audio'): void {
     if (this.stopping || !this.running) return;
     debugWarn(`[WebCodecs] ${kind} track ended unexpectedly`);
-    // Video track ending is fatal — signal the error so the caller can stop gracefully
+    // Video track ending means the source tab went away; stop gracefully without treating it as a crash.
     if (kind === 'video') {
-      this.fatalError = new Error('Video stream ended unexpectedly (tab may have been closed or navigated)');
+      this.fatalError = new Error('Recording source ended because the tab was closed or navigated');
       this.options.onError?.(this.fatalError);
     }
   }
