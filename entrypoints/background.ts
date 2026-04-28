@@ -800,7 +800,7 @@ async function handlePrepareStart(
     setState('preflight');
     const preflightStartedAt = Date.now();
 
-    const targetTabId = await getStartTargetTabId();
+    const targetTabId = await getStartTargetTabId({ validateCapturable: false });
     const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
     if (!staleCaptureRecovery.ok) {
       errorMessage = formatCodedStartError(
@@ -1643,7 +1643,7 @@ async function runProcessingPipeline(options?: {
   }
 }
 
-async function getStartTargetTabId() {
+async function getStartTargetTabId(options?: { validateCapturable?: boolean }) {
   const [activeTab] = await chrome.tabs.query({
     active: true,
     lastFocusedWindow: true,
@@ -1658,7 +1658,7 @@ async function getStartTargetTabId() {
     );
   }
 
-  if (typeof activeTab.url === 'string' && activeTab.url.trim()) {
+  if (options?.validateCapturable !== false && typeof activeTab.url === 'string' && activeTab.url.trim()) {
     const capturable = isTabUrlCapturable(activeTab.url);
     if (!capturable.ok) {
       throw new Error(formatCodedStartError(capturable.code, capturable.message, activeTab.url));
@@ -1681,6 +1681,10 @@ async function getTabCaptureStreamId(targetTabId: number): Promise<string> {
 }
 
 async function getCapturedTabInfo(targetTabId: number): Promise<chrome.tabCapture.CaptureInfo | null> {
+  if (typeof chrome.tabCapture.getCapturedTabs !== 'function') {
+    return null;
+  }
+
   const capturedTabs = await new Promise<chrome.tabCapture.CaptureInfo[]>((resolve, reject) => {
     chrome.tabCapture.getCapturedTabs((result) => {
       const runtimeError = chrome.runtime.lastError;

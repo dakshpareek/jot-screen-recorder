@@ -1,9 +1,8 @@
-// @vitest-environment jsdom
-
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeMessageType } from '@/lib/messages';
 import { useRecorderSnapshot } from '@/entrypoints/popup/hooks/useRecorderSnapshot';
+import { installTestDom } from './helpers/linkedom';
 import { createSnapshot } from './helpers/snapshot';
 
 type RuntimeListener = (message: unknown) => void;
@@ -13,8 +12,10 @@ describe('useRecorderSnapshot', () => {
   const addListenerMock = vi.fn();
   const removeListenerMock = vi.fn();
   let listeners: RuntimeListener[] = [];
+  let restoreDom = () => {};
 
   beforeEach(() => {
+    restoreDom = installTestDom();
     sendMessageMock.mockReset();
     addListenerMock.mockReset();
     removeListenerMock.mockReset();
@@ -40,6 +41,7 @@ describe('useRecorderSnapshot', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    restoreDom();
   });
 
   it('loads latest state and requests orphan refresh on mount', async () => {

@@ -1,15 +1,16 @@
-// @vitest-environment jsdom
-
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeMessageType } from '@/lib/messages';
 import { useRecorderCommands } from '@/entrypoints/popup/hooks/useRecorderCommands';
+import { installTestDom } from './helpers/linkedom';
 import { createSnapshot } from './helpers/snapshot';
 
 describe('useRecorderCommands', () => {
   const sendMessageMock = vi.fn();
+  let restoreDom = () => {};
 
   beforeEach(() => {
+    restoreDom = installTestDom();
     sendMessageMock.mockReset();
 
     (globalThis as { chrome: unknown }).chrome = {
@@ -17,6 +18,10 @@ describe('useRecorderCommands', () => {
         sendMessage: sendMessageMock,
       },
     };
+  });
+
+  afterEach(() => {
+    restoreDom();
   });
 
   it('sends command payloads and forwards snapshot updates', async () => {
