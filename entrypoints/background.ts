@@ -51,7 +51,10 @@ type RawDownloadItem = {
 const PREFLIGHT_RESULT_MIN_VISIBLE_MS = 1_500;
 const BLOCKED_TAB_CAPTURE_SCHEMES = ['chrome:', 'chrome-extension:', 'devtools:', 'edge:', 'about:'];
 const BLOCKED_TAB_CAPTURE_HOSTS = new Set(['chromewebstore.google.com']);
-const ACTIVE_TAB_CAPTURE_STATUSES = new Set<chrome.tabCapture.TabCaptureState>(['pending', 'active']);
+const ACTIVE_TAB_CAPTURE_STATUSES = new Set<chrome.tabCapture.CaptureInfo['status']>([
+  'pending',
+  'active',
+]);
 
 const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
   micChecked: false,
