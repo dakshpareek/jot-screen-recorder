@@ -136,6 +136,11 @@ export default defineUnlistedScript(() => {
       return;
     }
 
+    if (msg.type === RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP) {
+      void forceCleanupCapture().then(sendResponse);
+      return true;
+    }
+
     if (msg.type === RuntimeMessageType.OFFSCREEN_PAUSE) {
       void pauseRecording().then(sendResponse);
       return true;
@@ -255,6 +260,8 @@ export default defineUnlistedScript(() => {
 
           sendResponse(result);
         } catch (error) {
+          cleanupWebCodecsPipeline();
+          await cleanupMedia().catch(() => {});
           sendResponse({ ok: false, error: toNamedErrorMessage(error) });
         }
       })();
@@ -1214,6 +1221,17 @@ export default defineUnlistedScript(() => {
       mixAudioCtx = null;
     }
 
+    if (recorder) {
+      recorder.ondataavailable = null;
+      recorder.onstop = null;
+      recorder.onerror = null;
+      try {
+        if (recorder.state !== 'inactive') {
+          recorder.stop();
+        }
+      } catch {}
+    }
+
     if (captureStream) {
       captureStream.getTracks().forEach((track) => track.stop());
     }
@@ -1227,6 +1245,28 @@ export default defineUnlistedScript(() => {
     tabCaptureStream = null;
     micCaptureStream = null;
     recorder = null;
+  }
+
+  async function forceCleanupCapture() {
+    try {
+      pendingStop = false;
+      clearFinalStopDataWait();
+      resolveStopCompletion?.();
+      resolveStopCompletion = null;
+      stopCompletionPromise = null;
+
+      if (webcodecsPipeline) {
+        cleanupWebCodecsPipeline();
+      }
+
+      await cleanupMedia();
+      activeSessionId = null;
+      return { ok: true };
+    } catch (error) {
+      cleanupWebCodecsPipeline();
+      await cleanupMedia().catch(() => {});
+      return { ok: false, error: toNamedErrorMessage(error) };
+    }
   }
 
   async function runMicPreflight(micDeviceId: string | null = null) {

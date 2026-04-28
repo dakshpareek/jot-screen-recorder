@@ -37,6 +37,10 @@ export class OffscreenClient {
     throw lastError instanceof Error ? lastError : new Error('Unable to initialize offscreen recorder');
   }
 
+  async forceResetDocument() {
+    await this.recreateDocument();
+  }
+
   private async ensureDocument() {
     if (await chrome.offscreen.hasDocument()) return;
 

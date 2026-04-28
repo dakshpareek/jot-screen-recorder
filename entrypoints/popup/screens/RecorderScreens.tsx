@@ -516,6 +516,11 @@ export function PreflightErrorScreen({
       body: 'Could not create a capture stream for this tab. Try again.',
       status: 'Capture stream unavailable',
     },
+    TAB_CAPTURE_ACTIVE: {
+      title: 'Screen capture already active',
+      body: 'Chrome still thinks this tab is being shared. We tried to clear the previous session, but it is still active.',
+      status: 'Tab capture already active',
+    },
     TAB_NOT_AVAILABLE: {
       title: 'No tab available to record',
       body: 'Focus a browser tab and try again.',

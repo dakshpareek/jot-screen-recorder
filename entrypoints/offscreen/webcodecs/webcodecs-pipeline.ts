@@ -3,6 +3,7 @@ import { debugWarn } from '@/lib/runtime-log';
 import {
   VIDEO_ENCODER_PROFILES,
   type WebCodecsEncoderConfig,
+  type WebCodecsAudioConfig,
   type WebCodecsPipelineStats,
   type WebCodecsPipelineOptions,
   type EncoderCapabilityResult,
@@ -100,6 +101,11 @@ export class WebCodecsPipeline {
     this.initializeMemoryPressureBaseline(profile);
 
     const hasAudio = stream.getAudioTracks().length > 0;
+    const audioTracks = stream.getAudioTracks();
+    const resolvedAudioConfig =
+      audioTracks.length > 0
+        ? await this.resolveTrackAudioConfig(audioTracks[0], format.audioEncoderConfig)
+        : format.audioEncoderConfig;
     const useOpfsStream = Boolean(this.options.opfsPersist);
 
     const muxerCallbacks = {
@@ -132,8 +138,8 @@ export class WebCodecsPipeline {
           height: profile.height,
           framerate: profile.framerate,
           includeAudio: hasAudio,
-          audioSampleRate: format.audioEncoderConfig.sampleRate,
-          audioChannels: format.audioEncoderConfig.numberOfChannels,
+          audioSampleRate: resolvedAudioConfig.sampleRate,
+          audioChannels: resolvedAudioConfig.numberOfChannels,
         },
         muxerCallbacks,
         useOpfsStream,
@@ -146,8 +152,8 @@ export class WebCodecsPipeline {
           framerate: profile.framerate,
           videoMatroskaCodec: matroskaVideoCodecId(format.selectedVideoCodec!),
           includeAudio: hasAudio,
-          audioSampleRate: format.audioEncoderConfig.sampleRate,
-          audioChannels: format.audioEncoderConfig.numberOfChannels,
+          audioSampleRate: resolvedAudioConfig.sampleRate,
+          audioChannels: resolvedAudioConfig.numberOfChannels,
         },
         muxerCallbacks,
         useOpfsStream,
@@ -163,9 +169,8 @@ export class WebCodecsPipeline {
     }
 
     // Set up audio encoder
-    const audioTracks = stream.getAudioTracks();
     if (audioTracks.length > 0) {
-      await this.initAudioEncoder(audioTracks[0], format.audioEncoderConfig);
+      await this.initAudioEncoder(audioTracks[0], resolvedAudioConfig);
       audioTracks[0].addEventListener('ended', () => this.handleTrackEnded('audio'));
     }
 
@@ -333,6 +338,52 @@ export class WebCodecsPipeline {
     this.audioReader = this.audioTrackProcessor.readable.getReader();
   }
 
+  private async resolveTrackAudioConfig(
+    track: MediaStreamTrack,
+    fallback: WebCodecsAudioConfig,
+  ): Promise<WebCodecsAudioConfig> {
+    const settings = track.getSettings() as MediaTrackSettings & {
+      sampleRate?: number;
+      channelCount?: number;
+    };
+    const sampleRate = normalizePositiveInteger(settings.sampleRate) ?? fallback.sampleRate;
+    const numberOfChannels = normalizeChannelCount(settings.channelCount) ?? fallback.numberOfChannels;
+    const bitrate = numberOfChannels <= 1 ? Math.min(fallback.bitrate, 96_000) : fallback.bitrate;
+
+    const candidate: WebCodecsAudioConfig = {
+      codec: fallback.codec,
+      sampleRate,
+      numberOfChannels,
+      bitrate,
+    };
+
+    if (await this.isAudioEncoderConfigSupported(candidate)) {
+      return candidate;
+    }
+
+    if (await this.isAudioEncoderConfigSupported(fallback)) {
+      return fallback;
+    }
+
+    throw new Error(
+      `No supported audio encoder config for track (${sampleRate}Hz, ${numberOfChannels}ch)`,
+    );
+  }
+
+  private async isAudioEncoderConfigSupported(config: WebCodecsAudioConfig): Promise<boolean> {
+    try {
+      const support = await AudioEncoder.isConfigSupported({
+        codec: config.codec,
+        sampleRate: config.sampleRate,
+        numberOfChannels: config.numberOfChannels,
+        bitrate: config.bitrate,
+      });
+      return support.supported === true;
+    } catch {
+      return false;
+    }
+  }
+
   private async processVideoFrames(): Promise<void> {
     if (!this.videoReader || !this.videoEncoder) return;
 
@@ -397,6 +448,18 @@ export class WebCodecsPipeline {
             this.audioEncoder.state !== 'configured' ||
             this.audioEncoder.encodeQueueSize > this.effectiveAudioQueueMax
           ) {
+            continue;
+          }
+
+          if (
+            this.audioEncoderConfig &&
+            (audioData.sampleRate !== this.audioEncoderConfig.sampleRate ||
+              audioData.numberOfChannels !== this.audioEncoderConfig.numberOfChannels)
+          ) {
+            debugWarn(
+              `[WebCodecs] Skipping incompatible audio buffer ${audioData.sampleRate}Hz/${audioData.numberOfChannels}ch ` +
+                `for encoder ${this.audioEncoderConfig.sampleRate}Hz/${this.audioEncoderConfig.numberOfChannels}ch`,
+            );
             continue;
           }
 
@@ -534,4 +597,15 @@ export class WebCodecsPipeline {
   isRunning(): boolean {
     return this.running && !this.stopping;
   }
+}
+
+function normalizePositiveInteger(value: number | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.round(value) : null;
+}
+
+function normalizeChannelCount(value: number | undefined): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return Math.max(1, Math.min(2, Math.round(value)));
 }

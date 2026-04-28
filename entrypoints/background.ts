@@ -51,6 +51,7 @@ type RawDownloadItem = {
 const PREFLIGHT_RESULT_MIN_VISIBLE_MS = 1_500;
 const BLOCKED_TAB_CAPTURE_SCHEMES = ['chrome:', 'chrome-extension:', 'devtools:', 'edge:', 'about:'];
 const BLOCKED_TAB_CAPTURE_HOSTS = new Set(['chromewebstore.google.com']);
+const ACTIVE_TAB_CAPTURE_STATUSES = new Set<chrome.tabCapture.TabCaptureState>(['pending', 'active']);
 
 const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
   micChecked: false,
@@ -655,6 +656,17 @@ async function handleStart(
 
   try {
     const targetTabId = await getStartTargetTabId();
+    const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
+    if (!staleCaptureRecovery.ok) {
+      errorMessage = formatCodedStartError(
+        'TAB_CAPTURE_ACTIVE',
+        'Chrome still has an active capture attached to this tab. Stop the current share and try again.',
+        staleCaptureRecovery.detail,
+      );
+      setState('preflight_error');
+      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
+    }
+
     const streamId = await getTabCaptureStreamId(targetTabId);
     if (!streamId) {
       errorMessage = formatCodedStartError(
@@ -784,6 +796,18 @@ async function handlePrepareStart(
 
     setState('preflight');
     const preflightStartedAt = Date.now();
+
+    const targetTabId = await getStartTargetTabId();
+    const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
+    if (!staleCaptureRecovery.ok) {
+      errorMessage = formatCodedStartError(
+        'TAB_CAPTURE_ACTIVE',
+        'Chrome still has an active capture attached to this tab. Stop the current share and try again.',
+        staleCaptureRecovery.detail,
+      );
+      setState('preflight_error');
+      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
+    }
 
     await offscreenClient.ensureReadyWithRetry(delay);
 
@@ -1026,19 +1050,53 @@ async function handleStop() {
 }
 
 async function handleWebCodecsFatalError(errorMsg?: string) {
-  if (!isUsingWebCodecsBackend() || state !== 'recording') {
+  if (!isUsingWebCodecsBackend() || !['recording', 'stopping', 'error'].includes(state)) {
     return { ok: true };
   }
 
   debugWarn('[Background] WebCodecs fatal error, triggering graceful stop:', errorMsg);
-  // Attempt a graceful stop — this will finalize whatever was encoded so far
-  const result = await handleStop();
-  if (!result.ok) {
-    errorMessage = errorMsg ?? 'WebCodecs recording failed unexpectedly';
-    activeEncoderBackend = 'webcodecs';
-    setState('error');
+  try {
+    const status = await offscreenClient.send<{
+      alive?: boolean;
+      isWebCodecsRecording?: boolean;
+    }>({
+      type: RuntimeMessageType.OFFSCREEN_STATUS,
+    });
+
+    if (status?.alive && status.isWebCodecsRecording) {
+      const result = await offscreenClient.send<OffscreenResponse>({
+        type: RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS,
+      });
+
+      if (result?.ok) {
+        outputUrl = result.outputUrl ?? null;
+        outputFileName = result.fileName ?? `${sessionId ?? 'recording'}.mp4`;
+        validation = result.validation ?? null;
+        processingProgress = 100;
+        await persistContext();
+        await broadcastSnapshot();
+        setState('done', { force: true });
+        return { ok: true, snapshot: buildSnapshot() };
+      }
+    }
+  } catch (error) {
+    debugWarn('[Background] Graceful WebCodecs fatal stop failed:', error);
   }
-  return result;
+
+  try {
+    await offscreenClient.send<{ ok?: boolean; error?: string }>({
+      type: RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP,
+    });
+  } catch (error) {
+    debugWarn('[Background] Forced WebCodecs cleanup failed:', error);
+  }
+
+  recordingTabId = null;
+  resetAttemptMetadata();
+  errorMessage = errorMsg ?? 'WebCodecs recording failed unexpectedly';
+  activeEncoderBackend = 'webcodecs';
+  setState('error', { force: true });
+  return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
 }
 
 async function handleDownload() {
@@ -1435,6 +1493,11 @@ async function handleOffscreenEvent(message: OffscreenEventMessage) {
 
   if (message.event === OffscreenEventType.ERROR) {
     errorMessage = message.error ?? 'Offscreen pipeline error';
+    if (isUsingWebCodecsBackend() && ['recording', 'stopping'].includes(state)) {
+      await persistContext();
+      await broadcastSnapshot();
+      return { ok: true };
+    }
     setState('error');
     return { ok: true };
   }
@@ -1614,6 +1677,65 @@ async function getTabCaptureStreamId(targetTabId: number): Promise<string> {
   });
 }
 
+async function getCapturedTabInfo(targetTabId: number): Promise<chrome.tabCapture.CaptureInfo | null> {
+  const capturedTabs = await new Promise<chrome.tabCapture.CaptureInfo[]>((resolve, reject) => {
+    chrome.tabCapture.getCapturedTabs((result) => {
+      const runtimeError = chrome.runtime.lastError;
+      if (runtimeError) {
+        reject(new Error(runtimeError.message));
+        return;
+      }
+      resolve(Array.isArray(result) ? result : []);
+    });
+  });
+
+  return (
+    capturedTabs.find(
+      (item) => item.tabId === targetTabId && ACTIVE_TAB_CAPTURE_STATUSES.has(item.status),
+    ) ?? null
+  );
+}
+
+async function releaseStaleTabCapture(targetTabId: number): Promise<{ ok: boolean; detail?: string }> {
+  const activeCapture = await getCapturedTabInfo(targetTabId);
+  if (!activeCapture) {
+    return { ok: true };
+  }
+
+  debugWarn('[Background] Detected stale tab capture, attempting cleanup', activeCapture);
+
+  try {
+    await offscreenClient.ensureReadyWithRetry(delay);
+    await offscreenClient.send<{ ok?: boolean; error?: string }>({
+      type: RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP,
+    });
+  } catch (error) {
+    debugWarn('[Background] Offscreen force cleanup failed:', error);
+  }
+
+  await delay(250);
+  if (!(await getCapturedTabInfo(targetTabId))) {
+    return { ok: true };
+  }
+
+  try {
+    await offscreenClient.forceResetDocument();
+  } catch (error) {
+    debugWarn('[Background] Offscreen document reset failed:', error);
+  }
+
+  await delay(400);
+  const remainingCapture = await getCapturedTabInfo(targetTabId);
+  if (!remainingCapture) {
+    return { ok: true };
+  }
+
+  return {
+    ok: false,
+    detail: `Capture state is still "${remainingCapture.status}".`,
+  };
+}
+
 function formatCodedStartError(code: string, message: string, detail?: string | null) {
   const nextDetail = typeof detail === 'string' ? detail.trim() : '';
   if (!nextDetail) {
@@ -1655,6 +1777,18 @@ function normalizeStartFailureMessage(rawMessage: string | null | undefined) {
     return formatCodedStartError(
       'TAB_CAPTURE_START_FAILED',
       'Could not attach to the current tab. Refresh the tab and try again.',
+      raw,
+    );
+  }
+
+  if (
+    lower.includes('active stream') ||
+    lower.includes('already being captured') ||
+    lower.includes('capture attached to this tab')
+  ) {
+    return formatCodedStartError(
+      'TAB_CAPTURE_ACTIVE',
+      'Chrome still has an active capture attached to this tab.',
       raw,
     );
   }
