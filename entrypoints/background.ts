@@ -51,10 +51,7 @@ type RawDownloadItem = {
 const PREFLIGHT_RESULT_MIN_VISIBLE_MS = 1_500;
 const BLOCKED_TAB_CAPTURE_SCHEMES = ['chrome:', 'chrome-extension:', 'devtools:', 'edge:', 'about:'];
 const BLOCKED_TAB_CAPTURE_HOSTS = new Set(['chromewebstore.google.com']);
-const ACTIVE_TAB_CAPTURE_STATUSES = new Set<chrome.tabCapture.CaptureInfo['status']>([
-  'pending',
-  'active',
-]);
+const ACTIVE_TAB_CAPTURE_STATUSES = ['pending', 'active'] as const;
 
 const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
   micChecked: false,
@@ -1698,7 +1695,9 @@ async function getCapturedTabInfo(targetTabId: number): Promise<chrome.tabCaptur
 
   return (
     capturedTabs.find(
-      (item) => item.tabId === targetTabId && ACTIVE_TAB_CAPTURE_STATUSES.has(item.status),
+      (item) =>
+        item.tabId === targetTabId &&
+        ACTIVE_TAB_CAPTURE_STATUSES.includes(item.status as (typeof ACTIVE_TAB_CAPTURE_STATUSES)[number]),
     ) ?? null
   );
 }
