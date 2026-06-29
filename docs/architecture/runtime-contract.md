@@ -103,3 +103,9 @@ Quality preset fields:
 - FFmpeg remains a cold-path dependency for processing/recovery/transcode paths.
 - Recording start/happy-path capture does not prewarm FFmpeg.
 - `ffmpeg.load()` should only occur from cold paths that require FFmpeg execution.
+
+## Test Control Plane
+- `TEST_*` runtime messages are test-only and are documented separately in
+  `docs/architecture/test-control-plane.md`.
+- They are gated behind the background control-plane flag and are not part of
+  the user-facing popup contract.

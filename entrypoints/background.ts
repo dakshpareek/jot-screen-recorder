@@ -45,6 +45,11 @@ import {
   normalizeSystemAudioStatus,
   toErrorMessage,
 } from './background/utils';
+import {
+  getTestActiveTabFixture,
+  handleTestControlPlaneMessage,
+  installTestControlPlaneDebugHook,
+} from './background/testing/control-plane';
 
 type RawDownloadItem = {
   url: string;
@@ -91,8 +96,15 @@ let webCodecsStats: RecordingSnapshot['webCodecsStats'] = null;
 const offscreenClient = new OffscreenClient();
 
 export default defineBackground(() => {
+  installTestControlPlaneDebugHook(buildSnapshot, () => outputFileName);
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message?.type) return;
+
+    if (typeof message.type === 'string' && message.type.startsWith('TEST_')) {
+      void handleTestControlPlaneMessage(message, buildSnapshot, () => outputFileName).then(sendResponse);
+      return true;
+    }
 
     if (message.type === RuntimeMessageType.GET_STATE) {
       sendResponse(buildSnapshot());
@@ -1659,6 +1671,18 @@ async function runProcessingPipeline(options?: {
 }
 
 async function getStartTargetTab(options?: { validateCapturable?: boolean }) {
+  const testActiveTab = getTestActiveTabFixture();
+  if (testActiveTab) {
+    if (options?.validateCapturable !== false && typeof testActiveTab.url === 'string' && testActiveTab.url.trim()) {
+      const capturable = isTabUrlCapturable(testActiveTab.url);
+      if (!capturable.ok) {
+        throw new Error(formatCodedStartError(capturable.code, capturable.message, testActiveTab.url));
+      }
+    }
+
+    return testActiveTab as chrome.tabs.Tab;
+  }
+
   const [activeTab] = await chrome.tabs.query({
     active: true,
     lastFocusedWindow: true,

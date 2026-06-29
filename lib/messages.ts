@@ -9,6 +9,10 @@ export const RuntimeMessageType = {
   GET_STATE: 'GET_STATE',
   STATE_CHANGE: 'STATE_CHANGE',
 
+  TEST_GET_SNAPSHOT: 'TEST_GET_SNAPSHOT',
+  TEST_GET_LAST_FILENAME: 'TEST_GET_LAST_FILENAME',
+  TEST_SET_ACTIVE_TAB: 'TEST_SET_ACTIVE_TAB',
+
   START: 'START',
   PREPARE_START: 'PREPARE_START',
   RUN_MIC_CHECK: 'RUN_MIC_CHECK',
@@ -149,4 +153,18 @@ export type CommandResponse = {
   ok?: boolean;
   error?: string;
   snapshot?: RecordingSnapshot;
+} | null;
+
+export type TestActiveTabFixture = {
+  id: number;
+  title?: string | null;
+  url?: string | null;
+};
+
+export type TestControlPlaneResponse = {
+  ok?: boolean;
+  error?: string;
+  snapshot?: RecordingSnapshot;
+  outputFileName?: string | null;
+  activeTab?: TestActiveTabFixture | null;
 } | null;

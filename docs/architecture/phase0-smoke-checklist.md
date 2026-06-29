@@ -2,6 +2,8 @@
 
 Run this checklist after any runtime refactor. This is intentionally lightweight and manual.
 
+For the current headed-browser runbook, see [docs/testing/agent-browser-smoke.md](../testing/agent-browser-smoke.md).
+
 ## Preconditions
 - Chrome extension loads successfully.
 - Popup opens and shows `idle` state.

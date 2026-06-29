@@ -1,6 +1,7 @@
 # test-jot skill
 
-Start a headed Chrome session with the Jot extension loaded from `dist/`,
+Start a headed Chrome session with the Jot extension loaded from
+`.output/chrome-mv3`,
 ready to test on any URL. Use this whenever you need to verify Jot features
 in a real browser without the user manually installing anything.
 
@@ -86,10 +87,10 @@ agent-browser --session jot screenshot /tmp/jot.png
 
 The current browser-UI flow is intentionally thin. Most of the complex
 verification should move to the test control plane described in
-`docs/architecture/test-control-plane.md` once we decide to implement it.
+`docs/architecture/test-control-plane.md` and the runbooks in `docs/testing/`.
 
-That control plane would let us test the same flows directly, with less
-reliance on popup clicks, permission prompts, and native dialogs.
+Use `docs/testing/agent-browser-smoke.md` for headed-browser smoke and
+`docs/testing/control-plane-repl.md` for the live DevTools REPL loop.
 
 If Chrome reports `Failed to load extension from: . Manifest file is missing or unreadable`,
 the extension path is wrong. Rebuild with `pnpm build` and point `agent-browser`

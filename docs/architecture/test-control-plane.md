@@ -1,70 +1,62 @@
 # Test Control Plane
 
-This document captures the idea of a direct test control plane for Jot.
-The goal is to reduce browser-UI flake by letting automated tests invoke
-extension flows directly instead of depending on popup clicks, permission
-prompts, and native dialogs.
+This document captures the test-only control plane now wired into Jot's
+background worker.
 
-## Why this exists
+## Summary
 
-The current extension has a lot of behavior that is hard to observe through
-browser automation alone:
+The control plane is a background-worker message path that lets automated tests
+read recorder state and inject a small amount of fixture data without clicking
+through the popup UI.
 
-- popup UI is a thin shell over background state
-- recording flows span background, offscreen, OPFS, and downloads
-- permissions and capture prompts are browser-native
-- save dialogs are outside the web DOM
-- service workers and offscreen documents can be restarted by Chrome
+## File Layout
 
-A control plane gives tests a deterministic way to:
+- `entrypoints/background.ts`
+  - routes `TEST_*` runtime messages into the control plane
+  - reads the test tab fixture when resolving the active capture target
+- `entrypoints/background/testing/control-plane.ts`
+  - owns the test-only fixture state
+  - handles `TEST_GET_SNAPSHOT`, `TEST_GET_LAST_FILENAME`, and `TEST_SET_ACTIVE_TAB`
+- `entrypoints/background/testing/gate.ts`
+  - central gate for enabling the control plane
+  - defaults to `import.meta.env.MODE !== 'production'`
+  - also allows a console override through `globalThis.__JOT_TEST_CONTROL_PLANE_ENABLED__`
+- `lib/messages.ts`
+  - defines the shared `TEST_*` message constants and control-plane response types
+- `tests/background-test-control-plane.test.ts`
+  - focused coverage for the control plane and restart semantics
 
-- start and stop recordings
-- read current state snapshots
-- inspect resolved filenames and raw export paths
-- inject fixtures for capture, permissions, and tab metadata
-- verify recovery and orphan flows without UI timing noise
+## Behavior
 
-## Recommended Shape
+- `TEST_GET_SNAPSHOT` returns the live background snapshot.
+- `TEST_GET_LAST_FILENAME` returns the resolved public output filename, or
+  `null` before a recording has produced one.
+- `TEST_SET_ACTIVE_TAB` installs a test-only active-tab fixture used by
+  `getStartTargetTab()` when a recording flow needs a stable title and URL.
+- The control plane is disabled in production builds by default.
+- The current implementation treats `outputFileName` as persisted state, so
+  `TEST_GET_LAST_FILENAME` rehydrates after a background-worker restart if the
+  previous session saved one.
+- In DevTools, you can flip the live worker on with
+  `globalThis.__JOT_TEST_CONTROL_PLANE_ENABLED__ = true`, then call
+  `globalThis.__JOT_TEST_CONTROL_PLANE__.send({ type: "TEST_GET_SNAPSHOT" })`
+  or any other `TEST_*` message from the service-worker console.
 
-Prefer a test-only control plane inside the extension rather than a public
-network API.
+## Testing Notes
 
-### Preferred interface
-
-- runtime messages handled by the background service worker
-- enabled only in dev builds or behind a test flag
-- read/write commands for test fixtures and snapshots
-- explicit responses for filename, state, and download metadata
-
-### Example commands
-
-- `TEST_GET_SNAPSHOT`
-- `TEST_SET_ACTIVE_TAB`
-- `TEST_SET_PERMISSION_STATE`
-- `TEST_SET_CAPTURE_FIXTURE`
-- `TEST_START_RECORDING`
-- `TEST_STOP_RECORDING`
-- `TEST_DOWNLOAD_OUTPUT`
-- `TEST_DOWNLOAD_RAW`
-- `TEST_SCAN_ORPHANS`
-- `TEST_RECOVER_ORPHAN`
-- `TEST_SET_RECORDER_BACKEND`
-
-### Example readbacks
-
-- current recording snapshot
-- last resolved export base name
-- last resolved output filename
-- last raw export base name
-- last download request
-- orphan session list
-- validation result
+- Keep the main control-plane tests in one file.
+- Prefer a high-fidelity `chrome.runtime.sendMessage` mock that still routes
+  through the registered background listener.
+- Mock the offscreen client at the message boundary, not by bypassing the
+  background worker.
+- For manual usage, see [docs/testing/control-plane-repl.md](../testing/control-plane-repl.md).
+- For headed-browser smoke, see [docs/testing/agent-browser-smoke.md](../testing/agent-browser-smoke.md).
 
 ## What stays UI-tested
 
 The control plane should not replace all browser testing.
 
-Keep a thin browser UI lane for:
+Keep a thin headed-browser lane for:
 
 - popup opens and renders
 - start/stop buttons still bind
@@ -72,37 +64,14 @@ Keep a thin browser UI lane for:
 - recovery UI still appears
 - downloads still trigger in a real Chrome session
 
-That means the automated suite becomes:
+## Current Scope
 
-1. unit tests for pure logic
-2. control-plane tests for most extension behavior
-3. one or two headed browser smoke checks for real integration
+Block 1 is intentionally small:
 
-## What to avoid
+1. gate the control plane
+2. read back the live snapshot
+3. read back the last filename
+4. inject only the active-tab fixture needed for deterministic filename tests
 
-- Do not make this a public network API unless there is a real product need.
-- Do not depend on Save As dialog text for the main test assertions.
-- Do not require real microphone permission for every automated run.
-- Do not let the test harness infer state only from screenshots.
-
-## Adoption Path
-
-If we decide to build this later, I would do it in phases:
-
-1. add a test flag and runtime message handler
-2. expose snapshot and filename readbacks first
-3. add fixture injection for tab metadata and permissions
-4. add controlled recording start/stop commands
-5. add raw export and recovery commands
-6. keep a minimal agent-browser UI smoke lane alongside it
-
-## Decision Points
-
-Pick one of these before implementing:
-
-- UI-only skill: simplest to start, most brittle
-- Control-plane-only: most deterministic, but loses real browser coverage
-- Hybrid: best balance for this extension
-
-For Jot, the hybrid path is the best fit.
-
+Later blocks can add permission fixtures, capture fixtures, start/stop helpers,
+and orphan/recovery commands once the readback layer is proven stable.
