@@ -16,6 +16,11 @@ const savePersistedContextMock = vi.fn();
 const loadRecorderSettingsMock = vi.fn();
 const saveRecorderSettingsMock = vi.fn();
 const downloadsDownloadMock = vi.fn();
+const storageSessionGetMock = vi.fn();
+const storageSessionSetMock = vi.fn();
+const storageSessionRemoveMock = vi.fn();
+const permissionsQueryMock = vi.fn();
+let sessionStore: Record<string, unknown> = {};
 
 vi.mock('@/entrypoints/background/services/offscreen-client', () => {
   class MockOffscreenClient {
@@ -97,6 +102,11 @@ describe('background start fallback', () => {
     loadRecorderSettingsMock.mockReset();
     saveRecorderSettingsMock.mockReset();
     downloadsDownloadMock.mockReset();
+    storageSessionGetMock.mockReset();
+    storageSessionSetMock.mockReset();
+    storageSessionRemoveMock.mockReset();
+    permissionsQueryMock.mockReset();
+    sessionStore = {};
     onMessageAddListenerMock.mockReset();
     onUpdatedAddListenerMock.mockReset();
     onInstalledAddListenerMock.mockReset();
@@ -127,6 +137,30 @@ describe('background start fallback', () => {
     loadRecorderSettingsMock.mockResolvedValue({ encoderBackend: 'webcodecs' });
     saveRecorderSettingsMock.mockResolvedValue({ encoderBackend: 'webcodecs' });
     downloadsDownloadMock.mockResolvedValue(1);
+    storageSessionGetMock.mockImplementation(async (keys?: string | string[] | Record<string, unknown>) => {
+      if (typeof keys === 'string') {
+        return { [keys]: sessionStore[keys] };
+      }
+      if (Array.isArray(keys)) {
+        return Object.fromEntries(keys.map((key) => [key, sessionStore[key]]));
+      }
+      if (keys && typeof keys === 'object') {
+        return Object.fromEntries(
+          Object.entries(keys).map(([key, defaultValue]) => [key, key in sessionStore ? sessionStore[key] : defaultValue]),
+        );
+      }
+      return { ...sessionStore };
+    });
+    storageSessionSetMock.mockImplementation(async (value: Record<string, unknown>) => {
+      sessionStore = { ...sessionStore, ...value };
+    });
+    storageSessionRemoveMock.mockImplementation(async (keys: string | string[]) => {
+      const removalKeys = Array.isArray(keys) ? keys : [keys];
+      for (const key of removalKeys) {
+        delete sessionStore[key];
+      }
+    });
+    permissionsQueryMock.mockResolvedValue({ state: 'granted' });
     offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
       if (message.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
         return { ok: true, sessions: [] };
@@ -143,6 +177,9 @@ describe('background start fallback', () => {
             usage: 100_000_000,
           }),
         },
+        permissions: {
+          query: permissionsQueryMock,
+        },
       },
       configurable: true,
       writable: true,
@@ -158,6 +195,13 @@ describe('background start fallback', () => {
         },
         sendMessage: runtimeSendMessageMock,
         lastError: undefined,
+      },
+      storage: {
+        session: {
+          get: storageSessionGetMock,
+          set: storageSessionSetMock,
+          remove: storageSessionRemoveMock,
+        },
       },
       tabs: {
         onUpdated: {
@@ -251,6 +295,89 @@ describe('background start fallback', () => {
     expect(start?.snapshot?.state).toBe('preflight_error');
     expect(start?.error).toContain('WebCodecs start failed (wc failed)');
     expect(start?.error).toContain('MediaRecorder fallback also failed: legacy failed');
+  });
+
+  it('honors the prompt permission fixture during mic checks', async () => {
+    sessionStore['jot-test-permission-fixture'] = { microphone: 'prompt' };
+    await bootBackground();
+    offscreenSendMock.mockClear();
+
+    offscreenSendMock.mockImplementation(async (message: { type?: string; permissionState?: string }) => {
+      if (message.type === RuntimeMessageType.MIC_PREFLIGHT) {
+        return message.permissionState === 'prompt'
+          ? { ok: false, error: 'MIC_PERMISSION_PROMPT' }
+          : { ok: false, error: 'MIC_PERMISSION_DENIED' };
+      }
+      return { ok: true };
+    });
+
+    const micCheck = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.RUN_MIC_CHECK,
+    })) as { ok?: boolean; error?: string; snapshot?: { audioPreflight?: { micError?: string } } };
+
+    expect(micCheck?.ok).toBe(false);
+    expect(micCheck?.error).toBe('MIC_PERMISSION_PROMPT');
+    expect(micCheck?.snapshot?.audioPreflight?.micError).toBe('MIC_PERMISSION_PROMPT');
+    expect(offscreenSendMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: RuntimeMessageType.MIC_PREFLIGHT,
+        permissionState: 'prompt',
+      }),
+    );
+  });
+
+  it('reacquires tab capture before retrying MediaRecorder fallback', async () => {
+    tabCaptureGetMediaStreamIdMock
+      .mockImplementationOnce((_options: unknown, callback: (streamId: string) => void) => {
+        callback('stream-webcodecs');
+      })
+      .mockImplementationOnce((_options: unknown, callback: (streamId: string) => void) => {
+        callback('stream-mediarecorder');
+      });
+
+    await bootBackground();
+    offscreenSendMock.mockClear();
+
+    offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
+      if (message.type === RuntimeMessageType.OFFSCREEN_START_WEBCODECS) {
+        return { ok: false, error: 'webcodecs attach failed' };
+      }
+      if (message.type === RuntimeMessageType.OFFSCREEN_START) {
+        return { ok: true, requestedPreset: 'auto', resolvedPreset: '1080p30' };
+      }
+      return { ok: true };
+    });
+
+    const prep = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.PREPARE_START,
+      includeMic: false,
+      quality: 'auto',
+    })) as { ok?: boolean };
+    expect(prep?.ok).toBe(true);
+
+    const start = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.START,
+      audioSource: 'tab',
+      quality: 'auto',
+    })) as { ok?: boolean; snapshot?: { state?: string } };
+
+    expect(start?.ok).toBe(true);
+    expect(start?.snapshot?.state).toBe('recording');
+    expect(tabCaptureGetMediaStreamIdMock).toHaveBeenCalledTimes(2);
+    expect(offscreenSendMock).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS,
+        streamId: 'stream-webcodecs',
+      }),
+    );
+    expect(offscreenSendMock).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        type: RuntimeMessageType.OFFSCREEN_START,
+        streamId: 'stream-mediarecorder',
+      }),
+    );
   });
 
   it('returns explicit tab-not-capturable error for browser-internal pages', async () => {

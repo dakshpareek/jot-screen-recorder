@@ -121,6 +121,34 @@ export function MicToggleCard({
               </div>
             )}
 
+            {status === 'prompt' && (
+              <div className="jot-mic-error">
+                <div className="jot-mic-error-title">Microphone permission requested</div>
+                <div className="jot-mic-error-body">
+                  Chrome asked for microphone access. Allow it when prompted, then retry.
+                </div>
+                <div className="jot-mic-error-btns">
+                  <button className="jot-mic-error-btn" onClick={() => void runCheck()}>
+                    Retry
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {status === 'aborted' && (
+              <div className="jot-mic-error">
+                <div className="jot-mic-error-title">Microphone prompt dismissed</div>
+                <div className="jot-mic-error-body">
+                  The request was interrupted. Reopen the popup and try again.
+                </div>
+                <div className="jot-mic-error-btns">
+                  <button className="jot-mic-error-btn" onClick={() => void runCheck()}>
+                    Retry
+                  </button>
+                </div>
+              </div>
+            )}
+
             {status === 'denied' && (
               <div className="jot-mic-error">
                 <div className="jot-mic-error-title">Microphone permission blocked</div>

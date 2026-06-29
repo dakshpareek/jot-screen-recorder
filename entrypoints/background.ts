@@ -45,6 +45,7 @@ import {
   normalizeSystemAudioStatus,
   toErrorMessage,
 } from './background/utils';
+import { resolveMicrophonePermissionState } from '@/lib/testing/permission-fixture';
 import {
   getTestActiveTabFixture,
   handleTestControlPlaneMessage,
@@ -683,7 +684,7 @@ async function handleStart(
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
     }
 
-    const streamId = await getTabCaptureStreamId(targetTabId);
+    let streamId = await getTabCaptureStreamId(targetTabId);
     if (!streamId) {
       errorMessage = formatCodedStartError(
         'TAB_CAPTURE_STREAM_UNAVAILABLE',
@@ -733,6 +734,36 @@ async function handleStart(
           webCodecsError = webCodecsResult?.error ?? 'Unknown WebCodecs start failure';
           debugWarn('[Background] WebCodecs start failed; falling back to MediaRecorder:', webCodecsError);
           activeEncoderBackend = 'mediarecorder';
+          const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
+          if (!staleCaptureRecovery.ok) {
+            result = {
+              ok: false,
+              error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${staleCaptureRecovery.detail ?? 'Unable to release stale tab capture'}`,
+            };
+          } else {
+            streamId = await getTabCaptureStreamId(targetTabId);
+            const fallback = await startMediaRecorder();
+            result =
+              fallback?.ok || !fallback
+                ? fallback
+                : {
+                    ...fallback,
+                    error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${fallback.error ?? 'Unknown fallback failure'}`,
+                  };
+          }
+        }
+      } catch (error) {
+        webCodecsError = toErrorMessage(error);
+        debugWarn('[Background] WebCodecs start threw; falling back to MediaRecorder:', webCodecsError);
+        activeEncoderBackend = 'mediarecorder';
+        const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
+        if (!staleCaptureRecovery.ok) {
+          result = {
+            ok: false,
+            error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${staleCaptureRecovery.detail ?? 'Unable to release stale tab capture'}`,
+          };
+        } else {
+          streamId = await getTabCaptureStreamId(targetTabId);
           const fallback = await startMediaRecorder();
           result =
             fallback?.ok || !fallback
@@ -742,18 +773,6 @@ async function handleStart(
                   error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${fallback.error ?? 'Unknown fallback failure'}`,
                 };
         }
-      } catch (error) {
-        webCodecsError = toErrorMessage(error);
-        debugWarn('[Background] WebCodecs start threw; falling back to MediaRecorder:', webCodecsError);
-        activeEncoderBackend = 'mediarecorder';
-        const fallback = await startMediaRecorder();
-        result =
-          fallback?.ok || !fallback
-            ? fallback
-            : {
-                ...fallback,
-                error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${fallback.error ?? 'Unknown fallback failure'}`,
-              };
       }
     } else {
       result = await startMediaRecorder();
@@ -895,9 +914,13 @@ async function handlePrepareStart(
 
 async function runMicPreflight(micDeviceId: string | null = null): Promise<MicPreflightResponse> {
   try {
+    const permissionState = await resolveMicrophonePermissionState();
     const payload: Record<string, unknown> = { type: RuntimeMessageType.MIC_PREFLIGHT };
     if (micDeviceId) {
       payload.micDeviceId = micDeviceId;
+    }
+    if (permissionState) {
+      payload.permissionState = permissionState;
     }
     const result = await offscreenClient.send<MicPreflightResponse>(payload);
     if (!result?.ok) {

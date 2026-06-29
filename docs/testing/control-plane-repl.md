@@ -26,6 +26,11 @@ agent-browser --session jot --headed --extension /Users/dakshpareek/personal-pro
 That browser-profile step is only needed for inspection. You do not need to
 manually install the extension from the extensions page for the normal smoke
 path.
+If you are using `agent-browser`, keep using the same Chrome profile so the
+one-time Developer mode toggle sticks.
+If the DevTools worker inspector is flaky, use
+[CDP Service Worker Console](./cdp-service-worker-console.md) as the fallback
+debug path.
 
 ## Enable the control plane
 
@@ -80,14 +85,70 @@ await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
 });
 ```
 
+## Seed the permission fixture
+
+Reset first so the console session starts from a known baseline:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_RESET_TEST_FIXTURES",
+});
+```
+
+Set the mic permission fixture:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_SET_PERMISSION_STATE",
+  permissionState: {
+    microphone: "prompt",
+  },
+});
+```
+
+Read it back:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_GET_PERMISSION_STATE",
+});
+```
+
+To verify the actual mic preflight path, trigger the runtime check directly:
+
+```js
+await chrome.runtime.sendMessage({
+  type: "RUN_MIC_CHECK",
+});
+```
+
+With the fixture set to `prompt` or `denied`, the response should surface the
+corresponding mic error without needing to click through the popup first.
+
+`prompt` and `denied` are now distinct in the popup:
+
+- `prompt` shows a pending-permission state
+- `denied` shows the blocked-state copy
+- `aborted` means the permission request was interrupted, which is common when the
+  popup loses focus
+
+For automated "granted" path checks, launch Chrome with:
+
+```bash
+--use-fake-device-for-media-stream --use-fake-ui-for-media-stream
+```
+
+That gives the browser a mic device and auto-accepts the prompt, which makes the
+recording path deterministic. Keep the native prompt as a manual QA check.
+
 ## Typical block-1 loop
 
 1. Enable the control plane.
 2. Read the initial snapshot.
-3. Seed the tab fixture.
-4. Start and stop a real recording from the popup.
-5. Read `TEST_GET_LAST_FILENAME` again.
-6. Confirm the persisted filename matches the stem you expected.
+3. Reset and seed the tab and permission fixtures.
+4. Run the relevant runtime message or popup action.
+5. Read back the snapshot or permission state again.
+6. Confirm the result matches the expected fixture-driven outcome.
 
 ## Teardown
 

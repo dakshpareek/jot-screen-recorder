@@ -486,6 +486,12 @@ export function PreflightErrorScreen({
       action: 'Grant microphone access',
       status: 'Permission prompt pending',
     },
+    MIC_PERMISSION_ABORTED: {
+      title: 'Microphone prompt dismissed',
+      body: 'The permission request was interrupted. Reopen the popup and try again.',
+      action: 'Try again',
+      status: 'Permission prompt dismissed',
+    },
     MIC_NOT_FOUND: {
       title: 'No microphone detected',
       body: 'No microphone was found. Please connect a microphone and try again.',
@@ -567,8 +573,10 @@ export function PreflightErrorScreen({
         stream.getTracks().forEach((t) => t.stop());
         onRetry();
       } catch {
-        // permission still denied
+        onRetry();
       }
+    } else if (isMicSpecificError && micError === 'MIC_PERMISSION_ABORTED') {
+      onRetry();
     } else {
       onRetry();
     }

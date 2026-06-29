@@ -11,6 +11,9 @@ const savePersistedContextMock = vi.fn();
 const loadRecorderSettingsMock = vi.fn();
 const saveRecorderSettingsMock = vi.fn();
 const downloadsDownloadMock = vi.fn();
+const storageSessionGetMock = vi.fn();
+const storageSessionSetMock = vi.fn();
+const storageSessionRemoveMock = vi.fn();
 
 vi.mock('@/entrypoints/background/services/offscreen-client', () => {
   class MockOffscreenClient {
@@ -43,6 +46,7 @@ vi.mock('@/entrypoints/background/state/persisted-context', () => ({
 describe('background test control plane', () => {
   let runtimeListener: ((message: unknown, sender: chrome.runtime.MessageSender, sendResponse: (response?: unknown) => void) => boolean | void) | null = null;
   let persistedContextStore: PersistedContext | undefined;
+  let sessionStore: Record<string, unknown>;
 
   const onMessageAddListenerMock = vi.fn();
   const onUpdatedAddListenerMock = vi.fn();
@@ -98,6 +102,7 @@ describe('background test control plane', () => {
     delete (globalThis as { __JOT_TEST_CONTROL_PLANE_ENABLED__?: boolean }).__JOT_TEST_CONTROL_PLANE_ENABLED__;
     runtimeListener = null;
     persistedContextStore = undefined;
+    sessionStore = {};
 
     offscreenSendMock.mockReset();
     ensureReadyMock.mockReset();
@@ -106,6 +111,9 @@ describe('background test control plane', () => {
     loadRecorderSettingsMock.mockReset();
     saveRecorderSettingsMock.mockReset();
     downloadsDownloadMock.mockReset();
+    storageSessionGetMock.mockReset();
+    storageSessionSetMock.mockReset();
+    storageSessionRemoveMock.mockReset();
     onMessageAddListenerMock.mockReset();
     onUpdatedAddListenerMock.mockReset();
     onInstalledAddListenerMock.mockReset();
@@ -154,6 +162,32 @@ describe('background test control plane', () => {
     loadRecorderSettingsMock.mockResolvedValue({ encoderBackend: 'webcodecs' });
     saveRecorderSettingsMock.mockResolvedValue({ encoderBackend: 'webcodecs' });
     downloadsDownloadMock.mockResolvedValue(1);
+    storageSessionGetMock.mockImplementation(async (keys?: string | string[] | Record<string, unknown>) => {
+      if (typeof keys === 'string') {
+        return { [keys]: sessionStore[keys] };
+      }
+
+      if (Array.isArray(keys)) {
+        return Object.fromEntries(keys.map((key) => [key, sessionStore[key]]));
+      }
+
+      if (keys && typeof keys === 'object') {
+        return Object.fromEntries(
+          Object.entries(keys).map(([key, defaultValue]) => [key, key in sessionStore ? sessionStore[key] : defaultValue]),
+        );
+      }
+
+      return { ...sessionStore };
+    });
+    storageSessionSetMock.mockImplementation(async (value: Record<string, unknown>) => {
+      sessionStore = { ...sessionStore, ...value };
+    });
+    storageSessionRemoveMock.mockImplementation(async (keys: string | string[]) => {
+      const removalKeys = Array.isArray(keys) ? keys : [keys];
+      for (const key of removalKeys) {
+        delete sessionStore[key];
+      }
+    });
     offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
       if (message.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
         return { ok: true, sessions: [] };
@@ -175,10 +209,15 @@ describe('background test control plane', () => {
     (globalThis as { defineBackground?: unknown }).defineBackground = (callback: () => void) => callback();
     Object.defineProperty(globalThis, 'navigator', {
       value: {
-        storage: {
-          estimate: vi.fn().mockResolvedValue({
-            quota: 10_000_000_000,
-            usage: 100_000_000,
+      storage: {
+        session: {
+          get: storageSessionGetMock,
+          set: storageSessionSetMock,
+          remove: storageSessionRemoveMock,
+        },
+        estimate: vi.fn().mockResolvedValue({
+          quota: 10_000_000_000,
+          usage: 100_000_000,
           }),
         },
       },
@@ -217,6 +256,13 @@ describe('background test control plane', () => {
       },
       downloads: {
         download: downloadsDownloadMock,
+      },
+      storage: {
+        session: {
+          get: storageSessionGetMock,
+          set: storageSessionSetMock,
+          remove: storageSessionRemoveMock,
+        },
       },
     };
   });
@@ -341,5 +387,119 @@ describe('background test control plane', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('reads, persists, and resets microphone permission fixtures through the control plane', async () => {
+    await bootBackground();
+
+    const initial = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_GET_PERMISSION_STATE,
+    })) as {
+      ok?: boolean;
+      permissionState?: { microphone?: string };
+      activeTab?: { id?: number } | null;
+    };
+
+    expect(initial?.ok).toBe(true);
+    expect(initial?.permissionState?.microphone).toBe('unset');
+    expect(initial?.activeTab).toBeNull();
+
+    const setPermission = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_SET_PERMISSION_STATE,
+      permissionState: {
+        microphone: 'prompt',
+      },
+    })) as {
+      ok?: boolean;
+      permissionState?: { microphone?: string };
+      activeTab?: { id?: number } | null;
+    };
+
+    expect(setPermission?.ok).toBe(true);
+    expect(setPermission?.permissionState?.microphone).toBe('prompt');
+    expect(setPermission?.activeTab).toBeNull();
+
+    const setActiveTab = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_SET_ACTIVE_TAB,
+      tab: {
+        id: 101,
+        title: 'Example Domain',
+        url: 'https://example.com/',
+      },
+    })) as {
+      ok?: boolean;
+      activeTab?: { id?: number } | null;
+    };
+
+    expect(setActiveTab?.ok).toBe(true);
+    expect(setActiveTab?.activeTab?.id).toBe(101);
+
+    const afterSet = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_GET_PERMISSION_STATE,
+    })) as {
+      ok?: boolean;
+      permissionState?: { microphone?: string };
+      activeTab?: { id?: number; title?: string | null } | null;
+    };
+
+    expect(afterSet?.ok).toBe(true);
+    expect(afterSet?.permissionState?.microphone).toBe('prompt');
+    expect(afterSet?.activeTab?.id).toBe(101);
+
+    vi.resetModules();
+    runtimeListener = null;
+    (globalThis as { __JOT_TEST_CONTROL_PLANE_ENABLED__?: boolean }).__JOT_TEST_CONTROL_PLANE_ENABLED__ = true;
+    await bootBackground();
+
+    const rehydrated = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_GET_PERMISSION_STATE,
+    })) as {
+      ok?: boolean;
+      permissionState?: { microphone?: string };
+      activeTab?: { id?: number } | null;
+    };
+
+    expect(rehydrated?.ok).toBe(true);
+    expect(rehydrated?.permissionState?.microphone).toBe('prompt');
+    expect(rehydrated?.activeTab).toBeNull();
+
+    const reloadedActiveTab = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_SET_ACTIVE_TAB,
+      tab: {
+        id: 202,
+        title: 'Google',
+        url: 'https://google.com/',
+      },
+    })) as {
+      ok?: boolean;
+      activeTab?: { id?: number } | null;
+    };
+
+    expect(reloadedActiveTab?.ok).toBe(true);
+    expect(reloadedActiveTab?.activeTab?.id).toBe(202);
+
+    const reset = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_RESET_TEST_FIXTURES,
+    })) as {
+      ok?: boolean;
+      permissionState?: { microphone?: string };
+      activeTab?: { id?: number } | null;
+    };
+
+    expect(reset?.ok).toBe(true);
+    expect(reset?.permissionState?.microphone).toBe('unset');
+    expect(reset?.activeTab).toBeNull();
+
+    const afterReset = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_GET_PERMISSION_STATE,
+    })) as {
+      ok?: boolean;
+      permissionState?: { microphone?: string };
+      activeTab?: { id?: number } | null;
+    };
+
+    expect(afterReset?.ok).toBe(true);
+    expect(afterReset?.permissionState?.microphone).toBe('unset');
+    expect(afterReset?.activeTab).toBeNull();
   });
 });

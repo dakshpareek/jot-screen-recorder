@@ -12,6 +12,9 @@ export const RuntimeMessageType = {
   TEST_GET_SNAPSHOT: 'TEST_GET_SNAPSHOT',
   TEST_GET_LAST_FILENAME: 'TEST_GET_LAST_FILENAME',
   TEST_SET_ACTIVE_TAB: 'TEST_SET_ACTIVE_TAB',
+  TEST_GET_PERMISSION_STATE: 'TEST_GET_PERMISSION_STATE',
+  TEST_SET_PERMISSION_STATE: 'TEST_SET_PERMISSION_STATE',
+  TEST_RESET_TEST_FIXTURES: 'TEST_RESET_TEST_FIXTURES',
 
   START: 'START',
   PREPARE_START: 'PREPARE_START',
@@ -114,6 +117,12 @@ export type MicPreflightResponse = {
   error?: string;
 };
 
+export type MicPreflightMessage = {
+  type: typeof RuntimeMessageType.MIC_PREFLIGHT;
+  micDeviceId?: string | null;
+  permissionState?: TestPermissionState | PermissionState | null;
+};
+
 export type RecoveryInspectResponse = {
   ok: boolean;
   error?: string;
@@ -161,10 +170,17 @@ export type TestActiveTabFixture = {
   url?: string | null;
 };
 
+export type TestPermissionState = 'unset' | 'prompt' | 'granted' | 'denied';
+
+export type TestPermissionFixture = {
+  microphone: TestPermissionState;
+};
+
 export type TestControlPlaneResponse = {
   ok?: boolean;
   error?: string;
   snapshot?: RecordingSnapshot;
   outputFileName?: string | null;
   activeTab?: TestActiveTabFixture | null;
+  permissionState?: TestPermissionFixture;
 } | null;

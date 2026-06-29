@@ -10,7 +10,9 @@ import {
   type AudioSource,
   type CaptureQuality,
   type CaptureResolvedQuality,
+  type MicPreflightMessage,
   type OffscreenEventTypeValue,
+  type TestPermissionState,
 } from '@/lib/messages';
 import { debugInfo, debugWarn } from '@/lib/runtime-log';
 import {
@@ -36,6 +38,7 @@ import {
   buildDownloadFileName,
   buildRawExportBaseName,
 } from './background/utils';
+import { classifyMicPermissionRequestError } from '@/lib/testing/mic-permission';
 
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
@@ -132,7 +135,8 @@ export default defineUnlistedScript(() => {
     }
 
     if (msg.type === RuntimeMessageType.MIC_PREFLIGHT) {
-      void runMicPreflight(normalizeMicDeviceId(msg.micDeviceId)).then(sendResponse);
+      const permissionState = normalizeMicPermissionState((msg as MicPreflightMessage).permissionState);
+      void runMicPreflight(normalizeMicDeviceId(msg.micDeviceId), permissionState).then(sendResponse);
       return true;
     }
 
@@ -1288,14 +1292,33 @@ export default defineUnlistedScript(() => {
     }
   }
 
-  async function runMicPreflight(micDeviceId: string | null = null) {
+  function normalizeMicPermissionState(
+    value: unknown,
+  ): TestPermissionState | PermissionState | null {
+    if (
+      value === 'unset' ||
+      value === 'prompt' ||
+      value === 'granted' ||
+      value === 'denied'
+    ) {
+      return value;
+    }
+    return null;
+  }
+
+  async function runMicPreflight(
+    micDeviceId: string | null = null,
+    permissionState: TestPermissionState | PermissionState | null = null,
+  ) {
     releasePreflightMicStream();
     try {
-      const permissionStatus = await navigator.permissions.query({
-        name: 'microphone' as PermissionName,
-      });
-      if (permissionStatus.state === 'denied') {
+      const resolvedPermissionState =
+        permissionState ?? (await resolveMicPermissionStateFromBrowser());
+      if (resolvedPermissionState === 'denied') {
         return { ok: false, error: 'MIC_PERMISSION_DENIED' };
+      }
+      if (resolvedPermissionState === 'prompt') {
+        return { ok: false, error: 'MIC_PERMISSION_PROMPT' };
       }
     } catch {
       // Some Chrome contexts may not expose permission query reliably.
@@ -1324,16 +1347,9 @@ export default defineUnlistedScript(() => {
       schedulePreflightMicHoldRelease();
       return { ok: true, level, deviceLabel };
     } catch (error) {
-      if (error instanceof Error) {
-        if (error.name === 'NotAllowedError') {
-          return { ok: false, error: 'MIC_PERMISSION_PROMPT' };
-        }
-        if (error.name === 'NotFoundError') {
-          return { ok: false, error: 'MIC_NOT_FOUND' };
-        }
-        if (error.name === 'NotReadableError') {
-          return { ok: false, error: 'MIC_IN_USE' };
-        }
+      const classified = classifyMicPermissionRequestError(error);
+      if (classified) {
+        return { ok: false, error: classified };
       }
       return {
         ok: false,
@@ -1342,6 +1358,17 @@ export default defineUnlistedScript(() => {
     } finally {
       stream?.getTracks().forEach((track) => track.stop());
       await audioCtx?.close().catch(() => {});
+    }
+  }
+
+  async function resolveMicPermissionStateFromBrowser(): Promise<TestPermissionState | PermissionState | null> {
+    try {
+      const permissionStatus = await navigator.permissions.query({
+        name: 'microphone' as PermissionName,
+      });
+      return permissionStatus.state;
+    } catch {
+      return null;
     }
   }
 

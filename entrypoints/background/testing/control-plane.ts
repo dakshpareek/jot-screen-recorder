@@ -1,8 +1,22 @@
-import { RuntimeMessageType, type TestActiveTabFixture, type TestControlPlaneResponse } from '@/lib/messages';
+import {
+  RuntimeMessageType,
+  type TestActiveTabFixture,
+  type TestControlPlaneResponse,
+  type TestPermissionFixture,
+} from '@/lib/messages';
 import type { RecordingSnapshot } from '@/lib/recording';
+import {
+  loadTestPermissionFixture,
+  resetTestPermissionFixture,
+  saveTestPermissionFixture,
+  normalizeTestPermissionState,
+} from '@/lib/testing/permission-fixture';
 import { isTestControlPlaneEnabled } from './gate';
 
 let activeTabFixture: TestActiveTabFixture | null = null;
+type TestPermissionStateMessage = {
+  permissionState?: Partial<TestPermissionFixture> | null;
+};
 
 function normalizeActiveTabFixture(value: unknown): TestActiveTabFixture | null {
   if (value == null) return null;
@@ -23,6 +37,18 @@ function normalizeActiveTabFixture(value: unknown): TestActiveTabFixture | null 
 
 export function getTestActiveTabFixture() {
   return activeTabFixture;
+}
+
+async function loadControlPlaneFixture() {
+  return {
+    permissionState: await loadTestPermissionFixture(),
+    activeTab: activeTabFixture,
+  };
+}
+
+async function resetControlPlaneFixtures() {
+  activeTabFixture = null;
+  await resetTestPermissionFixture();
 }
 
 export type TestControlPlaneDebugHook = {
@@ -80,6 +106,29 @@ export async function handleTestControlPlaneMessage(
       ok: true,
       activeTab: activeTabFixture,
     };
+  }
+
+  if (message.type === RuntimeMessageType.TEST_GET_PERMISSION_STATE) {
+    return {
+      ok: true,
+      ...(await loadControlPlaneFixture()),
+    };
+  }
+
+  if (message.type === RuntimeMessageType.TEST_SET_PERMISSION_STATE) {
+    const permissionState = message as TestPermissionStateMessage;
+    return {
+      ok: true,
+      permissionState: await saveTestPermissionFixture({
+        microphone: normalizeTestPermissionState(permissionState.permissionState?.microphone),
+      }),
+      activeTab: activeTabFixture,
+    };
+  }
+
+  if (message.type === RuntimeMessageType.TEST_RESET_TEST_FIXTURES) {
+    await resetControlPlaneFixtures();
+    return { ok: true, ...(await loadControlPlaneFixture()) };
   }
 
   return {

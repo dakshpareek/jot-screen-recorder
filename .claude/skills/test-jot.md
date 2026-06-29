@@ -56,6 +56,25 @@ Verify:
 4. Verify the orphan/recovery flow appears.
 5. Verify raw export and recovery actions still work.
 
+### Control-plane checks
+
+Use the live DevTools REPL when you need to verify test-only state without
+clicking through the popup:
+
+1. Enable the control plane in the service worker console.
+2. Reset fixtures first with `TEST_RESET_TEST_FIXTURES`.
+3. Seed the active-tab or permission fixture you want to test.
+4. Read the fixture back before running the real runtime message.
+5. Trigger `RUN_MIC_CHECK` or the popup flow and confirm the snapshot/error
+   matches the fixture state.
+
+Permission fixtures live in `chrome.storage.session`, so they should survive a
+background-worker restart but clear when Chrome is closed.
+
+For automated runs that need the granted mic path, launch Chrome with fake
+media flags instead of depending on the popup to keep the native prompt open:
+`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`.
+
 ## Screenshots
 
 Use screenshots to capture popup state transitions and recovery UI.
@@ -91,6 +110,8 @@ verification should move to the test control plane described in
 
 Use `docs/testing/agent-browser-smoke.md` for headed-browser smoke and
 `docs/testing/control-plane-repl.md` for the live DevTools REPL loop.
+Use `docs/testing/cdp-service-worker-console.md` when you need direct worker
+context access through CDP for debugging or fixture work.
 
 If Chrome reports `Failed to load extension from: . Manifest file is missing or unreadable`,
 the extension path is wrong. Rebuild with `pnpm build` and point `agent-browser`

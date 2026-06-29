@@ -7,7 +7,9 @@ export type MicToggleStatus =
   | 'checking'
   | 'ok'
   | 'waiting'
+  | 'prompt'
   | 'denied'
+  | 'aborted'
   | 'in_use'
   | 'not_found';
 
@@ -28,9 +30,15 @@ function normalizeMicDeviceId(deviceId: string) {
   return deviceId;
 }
 
-function mapMicErrorToStatus(error: string | null | undefined): MicToggleStatus {
-  if (error === 'MIC_PERMISSION_DENIED' || error === 'MIC_PERMISSION_PROMPT') {
+export function mapMicErrorToStatus(error: string | null | undefined): MicToggleStatus {
+  if (error === 'MIC_PERMISSION_PROMPT') {
+    return 'prompt';
+  }
+  if (error === 'MIC_PERMISSION_DENIED') {
     return 'denied';
+  }
+  if (error === 'MIC_PERMISSION_ABORTED') {
+    return 'aborted';
   }
   if (error === 'MIC_IN_USE') {
     return 'in_use';
@@ -234,6 +242,12 @@ export function useMicCaptureCheck({
     }
     if (status === 'waiting' || status === 'not_found') {
       return 'No microphone found - waiting for device';
+    }
+    if (status === 'prompt') {
+      return 'Permission prompt pending';
+    }
+    if (status === 'aborted') {
+      return 'Permission prompt dismissed';
     }
     if (status === 'denied') {
       return 'Permission blocked';
