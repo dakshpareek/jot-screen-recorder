@@ -33,6 +33,8 @@ import {
 } from './background/state/persisted-context';
 import { ALLOWED_TRANSITIONS } from './background/state/transitions';
 import {
+  buildDownloadFileName,
+  buildExportBaseName,
   createSessionId,
   delay,
   getSystemAudioPreflightSnapshot,
@@ -647,7 +649,8 @@ async function handleStart(
   selectedMicDeviceId = audioSource === 'both' || audioSource === 'mic' ? micDeviceId : null;
   recordingQuality = normalizeCaptureQuality(quality);
   resolvedPreset = null;
-  const nextSessionId = createSessionId();
+  const recordingStartedAt = Date.now();
+  const nextSessionId = createSessionId(recordingStartedAt);
   resetSessionMetadata(nextSessionId);
 
   // Encoder backend is productized settings now (WebCodecs default, legacy optional).
@@ -655,7 +658,8 @@ async function handleStart(
   activeEncoderBackend = recorderSettings.encoderBackend;
 
   try {
-    const targetTabId = await getStartTargetTabId();
+    const targetTab = await getStartTargetTab();
+    const targetTabId = targetTab.id!;
     const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
     if (!staleCaptureRecovery.ok) {
       errorMessage = formatCodedStartError(
@@ -678,6 +682,11 @@ async function handleStart(
     }
 
     recordingTabId = targetTabId;
+    const exportBaseName = buildExportBaseName({
+      timestampMs: recordingStartedAt,
+      title: targetTab.title,
+      url: targetTab.url,
+    });
 
     let result: OffscreenResponse;
     const startMediaRecorder = async () =>
@@ -688,6 +697,8 @@ async function handleStart(
         audioSource,
         micDeviceId: selectedMicDeviceId,
         quality: recordingQuality,
+        exportBaseName,
+        recordingStartTime: recordingStartedAt,
       });
 
     if (isUsingWebCodecsBackend()) {
@@ -701,6 +712,8 @@ async function handleStart(
           quality: recordingQuality,
           audioSource,
           micDeviceId: selectedMicDeviceId,
+          exportBaseName,
+          recordingStartTime: recordingStartedAt,
         });
         if (webCodecsResult?.ok) {
           result = webCodecsResult;
@@ -745,7 +758,11 @@ async function handleStart(
     resolvedPreset =
       result.resolvedPreset == null ? null : normalizeResolvedCaptureQuality(result.resolvedPreset);
 
-    recordingStartTime = Date.now();
+    recordingStartTime = recordingStartedAt;
+    outputFileName = buildDownloadFileName(
+      exportBaseName,
+      result.outputMimeType ?? (String(result.fileName ?? '').endsWith('.webm') ? 'video/webm' : 'video/mp4'),
+    );
     audioPreflight = {
       ...audioPreflight,
       ...getSystemAudioPreflightSnapshot(activeAudioSource, isUsingWebCodecsBackend()),
@@ -797,7 +814,8 @@ async function handlePrepareStart(
     setState('preflight');
     const preflightStartedAt = Date.now();
 
-    const targetTabId = await getStartTargetTabId({ validateCapturable: false });
+    const targetTab = await getStartTargetTab({ validateCapturable: false });
+    const targetTabId = targetTab.id!;
     const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
     if (!staleCaptureRecovery.ok) {
       errorMessage = formatCodedStartError(
@@ -1015,7 +1033,7 @@ async function handleStop() {
 
       // WebCodecs returns the output directly - skip processing
       outputUrl = result.outputUrl ?? null;
-      outputFileName = result.fileName ?? `${sessionId ?? 'recording'}.mp4`;
+      outputFileName = outputFileName ?? buildDownloadFileName(sessionId, result.outputMimeType ?? 'video/mp4');
       validation = result.validation ?? null;
       processingProgress = 100;
 
@@ -1070,7 +1088,7 @@ async function handleWebCodecsFatalError(errorMsg?: string) {
 
       if (result?.ok) {
         outputUrl = result.outputUrl ?? null;
-        outputFileName = result.fileName ?? `${sessionId ?? 'recording'}.mp4`;
+        outputFileName = outputFileName ?? buildDownloadFileName(sessionId, result.outputMimeType ?? 'video/mp4');
         validation = result.validation ?? null;
         processingProgress = 100;
         await persistContext();
@@ -1105,7 +1123,7 @@ async function handleDownload() {
   }
 
   try {
-    const filename = outputFileName ?? `${sessionId ?? 'recording'}.mp4`;
+    const filename = outputFileName ?? buildDownloadFileName(sessionId, 'video/mp4');
     const downloadId = await chrome.downloads.download({
       url: outputUrl,
       filename,
@@ -1574,7 +1592,7 @@ async function runProcessingPipeline(options?: {
     }
 
     outputUrl = processResult.outputUrl;
-    outputFileName = processResult.fileName ?? `${targetSessionId}.mp4`;
+    outputFileName = outputFileName ?? buildDownloadFileName(targetSessionId, processResult.outputMimeType ?? 'video/mp4');
     processingProgress = 100;
     validation = processResult.validation ?? null;
     await persistContext();
@@ -1640,7 +1658,7 @@ async function runProcessingPipeline(options?: {
   }
 }
 
-async function getStartTargetTabId(options?: { validateCapturable?: boolean }) {
+async function getStartTargetTab(options?: { validateCapturable?: boolean }) {
   const [activeTab] = await chrome.tabs.query({
     active: true,
     lastFocusedWindow: true,
@@ -1661,7 +1679,7 @@ async function getStartTargetTabId(options?: { validateCapturable?: boolean }) {
       throw new Error(formatCodedStartError(capturable.code, capturable.message, activeTab.url));
     }
   }
-  return activeTab.id;
+  return activeTab;
 }
 
 async function getTabCaptureStreamId(targetTabId: number): Promise<string> {

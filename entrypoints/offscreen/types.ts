@@ -11,6 +11,7 @@ export interface ManifestChunk {
 
 export interface SessionManifest {
   sessionId: string;
+  exportBaseName?: string;
   startTime: number;
   recordingQuality?: CaptureQuality;
   recordingResolvedQuality?: CaptureResolvedQuality;

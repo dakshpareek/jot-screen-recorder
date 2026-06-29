@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  buildDownloadFileName,
+  buildExportBaseName,
+  buildRawExportBaseName,
   createSessionId,
   delay,
+  formatRecordingTimestamp,
   getSystemAudioPreflightSnapshot,
   normalizeAudioSource,
   normalizeCaptureQuality,
@@ -12,6 +16,78 @@ import {
 } from '@/entrypoints/background/utils';
 
 describe('background utils', () => {
+  it('formats recording timestamps in local wall-clock time', () => {
+    expect(formatRecordingTimestamp(new Date(2026, 5, 29, 14, 30, 12).getTime())).toBe(
+      '2026-06-29 14-30-12',
+    );
+  });
+
+  it('builds safe export stems from the active tab title', () => {
+    const timestampMs = new Date(2026, 5, 29, 14, 30, 12).getTime();
+
+    expect(
+      buildExportBaseName({
+        timestampMs,
+        title: 'ChatGPT: Demo / Review? * - Google Chrome',
+        url: 'https://chatgpt.com/chat',
+      }),
+    ).toBe('Jot - 2026-06-29 14-30-12 - ChatGPT Demo Review');
+  });
+
+  it('falls back to host when the title is missing or useless', () => {
+    const timestampMs = new Date(2026, 5, 29, 14, 30, 12).getTime();
+
+    expect(
+      buildExportBaseName({
+        timestampMs,
+        title: 'New Tab',
+        url: 'https://www.example.com/path?q=1',
+      }),
+    ).toBe('Jot - 2026-06-29 14-30-12 - example.com');
+  });
+
+  it('truncates long stems while keeping the prefix and timestamp', () => {
+    const timestampMs = new Date(2026, 5, 29, 14, 30, 12).getTime();
+    const longTitle = 'A'.repeat(300);
+
+    const stem = buildExportBaseName({
+      timestampMs,
+      title: longTitle,
+      url: 'https://example.com',
+    });
+
+    expect(stem.startsWith('Jot - 2026-06-29 14-30-12 - ')).toBe(true);
+    expect(stem.length).toBeLessThanOrEqual(120);
+  });
+
+  it('falls back to timestamp-only names when title and url are missing', () => {
+    const timestampMs = new Date(2026, 5, 29, 14, 30, 12).getTime();
+
+    expect(
+      buildExportBaseName({
+        timestampMs,
+        title: null,
+        url: null,
+      }),
+    ).toBe('Jot - 2026-06-29 14-30-12');
+  });
+
+  it('keeps raw export folders on the same stem and falls back to session ids', () => {
+    expect(
+      buildRawExportBaseName('Jot - 2026-06-29 14-30-12 - ChatGPT', 'rec_20260629_143012'),
+    ).toBe('Jot - 2026-06-29 14-30-12 - ChatGPT-raw');
+    expect(buildRawExportBaseName(null, 'rec_20260629_143012')).toBe('rec_20260629_143012-raw');
+  });
+
+  it('builds output filenames from the resolved MIME type', () => {
+    expect(buildDownloadFileName('Jot - 2026-06-29 14-30-12 - ChatGPT', 'video/mp4')).toBe(
+      'Jot - 2026-06-29 14-30-12 - ChatGPT.mp4',
+    );
+    expect(buildDownloadFileName('Jot - 2026-06-29 14-30-12 - ChatGPT', 'video/webm')).toBe(
+      'Jot - 2026-06-29 14-30-12 - ChatGPT.webm',
+    );
+  });
+
   it('normalizes system audio status safely', () => {
     expect(normalizeSystemAudioStatus('pending')).toBe('pending');
     expect(normalizeSystemAudioStatus('ok')).toBe('ok');

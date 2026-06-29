@@ -22,6 +22,9 @@ Local-first Chrome extension screen recorder with:
 - `pnpm compile`: type-check only
 - `pnpm build`: production build
 
+## Headed Browser QA
+- For `agent-browser` extension testing, rebuild first and load `.output/chrome-mv3`, not `dist`.
+
 ## Refactor Safety
 - Smoke checklist: `docs/architecture/phase0-smoke-checklist.md`
 - Runtime contract baseline: `docs/architecture/runtime-contract.md`

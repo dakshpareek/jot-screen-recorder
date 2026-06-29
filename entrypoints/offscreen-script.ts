@@ -32,6 +32,10 @@ import {
   WebCodecsPipeline,
   type WebCodecsPipelineStats,
 } from './offscreen/webcodecs';
+import {
+  buildDownloadFileName,
+  buildRawExportBaseName,
+} from './background/utils';
 
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
@@ -101,6 +105,8 @@ export default defineUnlistedScript(() => {
         normalizeAudioSource(msg.audioSource),
         normalizeMicDeviceId(msg.micDeviceId),
         normalizeCaptureQuality(msg.quality),
+        String(msg.exportBaseName ?? ''),
+        typeof msg.recordingStartTime === 'number' ? msg.recordingStartTime : undefined,
       ).then(sendResponse);
       return true;
     }
@@ -233,6 +239,8 @@ export default defineUnlistedScript(() => {
             tabStreamResolution.requestedPreset,
             tabStreamResolution.resolvedPreset,
             tabStreamResolution.fallbackReason,
+            String(msg.exportBaseName ?? ''),
+            typeof msg.recordingStartTime === 'number' ? msg.recordingStartTime : undefined,
           );
 
           if (!result.ok) {
@@ -341,6 +349,8 @@ export default defineUnlistedScript(() => {
     audioSource: AudioSource,
     micDeviceId: string | null,
     captureQuality: CaptureQuality,
+    exportBaseName = '',
+    recordingStartTime?: number,
   ) {
     if (recorder?.state === 'recording') {
       return { ok: false, error: 'Recorder is already active' };
@@ -366,7 +376,8 @@ export default defineUnlistedScript(() => {
 
       manifest = {
         sessionId: nextSessionId,
-        startTime: Date.now(),
+        exportBaseName: exportBaseName || undefined,
+        startTime: recordingStartTime ?? Date.now(),
         recordingQuality: activeCaptureQuality,
         recordingResolvedQuality: activeResolvedPreset,
         chunks: [],
@@ -413,6 +424,11 @@ export default defineUnlistedScript(() => {
       // 4.2: FFmpeg stays cold-path only (processing/recovery). No start-time prewarm.
       return {
         ok: true,
+        outputMimeType: recorder.mimeType || mimeType,
+        fileName: buildDownloadFileName(
+          manifest.exportBaseName ?? nextSessionId,
+          recorder.mimeType || mimeType,
+        ),
         requestedPreset: activeCaptureQuality,
         resolvedPreset: activeResolvedPreset,
         fallbackReason: streamResolution.fallbackReason,
@@ -612,7 +628,8 @@ export default defineUnlistedScript(() => {
         return {
           ok: true,
           outputUrl: lastOutputUrl,
-          fileName: `${sessionId}.${outExt}`,
+          outputMimeType: outMime,
+          fileName: buildDownloadFileName(currentManifest.exportBaseName ?? sessionId, outMime),
           validation,
         };
       }
@@ -672,7 +689,8 @@ export default defineUnlistedScript(() => {
           return {
             ok: true,
             outputUrl: lastOutputUrl,
-            fileName: `${sessionId}.mp4`,
+            outputMimeType: 'video/mp4',
+            fileName: buildDownloadFileName(currentManifest.exportBaseName ?? sessionId, 'video/mp4'),
             validation,
           };
         }
@@ -845,7 +863,8 @@ export default defineUnlistedScript(() => {
       return {
         ok: true,
         outputUrl: lastOutputUrl,
-        fileName: `${sessionId}.mp4`,
+        outputMimeType: 'video/mp4',
+        fileName: buildDownloadFileName(currentManifest.exportBaseName ?? sessionId, 'video/mp4'),
         validation,
       };
     } catch (error) {
@@ -1065,7 +1084,7 @@ export default defineUnlistedScript(() => {
         try {
           const streamFile = webCodecsOpfsStreamName(manifestData);
           const data = await opfsBridge.readWebCodecsStream(sessionId, streamFile);
-          const baseName = `${sessionId}-raw`;
+          const baseName = buildRawExportBaseName(manifestData.exportBaseName, sessionId);
           const items: RawDownloadItem[] = [];
           const manifestBlob = new Blob([JSON.stringify(manifestData, null, 2)], {
             type: 'application/json',
@@ -1096,7 +1115,7 @@ export default defineUnlistedScript(() => {
         return { ok: false, error: 'No chunks found for this session' };
       }
 
-      const baseName = `${sessionId}-raw`;
+      const baseName = buildRawExportBaseName(manifestData.exportBaseName, sessionId);
       const chunkExt = (manifestData.mimeType ?? '').includes('mp4') ? 'mp4' : 'webm';
 
       const items: RawDownloadItem[] = [];
@@ -2024,6 +2043,8 @@ export default defineUnlistedScript(() => {
     requestedPreset: CaptureQuality,
     preferredResolvedPreset: CaptureResolvedQuality,
     captureFallbackReason: string | null,
+    exportBaseName = '',
+    recordingStartTime?: number,
   ) {
     if (webcodecsPipeline?.isRunning()) {
       return { ok: false, error: 'WebCodecs pipeline already running' };
@@ -2054,7 +2075,8 @@ export default defineUnlistedScript(() => {
 
       manifest = {
         sessionId: nextSessionId,
-        startTime: Date.now(),
+        exportBaseName: exportBaseName || undefined,
+        startTime: recordingStartTime ?? Date.now(),
         recordingQuality: activeCaptureQuality,
         recordingResolvedQuality: activeResolvedPreset,
         mimeType: resolved.outputMimeType,
@@ -2123,6 +2145,11 @@ export default defineUnlistedScript(() => {
       return {
         ok: true,
         hardwareAccelerated: resolved.hardwareAcceleration,
+        outputMimeType: resolved.outputMimeType,
+        fileName: buildDownloadFileName(
+          manifest.exportBaseName ?? nextSessionId,
+          resolved.outputMimeType,
+        ),
         requestedPreset: activeCaptureQuality,
         resolvedPreset: activeResolvedPreset,
         fallbackReason:
@@ -2153,7 +2180,6 @@ export default defineUnlistedScript(() => {
       const finalStats = webcodecsPipeline.getStats();
 
       const outMime = finalStats.outputMimeType;
-      const outExt = finalStats.fileExtension;
 
       // Create blob and URL
       const blob = new Blob([outputBuffer], { type: outMime });
@@ -2188,7 +2214,11 @@ export default defineUnlistedScript(() => {
       return {
         ok: true,
         outputUrl: lastOutputUrl,
-        fileName: `${activeSessionId ?? 'recording'}.${outExt}`,
+        outputMimeType: outMime,
+        fileName: buildDownloadFileName(
+          manifest?.exportBaseName ?? activeSessionId,
+          outMime,
+        ),
         outputSize: outputBuffer.byteLength,
         stopDurationMs,
         stats: finalStats,

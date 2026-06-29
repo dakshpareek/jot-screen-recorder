@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { RuntimeMessageType } from '@/lib/messages';
+import { buildDownloadFileName, buildExportBaseName } from '@/entrypoints/background/utils';
 
 type RuntimeListener = (
   message: unknown,
@@ -14,6 +15,7 @@ const loadPersistedContextMock = vi.fn();
 const savePersistedContextMock = vi.fn();
 const loadRecorderSettingsMock = vi.fn();
 const saveRecorderSettingsMock = vi.fn();
+const downloadsDownloadMock = vi.fn();
 
 vi.mock('@/entrypoints/background/services/offscreen-client', () => {
   class MockOffscreenClient {
@@ -94,6 +96,7 @@ describe('background start fallback', () => {
     savePersistedContextMock.mockReset();
     loadRecorderSettingsMock.mockReset();
     saveRecorderSettingsMock.mockReset();
+    downloadsDownloadMock.mockReset();
     onMessageAddListenerMock.mockReset();
     onUpdatedAddListenerMock.mockReset();
     onInstalledAddListenerMock.mockReset();
@@ -123,6 +126,7 @@ describe('background start fallback', () => {
     savePersistedContextMock.mockResolvedValue(undefined);
     loadRecorderSettingsMock.mockResolvedValue({ encoderBackend: 'webcodecs' });
     saveRecorderSettingsMock.mockResolvedValue({ encoderBackend: 'webcodecs' });
+    downloadsDownloadMock.mockResolvedValue(1);
     offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
       if (message.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
         return { ok: true, sessions: [] };
@@ -174,7 +178,7 @@ describe('background start fallback', () => {
         executeScript: executeScriptMock.mockResolvedValue(undefined),
       },
       downloads: {
-        download: vi.fn().mockResolvedValue(1),
+        download: downloadsDownloadMock,
       },
     };
   });
@@ -334,5 +338,186 @@ describe('background start fallback', () => {
       101,
       expect.objectContaining({ type: RuntimeMessageType.RECORDING_BANNER, visible: true }),
     );
+  });
+
+  it('prepopulates a stemmed WebCodecs download filename from the active tab title', async () => {
+    vi.useFakeTimers();
+    try {
+      const timestampMs = new Date(2026, 5, 29, 14, 30, 12).getTime();
+      vi.setSystemTime(timestampMs);
+      tabsQueryMock.mockResolvedValue([{ id: 101, title: 'ChatGPT', url: 'https://chatgpt.com/chat' }]);
+
+      await bootBackground();
+      offscreenSendMock.mockClear();
+
+      offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
+        if (message.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
+          return { ok: true, sessions: [] };
+        }
+        if (message.type === RuntimeMessageType.OFFSCREEN_START_WEBCODECS) {
+          return {
+            ok: true,
+            requestedPreset: 'auto',
+            resolvedPreset: '1080p30',
+            outputMimeType: 'video/webm',
+          };
+        }
+        if (message.type === RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS) {
+          return { ok: true, outputUrl: 'blob:webcodecs', outputMimeType: 'video/webm' };
+        }
+        return { ok: true };
+      });
+
+      const prep = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.PREPARE_START,
+        includeMic: false,
+        quality: 'auto',
+      })) as { ok?: boolean };
+      expect(prep?.ok).toBe(true);
+
+      const start = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.START,
+        audioSource: 'tab',
+        quality: 'auto',
+      })) as { ok?: boolean; snapshot?: { state?: string } };
+
+      expect(start?.ok).toBe(true);
+      expect(start?.snapshot?.state).toBe('recording');
+
+      const expectedStem = buildExportBaseName({
+        timestampMs,
+        title: 'ChatGPT',
+        url: 'https://chatgpt.com/chat',
+      });
+
+      expect(offscreenSendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS,
+          exportBaseName: expectedStem,
+          recordingStartTime: timestampMs,
+        }),
+      );
+
+      const stop = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.STOP,
+      })) as { ok?: boolean };
+      expect(stop?.ok).toBe(true);
+
+      const download = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.DOWNLOAD,
+      })) as { ok?: boolean };
+      expect(download?.ok).toBe(true);
+      expect(downloadsDownloadMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filename: buildDownloadFileName(expectedStem, 'video/webm'),
+          saveAs: true,
+        }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('prepopulates a stemmed MediaRecorder download filename from the active tab title', async () => {
+    vi.useFakeTimers();
+    try {
+      const timestampMs = new Date(2026, 5, 29, 14, 30, 12).getTime();
+      vi.setSystemTime(timestampMs);
+      tabsQueryMock.mockResolvedValue([{ id: 101, title: 'ChatGPT', url: 'https://chatgpt.com/chat' }]);
+      loadRecorderSettingsMock.mockResolvedValue({ encoderBackend: 'mediarecorder' });
+
+      await bootBackground();
+      offscreenSendMock.mockClear();
+
+      offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
+        if (message.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
+          return { ok: true, sessions: [] };
+        }
+        if (message.type === RuntimeMessageType.OFFSCREEN_START) {
+          return {
+            ok: true,
+            requestedPreset: 'auto',
+            resolvedPreset: '1080p30',
+            outputMimeType: 'video/mp4',
+          };
+        }
+        if (message.type === RuntimeMessageType.OFFSCREEN_STOP) {
+          return { ok: true };
+        }
+        if (message.type === RuntimeMessageType.OFFSCREEN_PROCESS) {
+          return {
+            ok: true,
+            outputUrl: 'blob:mediarecorder',
+            outputMimeType: 'video/mp4',
+          };
+        }
+        if (message.type === RuntimeMessageType.OFFSCREEN_VALIDATE) {
+          return {
+            passed: true,
+            checks: {
+              size: true,
+              header: true,
+              duration: true,
+            },
+          };
+        }
+        return { ok: true };
+      });
+
+      const prep = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.PREPARE_START,
+        includeMic: false,
+        quality: 'auto',
+      })) as { ok?: boolean };
+      expect(prep?.ok).toBe(true);
+
+      const start = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.START,
+        audioSource: 'tab',
+        quality: 'auto',
+      })) as { ok?: boolean; snapshot?: { state?: string } };
+
+      expect(start?.ok).toBe(true);
+      expect(start?.snapshot?.state).toBe('recording');
+
+      const expectedStem = buildExportBaseName({
+        timestampMs,
+        title: 'ChatGPT',
+        url: 'https://chatgpt.com/chat',
+      });
+
+      expect(offscreenSendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: RuntimeMessageType.OFFSCREEN_START,
+          exportBaseName: expectedStem,
+          recordingStartTime: timestampMs,
+        }),
+      );
+
+      const stop = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.STOP,
+      })) as { ok?: boolean };
+      expect(stop?.ok).toBe(true);
+
+      const processed = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.OFFSCREEN_EVENT,
+        event: 'FINAL_CHUNK_WRITTEN',
+        chunkCount: 1,
+      })) as { ok?: boolean };
+      expect(processed?.ok).toBe(true);
+
+      const download = (await dispatchRuntimeMessage({
+        type: RuntimeMessageType.DOWNLOAD,
+      })) as { ok?: boolean };
+      expect(download?.ok).toBe(true);
+      expect(downloadsDownloadMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          filename: buildDownloadFileName(expectedStem, 'video/mp4'),
+          saveAs: true,
+        }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

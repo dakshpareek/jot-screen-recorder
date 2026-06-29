@@ -95,6 +95,7 @@ export type OffscreenResponse = {
   ok: boolean;
   error?: string;
   outputUrl?: string;
+  outputMimeType?: string;
   fileName?: string;
   validation?: ValidationResult;
   requestedPreset?: CaptureQuality;
