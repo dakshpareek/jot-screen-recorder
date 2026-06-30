@@ -143,3 +143,97 @@ describe('RecordingSession', () => {
     expect(snapshot.errorMessage).toBe('storage exploded');
   });
 });
+
+describe('RecordingSession lifecycle', () => {
+  function offscreenRouter(
+    handlers: Record<string, (message: { type?: string; [key: string]: unknown }) => unknown>,
+  ) {
+    return vi.fn(async (message: { type?: string }) => {
+      const handler = message.type ? handlers[message.type] : undefined;
+      return (handler ? handler(message) : { ok: true }) as never;
+    });
+  }
+
+  it('drives prepareStart → start → stop → download against fakes (WebCodecs path)', async () => {
+    const send = offscreenRouter({
+      OFFSCREEN_SCAN_ORPHANS: () => ({ ok: true, sessions: [] }),
+      OFFSCREEN_START_WEBCODECS: () => ({
+        ok: true,
+        requestedPreset: 'auto',
+        resolvedPreset: '1080p30',
+        outputMimeType: 'video/webm',
+      }),
+      OFFSCREEN_STOP_WEBCODECS: () => ({
+        ok: true,
+        outputUrl: 'blob:webcodecs',
+        outputMimeType: 'video/webm',
+      }),
+    });
+    const deps = createFakeDeps({
+      offscreen: {
+        send,
+        ensureReadyWithRetry: vi.fn(async () => {}),
+        forceResetDocument: vi.fn(async () => {}),
+        markReady: vi.fn(),
+      },
+    });
+    const session = new RecordingSession(deps);
+
+    const prep = await session.prepareStart(false, null, 'auto');
+    expect(prep.ok).toBe(true);
+    expect(session.snapshot().state).toBe('armed');
+
+    const start = await session.start('tab', null, 'auto');
+    expect(start.ok).toBe(true);
+    expect(session.snapshot().state).toBe('recording');
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'OFFSCREEN_START_WEBCODECS' }),
+    );
+
+    const stop = await session.stop();
+    expect(stop.ok).toBe(true);
+    expect(session.snapshot().state).toBe('done');
+    expect(session.snapshot().canDownload).toBe(true);
+
+    const download = await session.download();
+    expect(download.ok).toBe(true);
+    expect(deps.download).toHaveBeenCalledWith(
+      expect.objectContaining({ filename: expect.any(String), saveAs: true }),
+    );
+    expect(session.snapshot().state).toBe('idle');
+  });
+
+  it('blocks start and stop from invalid states', async () => {
+    const session = new RecordingSession(createFakeDeps());
+
+    const start = await session.start('tab', null, 'auto');
+    expect(start.ok).toBe(false);
+    expect(start.error).toContain('Cannot start from state "idle"');
+
+    const stop = await session.stop();
+    expect(stop.ok).toBe(false);
+    expect(stop.error).toContain('Cannot stop from state "idle"');
+  });
+
+  it('discards an orphaned session through the offscreen port', async () => {
+    const send = offscreenRouter({
+      OFFSCREEN_CLEAR_SESSION: () => ({ ok: true }),
+      OFFSCREEN_SCAN_ORPHANS: () => ({ ok: true, sessions: [] }),
+    });
+    const deps = createFakeDeps({
+      offscreen: {
+        send,
+        ensureReadyWithRetry: vi.fn(async () => {}),
+        forceResetDocument: vi.fn(async () => {}),
+        markReady: vi.fn(),
+      },
+    });
+    const session = new RecordingSession(deps);
+
+    const result = await session.discardOrphan('orphan-1');
+    expect(result.ok).toBe(true);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'OFFSCREEN_CLEAR_SESSION', sessionId: 'orphan-1' }),
+    );
+  });
+});

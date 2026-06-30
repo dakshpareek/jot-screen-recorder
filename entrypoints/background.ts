@@ -1,26 +1,12 @@
+import type { RecordingState } from '@/lib/recording';
 import type {
-  AudioPreflightSnapshot,
-  OrphanedSession,
-  ProcessingMetrics,
-  RecordingSnapshot,
-  RecordingState,
-  RecoveryChunkCheck,
-  ValidationResult,
-} from '@/lib/recording';
-import type {
-  AudioSource,
   CaptureQuality,
-  CaptureResolvedQuality,
   MicMixFailedMessage,
-  MicPreflightResponse,
   OffscreenEventMessage,
-  OffscreenResponse,
-  RecoveryInspectResponse,
   StorageSignalMessage,
   SystemAudioSignalMessage,
-  TestOrphanFixture,
 } from '@/lib/messages';
-import { OffscreenEventType, RuntimeMessageType } from '@/lib/messages';
+import { RuntimeMessageType } from '@/lib/messages';
 import { MessageRouter } from '@/lib/message-router';
 import { debugWarn } from '@/lib/runtime-log';
 import { OffscreenClient } from './background/services/offscreen-client';
@@ -29,25 +15,15 @@ import {
   savePersistedContext,
   loadRecorderSettings,
   saveRecorderSettings,
-  type PersistedContext,
-  type EncoderBackend,
   type RecorderSettings,
 } from './background/state/persisted-context';
-import { ALLOWED_TRANSITIONS } from './background/state/transitions';
 import {
-  buildDownloadFileName,
-  buildExportBaseName,
-  createSessionId,
   delay,
-  getSystemAudioPreflightSnapshot,
   normalizeAudioSource,
   normalizeCaptureQuality,
-  normalizeResolvedCaptureQuality,
   normalizeMicDeviceId,
-  normalizeSystemAudioStatus,
   toErrorMessage,
 } from './background/utils';
-import { buildTestCaptureStreamId } from '@/lib/testing/capture-stream';
 import { resolveMicrophonePermissionState } from '@/lib/testing/permission-fixture';
 import {
   getTestActiveTabFixture,
@@ -56,61 +32,66 @@ import {
   installTestControlPlaneRuntimeHandlers,
 } from './background/testing/control-plane';
 import { isTestControlPlaneEnabled } from './background/testing/gate';
+import { RecordingSession, type RecordingSessionDeps } from './background/recording-session';
 
-type RawDownloadItem = {
-  url: string;
-  filename: string;
-};
-const PREFLIGHT_RESULT_MIN_VISIBLE_MS = 1_500;
-const BLOCKED_TAB_CAPTURE_SCHEMES = ['chrome:', 'chrome-extension:', 'devtools:', 'edge:', 'about:'];
-const BLOCKED_TAB_CAPTURE_HOSTS = new Set(['chromewebstore.google.com']);
 const ACTIVE_TAB_CAPTURE_STATUSES = ['pending', 'active'] as const;
 
-const DEFAULT_AUDIO_PREFLIGHT: AudioPreflightSnapshot = {
-  micChecked: false,
-  micOk: false,
-  micLevel: null,
-  micError: null,
-  systemAudioStatus: 'idle',
-  systemAudioLevel: null,
-};
-
-let state: RecordingState = 'idle';
-let sessionId: string | null = null;
-let recordingStartTime: number | null = null;
-let chunkCount = 0;
-let processingProgress: number | null = null;
-let errorMessage: string | null = null;
-let micWarningMessage: string | null = null;
-let storageWarningMessage: string | null = null;
-let outputFileName: string | null = null;
-let outputUrl: string | null = null;
-let validation: ValidationResult | null = null;
-let processingMetrics: ProcessingMetrics | null = null;
-let audioPreflight: AudioPreflightSnapshot = { ...DEFAULT_AUDIO_PREFLIGHT };
-let orphanedSessions: OrphanedSession[] = [];
-let recoverySessionId: string | null = null;
-let recoveryChunks: RecoveryChunkCheck[] = [];
-let processingPipelineRunning = false;
-let recordingTabId: number | null = null;
-let activeAudioSource: AudioSource = 'both';
-let selectedMicDeviceId: string | null = null;
-let recordingQuality: CaptureQuality = 'auto';
-let resolvedPreset: CaptureResolvedQuality | null = null;
-let activeEncoderBackend: EncoderBackend = 'webcodecs';
-let webCodecsStats: RecordingSnapshot['webCodecsStats'] = null;
 const offscreenClient = new OffscreenClient();
 
+const deps: RecordingSessionDeps = {
+  offscreen: offscreenClient,
+  delay,
+  persist: (context) => savePersistedContext(context),
+  broadcast: async (snapshot) => {
+    try {
+      await chrome.runtime.sendMessage({
+        type: RuntimeMessageType.STATE_CHANGE,
+        snapshot,
+      });
+    } catch {
+      // Popup is usually closed; ignore.
+    }
+  },
+  setBadge: (state) => updateBadge(state),
+  showRecordingBanner: (tabId) => ensureRecordingBannerVisible(tabId),
+  hideRecordingBanner: async (tabId) => {
+    await sendRecordingBanner(tabId, false);
+  },
+  loadRecorderSettings,
+  estimateStorage: () => navigator.storage.estimate(),
+  resolveMicPermissionState: () => resolveMicrophonePermissionState(),
+  isTestControlPlaneEnabled,
+  getTestActiveTabFixture: () =>
+    getTestActiveTabFixture() as Promise<chrome.tabs.Tab | null>,
+  queryActiveTab: async () => {
+    const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    return activeTab;
+  },
+  activateTab: async (tabId) => {
+    await chrome.tabs.update(tabId, { active: true });
+  },
+  getCaptureStreamId: (tabId) => getTabCaptureStreamId(tabId),
+  getCapturedTabInfo: (tabId) => getCapturedTabInfo(tabId),
+  download: (options) => chrome.downloads.download(options),
+};
+
+const session = new RecordingSession(deps);
+
 export default defineBackground(() => {
-  installTestControlPlaneDebugHook(buildSnapshot, () => outputFileName);
+  installTestControlPlaneDebugHook(
+    () => session.snapshot(),
+    () => session.outputFileName,
+  );
   installTestControlPlaneRuntimeHandlers({
-    prepareStart: handlePrepareStart,
-    start: handleStart,
-    stop: handleStop,
-    refreshOrphans: handleRefreshOrphans,
-    recoverOrphan: handleRecoverOrphan,
-    discardOrphan: handleDiscardOrphan,
-    syncOrphanFixture: syncOrphanFixture,
+    prepareStart: (includeMic, micDeviceId, quality) =>
+      session.prepareStart(includeMic, micDeviceId, quality),
+    start: (audioSource, micDeviceId, quality) => session.start(audioSource, micDeviceId, quality),
+    stop: () => session.stop(),
+    refreshOrphans: () => session.refreshOrphans(),
+    recoverOrphan: (sessionId, chunkIndexes) => session.recoverOrphan(sessionId, chunkIndexes),
+    discardOrphan: (sessionId) => session.discardOrphan(sessionId),
+    syncOrphanFixture: (previousFixture, nextFixture) =>
+      session.syncOrphanFixture(previousFixture, nextFixture),
   });
 
   const router = new MessageRouter();
@@ -118,33 +99,34 @@ export default defineBackground(() => {
   router
     .onMatch(
       (type) => type.startsWith('TEST_'),
-      (message) => handleTestControlPlaneMessage(message, buildSnapshot, () => outputFileName),
+      (message) =>
+        handleTestControlPlaneMessage(message, () => session.snapshot(), () => session.outputFileName),
     )
-    .on(RuntimeMessageType.GET_STATE, () => buildSnapshot())
+    .on(RuntimeMessageType.GET_STATE, () => session.snapshot())
     .on(RuntimeMessageType.START, (message) =>
-      handleStart(
+      session.start(
         normalizeAudioSource(message.audioSource),
         normalizeMicDeviceId(message.micDeviceId),
         normalizeCaptureQuality(message.quality),
       ),
     )
     .on(RuntimeMessageType.PREPARE_START, (message) =>
-      handlePrepareStartRequest(
+      session.prepareStart(
         message.includeMic !== false,
         normalizeMicDeviceId(message.micDeviceId),
         normalizeCaptureQuality(message.quality),
       ),
     )
     .on(RuntimeMessageType.RUN_MIC_CHECK, (message) =>
-      handleRunMicCheck(normalizeMicDeviceId(message.micDeviceId)),
+      session.runMicCheck(normalizeMicDeviceId(message.micDeviceId)),
     )
-    .on(RuntimeMessageType.RELEASE_MIC_CHECK, () => handleReleaseMicCheck())
-    .on(RuntimeMessageType.CANCEL_START, () => handleCancelStart())
-    .on(RuntimeMessageType.STOP, () => handleStop())
-    .on(RuntimeMessageType.DOWNLOAD, () => handleDownload())
-    .on(RuntimeMessageType.RESET_TO_IDLE, () => handleResetToIdle())
+    .on(RuntimeMessageType.RELEASE_MIC_CHECK, () => session.releaseMicCheck())
+    .on(RuntimeMessageType.CANCEL_START, () => session.cancelStart())
+    .on(RuntimeMessageType.STOP, () => session.stop())
+    .on(RuntimeMessageType.DOWNLOAD, () => session.download())
+    .on(RuntimeMessageType.RESET_TO_IDLE, () => session.resetToIdle())
     .on(RuntimeMessageType.DOWNLOAD_RAW_CHUNKS, (message) =>
-      handleDownloadRawChunks(String(message.sessionId ?? '')),
+      session.downloadRawChunks(String(message.sessionId ?? '')),
     )
     .on(RuntimeMessageType.RECOVER_ORPHAN, (message) => {
       const chunkIndexes = Array.isArray(message.chunkIndexes)
@@ -152,18 +134,18 @@ export default defineBackground(() => {
             .map((value: unknown) => Number(value))
             .filter((value: number) => Number.isInteger(value) && value >= 0)
         : undefined;
-      return handleRecoverOrphan(String(message.sessionId ?? ''), chunkIndexes);
+      return session.recoverOrphan(String(message.sessionId ?? ''), chunkIndexes);
     })
     .on(RuntimeMessageType.DISCARD_ORPHAN, (message) =>
-      handleDiscardOrphan(String(message.sessionId ?? '')),
+      session.discardOrphan(String(message.sessionId ?? '')),
     )
-    .on(RuntimeMessageType.REFRESH_ORPHANS, () => handleRefreshOrphans())
+    .on(RuntimeMessageType.REFRESH_ORPHANS, () => session.refreshOrphans())
     .on(RuntimeMessageType.OPEN_MIC_SETTINGS, () => handleOpenMicSettings())
     .on(RuntimeMessageType.OFFSCREEN_EVENT, (message) =>
-      handleOffscreenEvent(message as OffscreenEventMessage),
+      session.applyOffscreenEvent(message as OffscreenEventMessage),
     )
     .on(RuntimeMessageType.MIC_MIX_FAILED, (message) =>
-      handleMicMixFailed(message as MicMixFailedMessage),
+      session.applyMicMixFailed(message as MicMixFailedMessage),
     )
     .on(
       [
@@ -171,14 +153,14 @@ export default defineBackground(() => {
         RuntimeMessageType.SYSTEM_AUDIO_SILENT,
         RuntimeMessageType.SYSTEM_AUDIO_ABSENT,
       ],
-      (message) => handleSystemAudioSignal(message as SystemAudioSignalMessage),
+      (message) => session.applySystemAudioSignal(message as SystemAudioSignalMessage),
     )
     .on(
       [RuntimeMessageType.LOW_STORAGE_WARNING, RuntimeMessageType.AUTO_STOP_LOW_STORAGE],
-      (message) => handleStorageSignal(message as StorageSignalMessage),
+      (message) => session.applyStorageSignal(message as StorageSignalMessage),
     )
     .on(RuntimeMessageType.WEBCODECS_FATAL_ERROR, (message) =>
-      handleWebCodecsFatalError(message.error as string | undefined),
+      session.handleWebCodecsFatalError(message.error as string | undefined),
     )
     .on(RuntimeMessageType.OFFSCREEN_READY, () => {
       offscreenClient.markReady();
@@ -195,10 +177,10 @@ export default defineBackground(() => {
   chrome.runtime.onMessage.addListener(router.dispatch);
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    void handleRecordingTabUpdated(tabId, changeInfo);
+    void session.onRecordingTabUpdated(tabId, changeInfo);
   });
   chrome.runtime.onInstalled.addListener(() => {
-    void refreshOrphanedSessions();
+    void session.refreshOrphanedSessions();
   });
 
   void bootstrap();
@@ -206,203 +188,54 @@ export default defineBackground(() => {
 
 async function bootstrap() {
   await hydrateContext();
-  await reconcileWithOffscreen();
-  await refreshOrphanedSessions();
-  await broadcastSnapshot();
-}
-
-function normalizeAudioPreflight(value: Partial<AudioPreflightSnapshot> | null | undefined) {
-  return {
-    ...DEFAULT_AUDIO_PREFLIGHT,
-    ...(value ?? {}),
-    systemAudioStatus: normalizeSystemAudioStatus(value?.systemAudioStatus),
-  };
-}
-
-function isUsingWebCodecsBackend() {
-  return activeEncoderBackend === 'webcodecs';
+  await session.reconcileWithOffscreen();
+  await session.refreshOrphanedSessions();
+  await deps.broadcast(session.snapshot());
 }
 
 async function hydrateContext() {
   try {
     const stored = await loadPersistedContext();
     if (!stored) return;
-
-    sessionId = stored.sessionId ?? null;
-    recordingStartTime = stored.recordingStartTime ?? null;
-    chunkCount = stored.chunkCount ?? 0;
-    processingProgress = stored.processingProgress ?? null;
-    errorMessage = stored.errorMessage ?? null;
-    micWarningMessage = stored.micWarningMessage ?? null;
-    storageWarningMessage = stored.storageWarningMessage ?? null;
-    outputFileName = stored.outputFileName ?? null;
-    validation = stored.validation ?? null;
-    processingMetrics = stored.processingMetrics ?? null;
-    audioPreflight = normalizeAudioPreflight(stored.audioPreflight);
-    orphanedSessions = Array.isArray(stored.orphanedSessions) ? stored.orphanedSessions : [];
-    recoverySessionId = stored.recoverySessionId ?? null;
-    recoveryChunks = Array.isArray(stored.recoveryChunks) ? stored.recoveryChunks : [];
-    recordingQuality = normalizeCaptureQuality(stored.requestedPreset ?? stored.recordingQuality);
-    resolvedPreset =
-      stored.resolvedPreset == null ? null : normalizeResolvedCaptureQuality(stored.resolvedPreset);
-    activeEncoderBackend = stored.usingWebCodecs === false ? 'mediarecorder' : 'webcodecs';
-    webCodecsStats = stored.webCodecsStats ?? null;
-    outputUrl = null;
-
-    if (stored.state === 'done') {
-      errorMessage = 'Output must be reprocessed before download.';
-      setState('recovery', { force: true });
-      return;
-    }
-
-    // WebCodecs uses OPFS (webcodecs-stream.mp4 + manifest); after SW restart,
-    // reconcileWithOffscreen moves to recovery so the user can reprocess like MediaRecorder orphans.
-
-    setState(stored.state ?? 'idle', { force: true });
+    session.hydrate(stored);
   } catch (error) {
     console.error('Failed to hydrate context', error);
-    errorMessage = toErrorMessage(error);
-    setState('error', { force: true });
+    session.failHydration(error);
   }
 }
 
-async function reconcileWithOffscreen() {
-  if (!['recording', 'stopping', 'processing'].includes(state)) return;
-
-  try {
-    const status = await offscreenClient.send<{
-      alive?: boolean;
-      chunkCount?: number;
-      isRecording?: boolean;
-      isWebCodecsRecording?: boolean;
-    }>({ type: RuntimeMessageType.OFFSCREEN_STATUS });
-
-    if (!status?.alive) {
-      errorMessage = 'Offscreen recorder is unavailable.';
-      setState('recovery', { force: true });
-      return;
-    }
-
-    const captureLive = status.isRecording === true || status.isWebCodecsRecording === true;
-    if (state === 'recording' && !captureLive) {
-      errorMessage = 'Recording session was lost.';
-      setState('recovery', { force: true });
-      return;
-    }
-
-    if (typeof status.chunkCount === 'number') {
-      chunkCount = Math.max(chunkCount, status.chunkCount);
-      await persistContext();
-    }
-  } catch {
-    errorMessage = 'Unable to reconnect to offscreen recorder.';
-    setState('recovery', { force: true });
-  }
+async function handleOpenMicSettings() {
+  const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
+  const settingsUrl = `chrome://settings/content/siteDetails?site=${encodeURIComponent(extensionOrigin)}`;
+  await chrome.tabs.create({ url: settingsUrl });
+  return { ok: true };
 }
 
-function hasActiveRuntimeRecording() {
-  return ['recording', 'stopping', 'processing'].includes(state);
-}
-
-async function refreshOrphanedSessions() {
+async function handleWebCodecsCheckSupport(quality: CaptureQuality | undefined) {
   try {
     await offscreenClient.ensureReadyWithRetry(delay);
-    const result = await offscreenClient.send<{ ok?: boolean; sessions?: OrphanedSession[]; error?: string }>({
-      type: RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS,
+    const result = await offscreenClient.send<{
+      ok?: boolean;
+      videoSupported?: boolean;
+      audioSupported?: boolean;
+      hardwareAcceleration?: boolean;
+      fallbackReason?: string | null;
+      error?: string;
+    }>({
+      type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
+      quality,
     });
-
-    const sessions = Array.isArray(result?.sessions) ? result.sessions : [];
-    orphanedSessions = sessions.filter((session) => {
-      if (!hasActiveRuntimeRecording()) return true;
-      if (!sessionId) return true;
-      return session.sessionId !== sessionId;
-    });
-    await persistContext();
-    await broadcastSnapshot();
-  } catch {
-    // Keep the last known orphan list when scan is unavailable.
-  }
-}
-
-async function syncOrphanFixture(previousFixture: TestOrphanFixture, nextFixture: TestOrphanFixture) {
-  const previousSessionIds = new Set(previousFixture.sessions.map((session) => session.sessionId));
-  const nextSessionIds = new Set(nextFixture.sessions.map((session) => session.sessionId));
-
-  try {
-    await offscreenClient.ensureReadyWithRetry(delay);
-
-    for (const sessionIdToClear of previousSessionIds) {
-      if (nextSessionIds.has(sessionIdToClear)) continue;
-      await offscreenClient.send<{ ok?: boolean; error?: string }>({
-        type: RuntimeMessageType.OFFSCREEN_CLEAR_SESSION,
-        sessionId: sessionIdToClear,
-      });
-    }
-
-    if (nextFixture.sessions.length > 0) {
-      await offscreenClient.send<{ ok?: boolean; error?: string }>({
-        type: RuntimeMessageType.OFFSCREEN_TEST_SEED_ORPHANS,
-        sessions: nextFixture.sessions,
-      });
-    }
+    return result ?? { ok: false, error: 'No response from offscreen' };
   } catch (error) {
-    debugWarn('[Background] Failed to sync test orphan fixture:', error);
+    debugWarn('[Background] WebCodecs check failed:', error);
+    return {
+      ok: false,
+      error: toErrorMessage(error),
+      videoSupported: false,
+      audioSupported: false,
+      hardwareAcceleration: false,
+    };
   }
-
-  await refreshOrphanedSessions();
-  return { ok: true, snapshot: buildSnapshot() };
-}
-
-function buildSnapshot(): RecordingSnapshot {
-  const elapsedSeconds =
-    state === 'recording' && recordingStartTime
-      ? Math.max(0, Math.floor((Date.now() - recordingStartTime) / 1000))
-      : 0;
-
-  return {
-    state,
-    sessionId,
-    recordingStartTime,
-    elapsedSeconds,
-    chunkCount,
-    processingProgress,
-    errorMessage,
-    micWarningMessage,
-    storageWarningMessage,
-    canDownload: Boolean(outputUrl) && (state === 'done' || state === 'recovery'),
-    outputFileName,
-    requestedPreset: recordingQuality,
-    resolvedPreset,
-    recordingQuality,
-    validation,
-    processingMetrics,
-    audioPreflight,
-    orphanedSessions,
-    recoverySessionId,
-    recoveryChunks,
-    webCodecsStats,
-  };
-}
-
-function setState(next: RecordingState, options?: { force?: boolean }) {
-  if (next === state) {
-    updateBadge(next);
-    void syncRecordingBanner(next);
-    void persistContext();
-    void broadcastSnapshot();
-    return;
-  }
-
-  if (!options?.force && !ALLOWED_TRANSITIONS[state].includes(next)) {
-    console.warn(`Blocked invalid transition ${state} -> ${next}`);
-    return;
-  }
-
-  state = next;
-  updateBadge(next);
-  void syncRecordingBanner(next);
-  void persistContext();
-  void broadcastSnapshot();
 }
 
 function updateBadge(next: RecordingState) {
@@ -420,55 +253,6 @@ function updateBadge(next: RecordingState) {
   } else {
     chrome.action.setBadgeText({ text: '' });
   }
-}
-
-async function persistContext() {
-  const payload: PersistedContext = {
-    state,
-    sessionId,
-    recordingStartTime,
-    chunkCount,
-    processingProgress,
-    errorMessage,
-    micWarningMessage,
-    storageWarningMessage,
-    outputFileName,
-    requestedPreset: recordingQuality,
-    resolvedPreset,
-    recordingQuality,
-    validation,
-    processingMetrics,
-    audioPreflight,
-    orphanedSessions,
-    recoverySessionId,
-    recoveryChunks,
-    webCodecsStats,
-  };
-  await savePersistedContext(payload);
-}
-
-async function broadcastSnapshot() {
-  try {
-    await chrome.runtime.sendMessage({
-      type: RuntimeMessageType.STATE_CHANGE,
-      snapshot: buildSnapshot(),
-    });
-  } catch {
-    // Popup is usually closed; ignore.
-  }
-}
-
-async function syncRecordingBanner(next: RecordingState) {
-  if (next === 'recording') {
-    if (recordingTabId === null) return;
-    await ensureRecordingBannerVisible(recordingTabId);
-    return;
-  }
-
-  if (recordingTabId === null) return;
-  const targetTabId = recordingTabId;
-  recordingTabId = null;
-  await sendRecordingBanner(targetTabId, false);
 }
 
 async function sendRecordingBanner(tabId: number, visible: boolean) {
@@ -539,1209 +323,6 @@ async function ensureRecordingBannerVisible(tabId: number) {
   }
 }
 
-async function handleRecordingTabUpdated(tabId: number, changeInfo: chrome.tabs.OnUpdatedInfo) {
-  if (recordingTabId === null || tabId !== recordingTabId) return;
-  if (state !== 'recording') return;
-  if (changeInfo.status !== 'complete') return;
-  await ensureRecordingBannerVisible(tabId);
-}
-
-function resetSessionMetadata(nextSessionId: string) {
-  sessionId = nextSessionId;
-  recordingStartTime = null;
-  chunkCount = 0;
-  processingProgress = null;
-  errorMessage = null;
-  micWarningMessage = null;
-  storageWarningMessage = null;
-  outputFileName = null;
-  outputUrl = null;
-  validation = null;
-  processingMetrics = null;
-  recoverySessionId = null;
-  recoveryChunks = [];
-  webCodecsStats = null;
-  resolvedPreset = null;
-  audioPreflight = {
-    ...audioPreflight,
-    systemAudioStatus: 'idle',
-    systemAudioLevel: null,
-  };
-}
-
-function resetAttemptMetadata() {
-  sessionId = null;
-  recordingStartTime = null;
-  chunkCount = 0;
-  processingProgress = null;
-  errorMessage = null;
-  micWarningMessage = null;
-  storageWarningMessage = null;
-  outputFileName = null;
-  outputUrl = null;
-  validation = null;
-  processingMetrics = null;
-  recoverySessionId = null;
-  recoveryChunks = [];
-  audioPreflight = { ...DEFAULT_AUDIO_PREFLIGHT };
-  activeAudioSource = 'both';
-  selectedMicDeviceId = null;
-  resolvedPreset = null;
-  webCodecsStats = null;
-}
-
-async function handleStart(
-  audioSource: AudioSource = 'both',
-  micDeviceId: string | null = null,
-  quality: CaptureQuality = 'auto',
-) {
-  if (state !== 'armed') {
-    return { ok: false, error: `Cannot start from state "${state}"`, snapshot: buildSnapshot() };
-  }
-
-  activeAudioSource = audioSource;
-  selectedMicDeviceId = audioSource === 'both' || audioSource === 'mic' ? micDeviceId : null;
-  recordingQuality = normalizeCaptureQuality(quality);
-  resolvedPreset = null;
-  const recordingStartedAt = Date.now();
-  const nextSessionId = createSessionId(recordingStartedAt);
-  resetSessionMetadata(nextSessionId);
-
-  // Encoder backend is productized settings now (WebCodecs default, legacy optional).
-  const recorderSettings = await loadRecorderSettings();
-  activeEncoderBackend = recorderSettings.encoderBackend;
-
-  try {
-    const targetTab = await getStartTargetTab();
-    const targetTabId = targetTab.id!;
-    const testCaptureFixture = isTestControlPlaneEnabled() ? await getTestActiveTabFixture() : null;
-    const useTestCaptureStream = testCaptureFixture?.id === targetTabId;
-    if (isTestControlPlaneEnabled()) {
-      if (useTestCaptureStream) {
-        try {
-          await chrome.tabs.update(targetTabId, { active: true });
-        } catch {
-          // Best-effort: the active-tab capture grant is only needed for test flows.
-        }
-      }
-    }
-    const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
-    if (!staleCaptureRecovery.ok) {
-      errorMessage = formatCodedStartError(
-        'TAB_CAPTURE_ACTIVE',
-        'Chrome still has an active capture attached to this tab. Stop the current share and try again.',
-        staleCaptureRecovery.detail,
-      );
-      setState('preflight_error');
-      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-    }
-
-    let streamId = useTestCaptureStream
-      ? buildTestCaptureStreamId(targetTabId)
-      : await getTabCaptureStreamId(targetTabId);
-    if (!streamId) {
-      errorMessage = formatCodedStartError(
-        'TAB_CAPTURE_STREAM_UNAVAILABLE',
-        'Could not create a capture stream for the current tab. Reload the tab and try again.',
-      );
-      setState('preflight_error');
-      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-    }
-
-    recordingTabId = targetTabId;
-    const exportBaseName = buildExportBaseName({
-      timestampMs: recordingStartedAt,
-      title: targetTab.title,
-      url: targetTab.url,
-    });
-
-    let result: OffscreenResponse;
-    const startMediaRecorder = async () =>
-      await offscreenClient.send<OffscreenResponse>({
-        type: RuntimeMessageType.OFFSCREEN_START,
-        sessionId: nextSessionId,
-        streamId,
-        audioSource,
-        micDeviceId: selectedMicDeviceId,
-        quality: recordingQuality,
-        exportBaseName,
-        recordingStartTime: recordingStartedAt,
-      });
-
-    if (isUsingWebCodecsBackend()) {
-      // 4.1: WebCodecs primary path with automatic MediaRecorder fallback.
-      let webCodecsError: string | null = null;
-      try {
-        const webCodecsResult = await offscreenClient.send<OffscreenResponse>({
-          type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS,
-          sessionId: nextSessionId,
-          streamId,
-          quality: recordingQuality,
-          audioSource,
-          micDeviceId: selectedMicDeviceId,
-          exportBaseName,
-          recordingStartTime: recordingStartedAt,
-        });
-        if (webCodecsResult?.ok) {
-          result = webCodecsResult;
-        } else {
-          webCodecsError = webCodecsResult?.error ?? 'Unknown WebCodecs start failure';
-          debugWarn('[Background] WebCodecs start failed; falling back to MediaRecorder:', webCodecsError);
-          activeEncoderBackend = 'mediarecorder';
-          const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
-          if (!staleCaptureRecovery.ok) {
-            result = {
-              ok: false,
-              error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${staleCaptureRecovery.detail ?? 'Unable to release stale tab capture'}`,
-            };
-          } else {
-            streamId = useTestCaptureStream
-              ? buildTestCaptureStreamId(targetTabId)
-              : await getTabCaptureStreamId(targetTabId);
-            const fallback = await startMediaRecorder();
-            result =
-              fallback?.ok || !fallback
-                ? fallback
-                : {
-                    ...fallback,
-                    error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${fallback.error ?? 'Unknown fallback failure'}`,
-                  };
-          }
-        }
-      } catch (error) {
-        webCodecsError = toErrorMessage(error);
-        debugWarn('[Background] WebCodecs start threw; falling back to MediaRecorder:', webCodecsError);
-        activeEncoderBackend = 'mediarecorder';
-        const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
-        if (!staleCaptureRecovery.ok) {
-          result = {
-            ok: false,
-            error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${staleCaptureRecovery.detail ?? 'Unable to release stale tab capture'}`,
-          };
-        } else {
-          streamId = useTestCaptureStream
-            ? buildTestCaptureStreamId(targetTabId)
-            : await getTabCaptureStreamId(targetTabId);
-          const fallback = await startMediaRecorder();
-          result =
-            fallback?.ok || !fallback
-              ? fallback
-              : {
-                  ...fallback,
-                  error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${fallback.error ?? 'Unknown fallback failure'}`,
-                };
-        }
-      }
-    } else {
-      result = await startMediaRecorder();
-    }
-
-    if (!result?.ok) {
-      recordingTabId = null;
-      errorMessage = normalizeStartFailureMessage(result?.error ?? 'Failed to start recorder');
-      setState('preflight_error');
-      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-    }
-
-    recordingQuality = normalizeCaptureQuality(result.requestedPreset ?? recordingQuality);
-    resolvedPreset =
-      result.resolvedPreset == null ? null : normalizeResolvedCaptureQuality(result.resolvedPreset);
-
-    recordingStartTime = recordingStartedAt;
-    outputFileName = buildDownloadFileName(
-      exportBaseName,
-      result.outputMimeType ?? (String(result.fileName ?? '').endsWith('.webm') ? 'video/webm' : 'video/mp4'),
-    );
-    audioPreflight = {
-      ...audioPreflight,
-      ...getSystemAudioPreflightSnapshot(activeAudioSource, isUsingWebCodecsBackend()),
-    };
-    await persistContext();
-    await broadcastSnapshot();
-    setState('recording');
-    return { ok: true, snapshot: buildSnapshot() };
-  } catch (error) {
-    recordingTabId = null;
-    errorMessage = normalizeStartFailureMessage(toErrorMessage(error));
-    setState('preflight_error');
-    return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-  }
-}
-
-async function handlePrepareStart(
-  includeMic = true,
-  micDeviceId: string | null = null,
-  quality: CaptureQuality = 'auto',
-) {
-  try {
-    if (state === 'armed') {
-      recordingQuality = normalizeCaptureQuality(quality);
-      resolvedPreset = null;
-      await persistContext();
-      await broadcastSnapshot();
-      return { ok: true, snapshot: buildSnapshot() };
-    }
-
-    if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
-      return { ok: false, error: `Cannot prepare from state "${state}"`, snapshot: buildSnapshot() };
-    }
-
-    recordingQuality = normalizeCaptureQuality(quality);
-    resolvedPreset = null;
-    resetAttemptMetadata();
-    await persistContext();
-    await broadcastSnapshot();
-
-    const storageCheck = await checkStorageQuota();
-    storageWarningMessage = storageCheck.warningMessage ?? null;
-    if (!storageCheck.ok) {
-      errorMessage = storageCheck.warningMessage ?? 'Insufficient storage to start recording';
-      setState('preflight_error');
-      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-    }
-
-    setState('preflight');
-    const preflightStartedAt = Date.now();
-
-    const targetTab = await getStartTargetTab({ validateCapturable: false });
-    const targetTabId = targetTab.id!;
-    const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
-    if (!staleCaptureRecovery.ok) {
-      errorMessage = formatCodedStartError(
-        'TAB_CAPTURE_ACTIVE',
-        'Chrome still has an active capture attached to this tab. Stop the current share and try again.',
-        staleCaptureRecovery.detail,
-      );
-      setState('preflight_error');
-      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-    }
-
-    await offscreenClient.ensureReadyWithRetry(delay);
-
-    if (!includeMic) {
-      selectedMicDeviceId = null;
-      audioPreflight = {
-        ...audioPreflight,
-        micChecked: true,
-        micOk: true,
-        micLevel: null,
-        micError: null,
-        systemAudioStatus: 'idle',
-        systemAudioLevel: null,
-      };
-      errorMessage = null;
-      await persistContext();
-      await broadcastSnapshot();
-      setState('armed');
-      return { ok: true, snapshot: buildSnapshot() };
-    }
-
-    selectedMicDeviceId = micDeviceId;
-    const micPreflight = await runMicPreflight(selectedMicDeviceId);
-    audioPreflight = {
-      ...audioPreflight,
-      micChecked: true,
-      micOk: micPreflight.ok,
-      micLevel: typeof micPreflight.level === 'number' ? micPreflight.level : null,
-      micError: micPreflight.error ?? null,
-      systemAudioStatus: 'idle',
-      systemAudioLevel: null,
-    };
-    await persistContext();
-    await broadcastSnapshot();
-
-    const visibleMs = Date.now() - preflightStartedAt;
-    if (visibleMs < PREFLIGHT_RESULT_MIN_VISIBLE_MS) {
-      await delay(PREFLIGHT_RESULT_MIN_VISIBLE_MS - visibleMs);
-    }
-
-    if (!micPreflight.ok) {
-      errorMessage = micPreflight.error ?? 'Microphone pre-flight failed';
-      setState('preflight_error');
-      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-    }
-    errorMessage = null;
-    setState('armed');
-    return { ok: true, snapshot: buildSnapshot() };
-  } catch (error) {
-    errorMessage = toErrorMessage(error);
-    setState('preflight_error');
-    return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-  }
-}
-
-async function handlePrepareStartRequest(
-  includeMic = true,
-  micDeviceId: string | null = null,
-  quality: CaptureQuality = 'auto',
-) {
-  try {
-    return await handlePrepareStart(includeMic, micDeviceId, quality);
-  } catch (error) {
-    errorMessage = toErrorMessage(error);
-    setState('preflight_error');
-    return {
-      ok: false,
-      error: errorMessage,
-      snapshot: buildSnapshot(),
-    };
-  }
-}
-
-async function handleOpenMicSettings() {
-  const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
-  const settingsUrl = `chrome://settings/content/siteDetails?site=${encodeURIComponent(extensionOrigin)}`;
-  await chrome.tabs.create({ url: settingsUrl });
-  return { ok: true };
-}
-
-async function handleWebCodecsCheckSupport(quality: CaptureQuality | undefined) {
-  try {
-    await offscreenClient.ensureReadyWithRetry(delay);
-    const result = await offscreenClient.send<{
-      ok?: boolean;
-      videoSupported?: boolean;
-      audioSupported?: boolean;
-      hardwareAcceleration?: boolean;
-      fallbackReason?: string | null;
-      error?: string;
-    }>({
-      type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
-      quality,
-    });
-    return result ?? { ok: false, error: 'No response from offscreen' };
-  } catch (error) {
-    debugWarn('[Background] WebCodecs check failed:', error);
-    return {
-      ok: false,
-      error: toErrorMessage(error),
-      videoSupported: false,
-      audioSupported: false,
-      hardwareAcceleration: false,
-    };
-  }
-}
-
-async function runMicPreflight(micDeviceId: string | null = null): Promise<MicPreflightResponse> {
-  try {
-    const permissionState = await resolveMicrophonePermissionState();
-    const payload: Record<string, unknown> = { type: RuntimeMessageType.MIC_PREFLIGHT };
-    if (micDeviceId) {
-      payload.micDeviceId = micDeviceId;
-    }
-    if (permissionState) {
-      payload.permissionState = permissionState;
-    }
-    const result = await offscreenClient.send<MicPreflightResponse>(payload);
-    if (!result?.ok) {
-      return {
-        ok: false,
-        error: result?.error ?? 'Microphone pre-flight failed',
-      };
-    }
-
-    return {
-      ok: true,
-      level: typeof result.level === 'number' ? result.level : 0,
-      deviceLabel: typeof result.deviceLabel === 'string' ? result.deviceLabel : null,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: toErrorMessage(error),
-    };
-  }
-}
-
-async function handleRunMicCheck(micDeviceId: string | null = null) {
-  if (!['idle', 'done', 'preflight_error', 'recovery', 'error'].includes(state)) {
-    return {
-      ok: false,
-      error: `Cannot check microphone from state "${state}"`,
-      snapshot: buildSnapshot(),
-    };
-  }
-
-  selectedMicDeviceId = micDeviceId;
-  const micPreflight = await runMicPreflight(selectedMicDeviceId);
-  audioPreflight = {
-    ...audioPreflight,
-    micChecked: true,
-    micOk: micPreflight.ok,
-    micLevel: typeof micPreflight.level === 'number' ? micPreflight.level : null,
-    micError: micPreflight.error ?? null,
-  };
-  if (micPreflight.ok) {
-    micWarningMessage = null;
-  }
-
-  await persistContext();
-  await broadcastSnapshot();
-  return {
-    ok: micPreflight.ok,
-    level: micPreflight.level,
-    deviceLabel: micPreflight.deviceLabel ?? null,
-    error: micPreflight.error,
-    snapshot: buildSnapshot(),
-  };
-}
-
-async function handleReleaseMicCheck() {
-  await releasePreflightMicHold();
-  audioPreflight = {
-    ...audioPreflight,
-    micChecked: false,
-    micOk: false,
-    micLevel: null,
-    micError: null,
-  };
-  micWarningMessage = null;
-  await persistContext();
-  await broadcastSnapshot();
-  return { ok: true, snapshot: buildSnapshot() };
-}
-
-async function releasePreflightMicHold() {
-  try {
-    await offscreenClient.ensureReadyWithRetry(delay);
-    await offscreenClient.send<{ ok?: boolean }>({
-      type: RuntimeMessageType.OFFSCREEN_RELEASE_PREFLIGHT_MIC,
-    });
-  } catch {
-    // Best-effort cleanup for any preflight-held mic stream.
-  }
-}
-
-async function checkStorageQuota() {
-  try {
-    const estimate = await navigator.storage.estimate();
-    const availableBytes = Math.max(0, (estimate.quota ?? 0) - (estimate.usage ?? 0));
-    const availableMB = availableBytes / (1024 * 1024);
-
-    if (availableMB < 50) {
-      return {
-        ok: false,
-        warningMessage: `Only ${Math.round(availableMB)}MB available. Free up storage before recording.`,
-      };
-    }
-
-    if (availableMB < 500) {
-      return {
-        ok: true,
-        warningMessage: `Low storage: ~${Math.round(availableMB / 100)} min of recording remaining.`,
-      };
-    }
-
-    return { ok: true };
-  } catch {
-    // If storage estimate is unavailable, do not block recording.
-    return { ok: true };
-  }
-}
-
-async function handleCancelStart() {
-  if (state === 'armed') {
-    await releasePreflightMicHold();
-    errorMessage = null;
-    setState('idle');
-  } else if (state === 'preflight') {
-    await releasePreflightMicHold();
-    errorMessage = null;
-    setState('idle', { force: true });
-  }
-  return { ok: true, snapshot: buildSnapshot() };
-}
-
-async function handleStop() {
-  if (state !== 'recording') {
-    return { ok: false, error: `Cannot stop from state "${state}"`, snapshot: buildSnapshot() };
-  }
-
-  setState('stopping');
-
-  try {
-    if (isUsingWebCodecsBackend()) {
-      // WebCodecs path: stop returns the final MP4 directly, no processing needed
-      const result = await offscreenClient.send<OffscreenResponse & {
-        outputSize?: number;
-        stopDurationMs?: number;
-      }>({
-        type: RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS,
-      });
-
-      if (!result?.ok) {
-        errorMessage = result?.error ?? 'Failed to stop WebCodecs recorder';
-        activeEncoderBackend = 'webcodecs';
-        setState('error');
-        return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-      }
-
-      // WebCodecs returns the output directly - skip processing
-      outputUrl = result.outputUrl ?? null;
-      outputFileName = outputFileName ?? buildDownloadFileName(sessionId, result.outputMimeType ?? 'video/mp4');
-      validation = result.validation ?? null;
-      processingProgress = 100;
-
-      activeEncoderBackend = 'webcodecs';
-      await persistContext();
-      await broadcastSnapshot();
-
-      // Go directly to done (skip processing/validating for WebCodecs)
-      setState('done', { force: true });
-      return { ok: true, snapshot: buildSnapshot() };
-    }
-
-    // Standard MediaRecorder path
-    const result = await offscreenClient.send<OffscreenResponse>({
-      type: RuntimeMessageType.OFFSCREEN_STOP,
-      sessionId,
-    });
-
-    if (!result?.ok) {
-      errorMessage = result?.error ?? 'Failed to stop recorder';
-      setState('error');
-      return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-    }
-
-    return { ok: true, snapshot: buildSnapshot() };
-  } catch (error) {
-    errorMessage = toErrorMessage(error);
-    activeEncoderBackend = 'webcodecs';
-    setState('error');
-    return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-  }
-}
-
-async function handleWebCodecsFatalError(errorMsg?: string) {
-  if (!isUsingWebCodecsBackend() || !['recording', 'stopping', 'error'].includes(state)) {
-    return { ok: true };
-  }
-
-  debugWarn('[Background] WebCodecs fatal error, triggering graceful stop:', errorMsg);
-  try {
-    const status = await offscreenClient.send<{
-      alive?: boolean;
-      isWebCodecsRecording?: boolean;
-    }>({
-      type: RuntimeMessageType.OFFSCREEN_STATUS,
-    });
-
-    if (status?.alive && status.isWebCodecsRecording) {
-      const result = await offscreenClient.send<OffscreenResponse>({
-        type: RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS,
-      });
-
-      if (result?.ok) {
-        outputUrl = result.outputUrl ?? null;
-        outputFileName = outputFileName ?? buildDownloadFileName(sessionId, result.outputMimeType ?? 'video/mp4');
-        validation = result.validation ?? null;
-        processingProgress = 100;
-        await persistContext();
-        await broadcastSnapshot();
-        setState('done', { force: true });
-        return { ok: true, snapshot: buildSnapshot() };
-      }
-    }
-  } catch (error) {
-    debugWarn('[Background] Graceful WebCodecs fatal stop failed:', error);
-  }
-
-  try {
-    await offscreenClient.send<{ ok?: boolean; error?: string }>({
-      type: RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP,
-    });
-  } catch (error) {
-    debugWarn('[Background] Forced WebCodecs cleanup failed:', error);
-  }
-
-  recordingTabId = null;
-  resetAttemptMetadata();
-  errorMessage = errorMsg ?? 'WebCodecs recording failed unexpectedly';
-  activeEncoderBackend = 'webcodecs';
-  setState('error', { force: true });
-  return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-}
-
-async function handleDownload() {
-  if (!outputUrl) {
-    return { ok: false, error: 'No processed MP4 is available yet', snapshot: buildSnapshot() };
-  }
-
-  try {
-    const filename = outputFileName ?? buildDownloadFileName(sessionId, 'video/mp4');
-    const downloadId = await chrome.downloads.download({
-      url: outputUrl,
-      filename,
-      saveAs: true,
-    });
-
-    setState('idle');
-    return { ok: true, downloadId, snapshot: buildSnapshot() };
-  } catch (error) {
-    errorMessage = toErrorMessage(error);
-    setState('error');
-    return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
-  }
-}
-
-async function handleResetToIdle() {
-  if (['recording', 'stopping', 'processing', 'validating', 'armed'].includes(state)) {
-    return {
-      ok: false,
-      error: `Cannot reset while state is "${state}"`,
-      snapshot: buildSnapshot(),
-    };
-  }
-
-  await releasePreflightMicHold();
-  resetAttemptMetadata();
-  setState('idle', { force: true });
-  return { ok: true, snapshot: buildSnapshot() };
-}
-
-async function handleDownloadRawChunks(targetSessionId: string) {
-  if (!targetSessionId) {
-    return { ok: false, error: 'Missing session id', snapshot: buildSnapshot() };
-  }
-
-  try {
-    await offscreenClient.ensureReadyWithRetry(delay);
-    const result = await offscreenClient.send<{
-      ok?: boolean;
-      error?: string;
-      items?: RawDownloadItem[];
-    }>({
-      type: RuntimeMessageType.OFFSCREEN_DOWNLOAD_RAW_CHUNKS,
-      sessionId: targetSessionId,
-    });
-
-    if (!result?.ok) {
-      return {
-        ok: false,
-        error: result?.error ?? 'Failed to download raw chunks',
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    const items = Array.isArray(result.items) ? result.items : [];
-    if (!items.length) {
-      return {
-        ok: false,
-        error: 'No raw files available to download',
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    let downloadCount = 0;
-    for (const item of items) {
-      if (!item?.url || !item?.filename) continue;
-      try {
-        await chrome.downloads.download({
-          url: item.url,
-          filename: item.filename,
-          saveAs: false,
-        });
-        downloadCount += 1;
-      } catch {
-        // Continue attempting remaining files even if one download fails.
-      }
-    }
-
-    if (!downloadCount) {
-      return {
-        ok: false,
-        error: 'Unable to trigger raw file downloads',
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    return {
-      ok: true,
-      downloadCount,
-      snapshot: buildSnapshot(),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: toErrorMessage(error),
-      snapshot: buildSnapshot(),
-    };
-  }
-}
-
-async function handleSystemAudioSignal(message: SystemAudioSignalMessage) {
-  if (state !== 'recording') {
-    return { ok: true };
-  }
-
-  if (message.type === RuntimeMessageType.SYSTEM_AUDIO_OK) {
-    audioPreflight = {
-      ...audioPreflight,
-      systemAudioStatus: 'ok',
-      systemAudioLevel: typeof message.level === 'number' ? message.level : null,
-    };
-    errorMessage = null;
-    micWarningMessage = null;
-    await persistContext();
-    await broadcastSnapshot();
-    return { ok: true };
-  }
-
-  const warningMessage = (() => {
-    if (activeAudioSource === 'both') {
-      return message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
-        ? 'System audio track is missing. Recording continues with microphone.'
-        : 'System audio appears silent. Recording continues with microphone.';
-    }
-    if (activeAudioSource === 'tab') {
-      return message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
-        ? 'System audio track is missing. The recording may not include tab audio.'
-        : 'System audio appears silent. Check the tab output volume.';
-    }
-    return null;
-  })();
-
-  audioPreflight = {
-    ...audioPreflight,
-    systemAudioStatus: message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT ? 'absent' : 'silent',
-    systemAudioLevel: typeof message.level === 'number' ? message.level : null,
-  };
-  micWarningMessage = warningMessage;
-  errorMessage = null;
-  await persistContext();
-  await broadcastSnapshot();
-  return { ok: true };
-}
-
-async function handleStorageSignal(message: StorageSignalMessage) {
-  const availableMB =
-    typeof message.availableMB === 'number' && Number.isFinite(message.availableMB)
-      ? Math.max(0, message.availableMB)
-      : null;
-
-  if (message.type === RuntimeMessageType.LOW_STORAGE_WARNING) {
-    storageWarningMessage =
-      availableMB === null
-        ? 'Low storage detected while recording.'
-        : `Low storage warning: ${Math.round(availableMB)}MB remaining.`;
-    await persistContext();
-    await broadcastSnapshot();
-    return { ok: true };
-  }
-
-  storageWarningMessage =
-    availableMB === null
-      ? 'Critical storage level reached. Stopping recording safely.'
-      : `Critical storage level (${Math.round(availableMB)}MB). Stopping recording safely.`;
-  errorMessage = storageWarningMessage;
-  await persistContext();
-  await broadcastSnapshot();
-
-  if (state === 'recording') {
-    return await handleStop();
-  }
-
-  return { ok: true, snapshot: buildSnapshot() };
-}
-
-async function handleRefreshOrphans() {
-  await refreshOrphanedSessions();
-  return { ok: true, snapshot: buildSnapshot() };
-}
-
-function primeRecoveredSessionContext(orphan: OrphanedSession) {
-  sessionId = orphan.sessionId;
-  recordingStartTime = null;
-  chunkCount = orphan.chunkCount;
-  processingProgress = null;
-  errorMessage = null;
-  micWarningMessage = null;
-  outputFileName = null;
-  outputUrl = null;
-  validation = null;
-  processingMetrics = null;
-  recoverySessionId = null;
-  recoveryChunks = [];
-  audioPreflight = { ...DEFAULT_AUDIO_PREFLIGHT };
-}
-
-async function handleRecoverOrphan(targetSessionId: string, chunkIndexes?: number[]) {
-  try {
-    if (!targetSessionId) {
-      return { ok: false, error: 'Missing session id', snapshot: buildSnapshot() };
-    }
-
-    if (['preflight', 'armed', 'recording', 'stopping', 'processing'].includes(state)) {
-      return {
-        ok: false,
-        error: `Cannot recover while state is "${state}"`,
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    const target = orphanedSessions.find((session) => session.sessionId === targetSessionId);
-    if (!target) {
-      await refreshOrphanedSessions();
-    }
-
-    let resolvedTarget = target ?? orphanedSessions.find((session) => session.sessionId === targetSessionId);
-    if (!resolvedTarget) {
-      const canUseActiveRecoverySession =
-        state === 'recovery' &&
-        (recoverySessionId === targetSessionId || sessionId === targetSessionId);
-
-      if (canUseActiveRecoverySession) {
-        resolvedTarget = {
-          sessionId: targetSessionId,
-          startTime: recordingStartTime ?? Date.now(),
-          chunkCount: recoveryChunks.length > 0 ? recoveryChunks.length : chunkCount,
-          totalSize: 0,
-        };
-      } else {
-        return { ok: false, error: 'Orphaned session not found', snapshot: buildSnapshot() };
-      }
-    }
-
-    let selectedChunkIndexes = chunkIndexes;
-    if (!Array.isArray(selectedChunkIndexes) || !selectedChunkIndexes.length) {
-      await offscreenClient.ensureReadyWithRetry(delay);
-      const inspect = await offscreenClient.send<RecoveryInspectResponse>({
-        type: RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT,
-        sessionId: targetSessionId,
-      });
-
-      if (!inspect?.ok) {
-        return {
-          ok: false,
-          error: inspect?.error ?? 'Failed to inspect orphaned session chunks',
-          snapshot: buildSnapshot(),
-        };
-      }
-
-      recordingQuality = normalizeCaptureQuality(inspect.recordingQuality);
-      resolvedPreset =
-        inspect.recordingResolvedQuality == null
-          ? null
-          : normalizeResolvedCaptureQuality(inspect.recordingResolvedQuality);
-
-      const inspectedChunks = Array.isArray(inspect.chunks) ? inspect.chunks : [];
-      const suspectChunks = inspectedChunks.filter((chunk) => chunk.status !== 'ok');
-      if (suspectChunks.length) {
-        recoverySessionId = targetSessionId;
-        recoveryChunks = inspectedChunks.map((chunk) => ({
-          ...chunk,
-          included: chunk.status !== 'missing' && chunk.status === 'ok',
-        }));
-        errorMessage = 'Suspect chunks detected. Select chunks to include before processing.';
-        // Orphan recovery can be entered directly from the control plane while idle,
-        // so force the UI into recovery even when the state machine has not been
-        // pre-armed by a validating flow.
-        setState('recovery', { force: true });
-        return {
-          ok: false,
-          error: errorMessage,
-          snapshot: buildSnapshot(),
-        };
-      }
-
-      selectedChunkIndexes = inspectedChunks
-        .filter((chunk) => chunk.status !== 'missing')
-        .map((chunk) => chunk.index);
-    }
-
-    const fallbackRecoveryChunks =
-      recoverySessionId === resolvedTarget.sessionId && recoveryChunks.length
-        ? recoveryChunks.map((chunk) => ({ ...chunk }))
-        : [];
-
-    primeRecoveredSessionContext(resolvedTarget);
-    await persistContext();
-    await broadcastSnapshot();
-
-    await runProcessingPipeline({
-      targetSessionId: resolvedTarget.sessionId,
-      chunkIndexes: selectedChunkIndexes,
-      fallbackRecoveryChunks,
-    });
-
-    if (state === 'done' && outputUrl) {
-      const downloadResult = await handleDownload();
-      await refreshOrphanedSessions();
-      return {
-        ok: Boolean(downloadResult?.ok),
-        error: downloadResult?.ok ? undefined : (downloadResult?.error as string | undefined),
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    await refreshOrphanedSessions();
-    if (state === 'error' || state === 'recovery') {
-      return {
-        ok: false,
-        error: errorMessage ?? 'Failed to recover orphaned session',
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    return { ok: true, snapshot: buildSnapshot() };
-  } catch (error) {
-    return {
-      ok: false,
-      error: toErrorMessage(error),
-      snapshot: buildSnapshot(),
-    };
-  }
-}
-
-async function handleDiscardOrphan(targetSessionId: string) {
-  if (!targetSessionId) {
-    return { ok: false, error: 'Missing session id', snapshot: buildSnapshot() };
-  }
-
-  try {
-    await offscreenClient.ensureReadyWithRetry(delay);
-    const result = await offscreenClient.send<{ ok?: boolean; error?: string }>({
-      type: RuntimeMessageType.OFFSCREEN_CLEAR_SESSION,
-      sessionId: targetSessionId,
-    });
-
-    if (!result?.ok) {
-      return {
-        ok: false,
-        error: result?.error ?? 'Failed to discard orphaned session',
-        snapshot: buildSnapshot(),
-      };
-    }
-
-    orphanedSessions = orphanedSessions.filter((session) => session.sessionId !== targetSessionId);
-    if (recoverySessionId === targetSessionId) {
-      recoverySessionId = null;
-      recoveryChunks = [];
-    }
-    await persistContext();
-    await broadcastSnapshot();
-    await refreshOrphanedSessions();
-    return { ok: true, snapshot: buildSnapshot() };
-  } catch (error) {
-    return { ok: false, error: toErrorMessage(error), snapshot: buildSnapshot() };
-  }
-}
-
-async function handleOffscreenEvent(message: OffscreenEventMessage) {
-  if (typeof message.chunkCount === 'number') {
-    chunkCount = Math.max(chunkCount, message.chunkCount);
-    await persistContext();
-    await broadcastSnapshot();
-  }
-
-  if (message.event === OffscreenEventType.PROCESS_PROGRESS && typeof message.progress === 'number') {
-    const nextProgress = Math.max(0, Math.min(100, Math.floor(message.progress)));
-    const currentProgress = typeof processingProgress === 'number' ? processingProgress : 0;
-    processingProgress = Math.max(currentProgress, nextProgress);
-    await persistContext();
-    await broadcastSnapshot();
-    return { ok: true };
-  }
-
-  if (message.event === OffscreenEventType.PROCESS_METRICS && message.metrics) {
-    processingMetrics = message.metrics;
-    await persistContext();
-    await broadcastSnapshot();
-    return { ok: true };
-  }
-
-  if (message.event === OffscreenEventType.WEBCODECS_STATS && message.webCodecsStats) {
-    webCodecsStats = message.webCodecsStats;
-    await persistContext();
-    await broadcastSnapshot();
-    return { ok: true };
-  }
-
-  if (message.event === OffscreenEventType.ERROR) {
-    errorMessage = message.error ?? 'Offscreen pipeline error';
-    if (isUsingWebCodecsBackend() && ['recording', 'stopping'].includes(state)) {
-      await persistContext();
-      await broadcastSnapshot();
-      return { ok: true };
-    }
-    setState('error');
-    return { ok: true };
-  }
-
-  if (message.event === OffscreenEventType.FINAL_CHUNK_WRITTEN) {
-    if (state === 'stopping' && !isUsingWebCodecsBackend()) {
-      // Critical transition: stopping -> processing happens only after OPFS confirms final chunk write.
-      // WebCodecs path handles stop->done directly in handleStop, so skip processing here.
-      await runProcessingPipeline();
-    }
-    return { ok: true };
-  }
-
-  return { ok: true };
-}
-
-async function handleMicMixFailed(message: MicMixFailedMessage) {
-  if (!['armed', 'recording', 'stopping'].includes(state)) {
-    return { ok: true };
-  }
-
-  if (activeAudioSource === 'tab' || activeAudioSource === 'silent') {
-    return { ok: true };
-  }
-
-  micWarningMessage =
-    message.fallback === 'mic_only'
-      ? 'Tab audio unavailable — continuing with microphone only.'
-      : 'Microphone unavailable — continuing without mic audio.';
-  audioPreflight = {
-    ...audioPreflight,
-    micOk: message.fallback === 'mic_only',
-    micError: message.reason ?? RuntimeMessageType.MIC_MIX_FAILED,
-  };
-  await persistContext();
-  await broadcastSnapshot();
-  return { ok: true };
-}
-
-async function runProcessingPipeline(options?: {
-  targetSessionId?: string;
-  chunkIndexes?: number[];
-  fallbackRecoveryChunks?: RecoveryChunkCheck[];
-}) {
-  if (processingPipelineRunning) return;
-  const targetSessionId = options?.targetSessionId ?? sessionId;
-  if (!targetSessionId) {
-    errorMessage = 'Missing session id for processing';
-    setState('error');
-    return;
-  }
-
-  sessionId = targetSessionId;
-
-  processingPipelineRunning = true;
-  try {
-    processingProgress = 0;
-    setState('processing');
-
-    const processPayload: Record<string, unknown> = {
-      type: RuntimeMessageType.OFFSCREEN_PROCESS,
-      sessionId: targetSessionId,
-    };
-    if (Array.isArray(options?.chunkIndexes) && options.chunkIndexes.length) {
-      processPayload.chunkIndexes = options.chunkIndexes;
-    }
-
-    const processResult = await offscreenClient.send<OffscreenResponse>(processPayload);
-
-    if (!processResult?.ok || !processResult.outputUrl) {
-      errorMessage = processResult?.error ?? 'MP4 processing failed';
-      setState('error');
-      return;
-    }
-
-    outputUrl = processResult.outputUrl;
-    outputFileName = outputFileName ?? buildDownloadFileName(targetSessionId, processResult.outputMimeType ?? 'video/mp4');
-    processingProgress = 100;
-    validation = processResult.validation ?? null;
-    await persistContext();
-    await broadcastSnapshot();
-
-    setState('validating');
-
-    const validationResult =
-      validation ??
-      (await offscreenClient.send<ValidationResult>({
-        type: RuntimeMessageType.OFFSCREEN_VALIDATE,
-      }));
-
-    validation = validationResult ?? null;
-    await persistContext();
-    await broadcastSnapshot();
-
-    if (!validationResult?.passed) {
-      recoverySessionId = targetSessionId;
-      let inspectError: string | null = null;
-
-      try {
-        const inspect = await offscreenClient.send<RecoveryInspectResponse>({
-          type: RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT,
-          sessionId: targetSessionId,
-        });
-
-        if (inspect?.ok && Array.isArray(inspect.chunks) && inspect.chunks.length > 0) {
-          recoveryChunks = inspect.chunks.map((chunk) => ({
-            ...chunk,
-            included: chunk.status !== 'missing',
-          }));
-        } else {
-          inspectError = inspect?.error ?? null;
-          recoveryChunks = Array.isArray(options?.fallbackRecoveryChunks)
-            ? options.fallbackRecoveryChunks.map((chunk) => ({ ...chunk }))
-            : [];
-        }
-      } catch (error) {
-        inspectError = toErrorMessage(error);
-        recoveryChunks = Array.isArray(options?.fallbackRecoveryChunks)
-          ? options.fallbackRecoveryChunks.map((chunk) => ({ ...chunk }))
-          : [];
-      }
-
-      errorMessage = inspectError
-        ? `Validation failed again (${inspectError}). Try fewer chunks or download raw files.`
-        : 'Validation failed again. Try fewer chunks or download raw files.';
-
-      setState('recovery');
-      return;
-    }
-
-    errorMessage = null;
-    recoverySessionId = null;
-    recoveryChunks = [];
-    setState('done');
-  } catch (error) {
-    errorMessage = toErrorMessage(error);
-    setState('error');
-  } finally {
-    processingPipelineRunning = false;
-  }
-}
-
-async function getStartTargetTab(options?: { validateCapturable?: boolean }) {
-  const testActiveTab = await getTestActiveTabFixture();
-  if (testActiveTab) {
-    if (options?.validateCapturable !== false && typeof testActiveTab.url === 'string' && testActiveTab.url.trim()) {
-      const capturable = isTabUrlCapturable(testActiveTab.url);
-      if (!capturable.ok) {
-        throw new Error(formatCodedStartError(capturable.code, capturable.message, testActiveTab.url));
-      }
-    }
-
-    return testActiveTab as chrome.tabs.Tab;
-  }
-
-  const [activeTab] = await chrome.tabs.query({
-    active: true,
-    lastFocusedWindow: true,
-  });
-
-  if (!activeTab?.id) {
-    throw new Error(
-      formatCodedStartError(
-        'TAB_NOT_AVAILABLE',
-        'No active tab is available to record. Focus a browser tab and try again.',
-      ),
-    );
-  }
-
-  if (options?.validateCapturable !== false && typeof activeTab.url === 'string' && activeTab.url.trim()) {
-    const capturable = isTabUrlCapturable(activeTab.url);
-    if (!capturable.ok) {
-      throw new Error(formatCodedStartError(capturable.code, capturable.message, activeTab.url));
-    }
-  }
-  return activeTab;
-}
-
 async function getTabCaptureStreamId(targetTabId: number): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     chrome.tabCapture.getMediaStreamId({ targetTabId }, (streamId) => {
@@ -1778,150 +359,4 @@ async function getCapturedTabInfo(targetTabId: number): Promise<chrome.tabCaptur
         ACTIVE_TAB_CAPTURE_STATUSES.includes(item.status as (typeof ACTIVE_TAB_CAPTURE_STATUSES)[number]),
     ) ?? null
   );
-}
-
-async function releaseStaleTabCapture(targetTabId: number): Promise<{ ok: boolean; detail?: string }> {
-  const activeCapture = await getCapturedTabInfo(targetTabId);
-  if (!activeCapture) {
-    return { ok: true };
-  }
-
-  debugWarn('[Background] Detected stale tab capture, attempting cleanup', activeCapture);
-
-  try {
-    await offscreenClient.ensureReadyWithRetry(delay);
-    await offscreenClient.send<{ ok?: boolean; error?: string }>({
-      type: RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP,
-    });
-  } catch (error) {
-    debugWarn('[Background] Offscreen force cleanup failed:', error);
-  }
-
-  await delay(250);
-  if (!(await getCapturedTabInfo(targetTabId))) {
-    return { ok: true };
-  }
-
-  try {
-    await offscreenClient.forceResetDocument();
-  } catch (error) {
-    debugWarn('[Background] Offscreen document reset failed:', error);
-  }
-
-  await delay(400);
-  const remainingCapture = await getCapturedTabInfo(targetTabId);
-  if (!remainingCapture) {
-    return { ok: true };
-  }
-
-  return {
-    ok: false,
-    detail: `Capture state is still "${remainingCapture.status}".`,
-  };
-}
-
-function formatCodedStartError(code: string, message: string, detail?: string | null) {
-  const nextDetail = typeof detail === 'string' ? detail.trim() : '';
-  if (!nextDetail) {
-    return `${code}: ${message}`;
-  }
-  return `${code}: ${message} (${nextDetail})`;
-}
-
-function normalizeStartFailureMessage(rawMessage: string | null | undefined) {
-  const raw = typeof rawMessage === 'string' ? rawMessage.trim() : '';
-  if (!raw) {
-    return formatCodedStartError('TAB_CAPTURE_START_FAILED', 'Unable to start recording.');
-  }
-
-  if (/^[A-Z0-9_]+:/.test(raw)) {
-    return raw;
-  }
-
-  const lower = raw.toLowerCase();
-
-  if (
-    lower.includes('cannot be captured') ||
-    lower.includes('chrome://') ||
-    lower.includes('devtools://') ||
-    lower.includes('chrome-extension://')
-  ) {
-    return formatCodedStartError(
-      'TAB_NOT_CAPTURABLE',
-      'This page cannot be recorded. Open a regular webpage (http/https) and try again.',
-      raw,
-    );
-  }
-
-  if (
-    lower.includes('unable to start tab capture') ||
-    lower.includes('error starting tab capture') ||
-    lower.includes('aborterror')
-  ) {
-    return formatCodedStartError(
-      'TAB_CAPTURE_START_FAILED',
-      'Could not attach to the current tab. Refresh the tab and try again.',
-      raw,
-    );
-  }
-
-  if (
-    lower.includes('active stream') ||
-    lower.includes('already being captured') ||
-    lower.includes('capture attached to this tab')
-  ) {
-    return formatCodedStartError(
-      'TAB_CAPTURE_ACTIVE',
-      'Chrome still has an active capture attached to this tab.',
-      raw,
-    );
-  }
-
-  if (
-    lower.includes('missing tab stream id') ||
-    lower.includes('failed to start tab capture') ||
-    lower.includes('stream id')
-  ) {
-    return formatCodedStartError(
-      'TAB_CAPTURE_STREAM_UNAVAILABLE',
-      'Could not create a capture stream for the current tab.',
-      raw,
-    );
-  }
-
-  if (lower.includes('no active tab')) {
-    return formatCodedStartError(
-      'TAB_NOT_AVAILABLE',
-      'No active tab is available to record. Focus a browser tab and try again.',
-      raw,
-    );
-  }
-
-  return raw;
-}
-
-function isTabUrlCapturable(urlString: string): { ok: true } | { ok: false; code: string; message: string } {
-  try {
-    const parsed = new URL(urlString);
-    if (BLOCKED_TAB_CAPTURE_SCHEMES.includes(parsed.protocol)) {
-      return {
-        ok: false,
-        code: 'TAB_NOT_CAPTURABLE',
-        message: 'This page cannot be recorded. Open a regular webpage (http/https) and try again.',
-      };
-    }
-
-    if (BLOCKED_TAB_CAPTURE_HOSTS.has(parsed.hostname)) {
-      return {
-        ok: false,
-        code: 'TAB_NOT_CAPTURABLE',
-        message: 'Chrome Web Store pages cannot be recorded. Open another tab and try again.',
-      };
-    }
-
-    return { ok: true };
-  } catch {
-    // If URL parsing fails, do not block capture preemptively.
-    return { ok: true };
-  }
 }
