@@ -1,7 +1,4 @@
-import type {
-  ProcessingMetrics,
-  ValidationResult,
-} from '@/lib/recording';
+import type { ValidationResult } from '@/lib/recording';
 import {
   OffscreenEventType,
   RuntimeMessageType,
@@ -13,7 +10,7 @@ import {
   type TestOrphanFixtureSession,
   type TestPermissionState,
 } from '@/lib/messages';
-import { debugInfo, debugWarn } from '@/lib/runtime-log';
+import { debugWarn } from '@/lib/runtime-log';
 import { MessageRouter } from '@/lib/message-router';
 import {
   getRuntimeHintsFromNavigator,
@@ -22,7 +19,8 @@ import {
 } from '@/lib/capture-presets';
 import { OpfsBridge } from './offscreen/storage/opfs-bridge';
 import { RecoveryService } from './offscreen/recovery/recovery-service';
-import type { FFmpegClass, SessionManifest } from './offscreen/types';
+import { Processor } from './offscreen/processing/processor';
+import type { SessionManifest } from './offscreen/types';
 import {
   buildTabCaptureConstraints,
   getCaptureProfileByPreset,
@@ -45,19 +43,9 @@ import {
   formatPresetShortLabel,
 } from './offscreen/media/capture-fallback';
 import {
-  findMvhdDuration,
   hasMp4FtypHeader,
   hasWebmEbmlHeader,
-  isMp4ArrayBuffer,
-  probeMp4DurationFromMetadata,
 } from './offscreen/media/container-probe';
-import {
-  buildConcatTranscodeArgs,
-  buildSingleTranscodeArgs,
-  getExpectedMinimumDurationSeconds,
-  OUTPUT_VIDEO_CODEC,
-  parseProgressFromLog,
-} from './offscreen/processing/ffmpeg-args';
 import { classifyMicPermissionRequestError } from '@/lib/testing/mic-permission';
 import { isTestCaptureStreamId } from '@/lib/testing/capture-stream';
 import { normalizeTestOrphanFixtureSession } from '@/lib/testing/orphan-fixture';
@@ -74,6 +62,21 @@ export default defineUnlistedScript(() => {
     createObjectURL: (blob) => URL.createObjectURL(blob),
     revokeObjectURL: (url) => URL.revokeObjectURL(url),
   });
+  const processor = new Processor({
+    opfs: opfsBridge,
+    emit: (event, payload) => emitEvent(event, payload),
+    createObjectURL: (blob) => URL.createObjectURL(blob),
+    revokeObjectURL: (url) => URL.revokeObjectURL(url),
+    probeVideoDuration: (blob) => probeVideoDuration(blob),
+    importFFmpegCtor: async () => (await import('@ffmpeg/ffmpeg')).FFmpeg,
+    ffmpegLoadConfig: {
+      classWorkerURL: chrome.runtime.getURL('ffmpeg/worker.js'),
+      coreURL: chrome.runtime.getURL('ffmpeg-core.js'),
+      wasmURL: chrome.runtime.getURL('ffmpeg-core.wasm'),
+    },
+    isRecorderActive: () => recorder?.state === 'recording',
+    chunkDurationSeconds: CHUNK_DURATION_SECONDS,
+  });
 
   let recorder: MediaRecorder | null = null;
   let captureStream: MediaStream | null = null;
@@ -83,13 +86,6 @@ export default defineUnlistedScript(() => {
   let micCaptureStream: MediaStream | null = null;
   let preflightMicStream: MediaStream | null = null;
   let preflightMicHoldTimer: ReturnType<typeof setTimeout> | null = null;
-  let FFmpegCtor: FFmpegClass | null = null;
-  let ffmpeg: InstanceType<FFmpegClass> | null = null;
-  let ffmpegLoaded = false;
-  let ffmpegLoadCount = 0;
-  let ffmpegLastLoadMs = 0;
-  let ffmpegDurationHint = 0;
-  let ffmpegLastProgress = -1;
 
   let activeSessionId: string | null = null;
   let manifest: SessionManifest | null = null;
@@ -107,8 +103,6 @@ export default defineUnlistedScript(() => {
   let writeQueue: Promise<void> = Promise.resolve();
   let writeError: Error | null = null;
 
-  let lastOutputBlob: Blob | null = null;
-  let lastOutputUrl: string | null = null;
   let systemAudioCheckTimer: ReturnType<typeof setTimeout> | null = null;
   let systemAudioAudioCtx: AudioContext | null = null;
   let systemAudioSource: MediaStreamAudioSourceNode | null = null;
@@ -144,9 +138,9 @@ export default defineUnlistedScript(() => {
             .map((value: unknown) => Number(value))
             .filter((value: number) => Number.isInteger(value) && value >= 0)
         : undefined;
-      return processRecording(String(msg.sessionId), chunkIndexes);
+      return processor.processRecording(String(msg.sessionId), chunkIndexes);
     })
-    .on(RuntimeMessageType.OFFSCREEN_VALIDATE, () => validateLatestOutput())
+    .on(RuntimeMessageType.OFFSCREEN_VALIDATE, () => processor.validateLatestOutput())
     .on(RuntimeMessageType.MIC_PREFLIGHT, (msg) =>
       runMicPreflight(
         normalizeMicDeviceId(msg.micDeviceId),
@@ -184,7 +178,7 @@ export default defineUnlistedScript(() => {
       isWebCodecsRecording: isWebCodecsRecording(),
       chunkCount,
       sessionId: activeSessionId,
-      hasOutput: Boolean(lastOutputUrl),
+      hasOutput: Boolean(processor.outputUrl),
     }))
     // WebCodecs pipeline handlers
     .on(RuntimeMessageType.WEBCODECS_CHECK_SUPPORT, (msg) => handleCheckWebCodecsSupport(msg.quality))
@@ -521,295 +515,6 @@ export default defineUnlistedScript(() => {
     stopFinalDataPromise = null;
   }
 
-  async function processRecording(sessionId: string, selectedChunkIndexes?: number[]) {
-    const metrics: ProcessingMetrics = {
-      chunkCount: 0,
-      mode: 'concat',
-      encodeProfile: OUTPUT_VIDEO_CODEC,
-      inputBytes: 0,
-      outputBytes: 0,
-      ffmpegAlreadyLoaded: ffmpegLoaded,
-      ffmpegLoadMs: 0,
-      manifestReadMs: 0,
-      chunkReadMs: 0,
-      ffmpegWriteMs: 0,
-      execMs: 0,
-      outputReadMs: 0,
-      validateMs: 0,
-      totalMs: 0,
-    };
-    const processingStartedAt = performance.now();
-
-    if (!sessionId) {
-      return { ok: false, error: 'Missing session id' };
-    }
-
-    if (recorder?.state === 'recording') {
-      return { ok: false, error: 'Cannot process while recorder is active' };
-    }
-
-    try {
-      const manifestReadStart = performance.now();
-      const currentManifest = await readManifest(sessionId);
-      metrics.manifestReadMs = performance.now() - manifestReadStart;
-
-      if (currentManifest.recordingKind === 'webcodecs-opfs') {
-        const readStart = performance.now();
-        const streamFile = webCodecsOpfsStreamName(currentManifest);
-        const outMime =
-          (currentManifest.mimeType ?? '').includes('webm') ? 'video/webm' : 'video/mp4';
-        const outExt = outMime.includes('webm') ? 'webm' : 'mp4';
-        let streamData: ArrayBuffer;
-        try {
-          streamData = await opfsBridge.readWebCodecsStream(sessionId, streamFile);
-        } catch {
-          return { ok: false, error: 'No WebCodecs stream data found for this session' };
-        }
-        metrics.chunkReadMs += performance.now() - readStart;
-        metrics.inputBytes = streamData.byteLength;
-        metrics.chunkCount = 1;
-        metrics.mode = 'single_copy';
-        metrics.encodeProfile = outExt === 'webm' ? 'copy_webm' : 'copy_mp4';
-        metrics.outputBytes = streamData.byteLength;
-
-        lastOutputBlob = new Blob([streamData], { type: outMime });
-        if (lastOutputUrl) {
-          URL.revokeObjectURL(lastOutputUrl);
-        }
-        lastOutputUrl = URL.createObjectURL(lastOutputBlob);
-
-        const validateStart = performance.now();
-        const validation = await validateBlob(lastOutputBlob);
-        metrics.validateMs = performance.now() - validateStart;
-        metrics.totalMs = performance.now() - processingStartedAt;
-
-        await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
-        await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
-        debugInfo('[Offscreen] Processing metrics', metrics);
-
-        return {
-          ok: true,
-          outputUrl: lastOutputUrl,
-          outputMimeType: outMime,
-          fileName: buildDownloadFileName(currentManifest.exportBaseName ?? sessionId, outMime),
-          validation,
-        };
-      }
-
-      if (!currentManifest.chunks.length) {
-        return { ok: false, error: 'No chunks found for this session' };
-      }
-
-      const orderedChunks = [...currentManifest.chunks].sort((a, b) => a.index - b.index);
-      const selectedIndexSet =
-        Array.isArray(selectedChunkIndexes) && selectedChunkIndexes.length
-          ? new Set(selectedChunkIndexes)
-          : null;
-      const selectedChunks = selectedIndexSet
-        ? orderedChunks.filter((chunk) => selectedIndexSet.has(chunk.index))
-        : orderedChunks;
-
-      if (!selectedChunks.length) {
-        return { ok: false, error: 'No selected chunks found for processing' };
-      }
-
-      metrics.chunkCount = selectedChunks.length;
-      metrics.mode = selectedChunks.length === 1 ? 'single' : 'concat';
-      const captureMimeType = (currentManifest.mimeType ?? '').toLowerCase();
-      const captureIsMp4 = captureMimeType.includes('mp4');
-      let singleChunkData: ArrayBuffer | null = null;
-
-      if (selectedChunks.length === 1) {
-        const readStart = performance.now();
-        singleChunkData = await readChunkData(sessionId, selectedChunks[0].index);
-        metrics.chunkReadMs += performance.now() - readStart;
-        metrics.inputBytes += singleChunkData.byteLength;
-
-        const canFastCopy =
-          currentManifest.mimeType?.includes('mp4') || isMp4ArrayBuffer(singleChunkData);
-
-        if (canFastCopy) {
-          metrics.mode = 'single_copy';
-          metrics.encodeProfile = 'copy_mp4';
-          metrics.outputBytes = singleChunkData.byteLength;
-          lastOutputBlob = new Blob([singleChunkData], { type: 'video/mp4' });
-
-          if (lastOutputUrl) {
-            URL.revokeObjectURL(lastOutputUrl);
-          }
-          lastOutputUrl = URL.createObjectURL(lastOutputBlob);
-
-          const validateStart = performance.now();
-          const validation = await validateBlob(lastOutputBlob);
-          metrics.validateMs = performance.now() - validateStart;
-          metrics.totalMs = performance.now() - processingStartedAt;
-
-          await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
-          await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
-          debugInfo('[Offscreen] Processing metrics', metrics);
-
-          return {
-            ok: true,
-            outputUrl: lastOutputUrl,
-            outputMimeType: 'video/mp4',
-            fileName: buildDownloadFileName(currentManifest.exportBaseName ?? sessionId, 'video/mp4'),
-            validation,
-          };
-        }
-      }
-
-      const ffmpegLoadStart = performance.now();
-      const ff = await ensureFFmpeg();
-      metrics.ffmpegLoadMs = performance.now() - ffmpegLoadStart;
-      const fileNames: string[] = [];
-
-      if (selectedChunks.length === 1) {
-        const data = singleChunkData ?? (await readChunkData(sessionId, selectedChunks[0].index));
-        if (!singleChunkData) {
-          metrics.inputBytes += data.byteLength;
-        }
-        const writeStart = performance.now();
-        const fileName = captureIsMp4 || isMp4ArrayBuffer(data) ? 'input.mp4' : 'input.webm';
-        await ff.writeFile(fileName, new Uint8Array(data));
-        metrics.ffmpegWriteMs += performance.now() - writeStart;
-        fileNames.push(fileName);
-      } else if (captureIsMp4) {
-        for (const chunk of selectedChunks) {
-          const readStart = performance.now();
-          const data = await readChunkData(sessionId, chunk.index);
-          metrics.chunkReadMs += performance.now() - readStart;
-          metrics.inputBytes += data.byteLength;
-
-          const writeStart = performance.now();
-          const fileName = `chunk-${chunk.index}.mp4`;
-          await ff.writeFile(fileName, new Uint8Array(data));
-          metrics.ffmpegWriteMs += performance.now() - writeStart;
-          fileNames.push(fileName);
-        }
-
-        const concatListWriteStart = performance.now();
-        const concatList = fileNames.map((name) => `file '${name}'`).join('\n');
-        await ff.writeFile('list.txt', new TextEncoder().encode(concatList));
-        metrics.ffmpegWriteMs += performance.now() - concatListWriteStart;
-      } else {
-        // WebM chunks from MediaRecorder.ondataavailable are NOT standalone
-        // files — only the first chunk contains the EBML/Tracks initialization
-        // segment.  The concat demuxer requires each file to be independently
-        // parseable, so feeding raw chunks produces a truncated output (only
-        // chunk 0 is decoded).  Instead, concatenate all chunks into a single
-        // binary blob which FFmpeg can demux as one continuous WebM stream.
-        const chunkBuffers: Uint8Array[] = [];
-        for (const chunk of selectedChunks) {
-          const readStart = performance.now();
-          const data = await readChunkData(sessionId, chunk.index);
-          metrics.chunkReadMs += performance.now() - readStart;
-          metrics.inputBytes += data.byteLength;
-          chunkBuffers.push(new Uint8Array(data));
-        }
-
-        const totalLength = chunkBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
-        const merged = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const buf of chunkBuffers) {
-          merged.set(buf, offset);
-          offset += buf.byteLength;
-        }
-
-        const writeStart = performance.now();
-        const fileName = 'input.webm';
-        await ff.writeFile(fileName, merged);
-        metrics.ffmpegWriteMs += performance.now() - writeStart;
-        fileNames.push(fileName);
-      }
-
-      ffmpegDurationHint =
-        selectedChunks.length * CHUNK_DURATION_SECONDS;
-      ffmpegLastProgress = 5;
-      await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 5 });
-
-      const shouldRunConcatDemuxer = fileNames.length > 1;
-      const transcodeArgs = shouldRunConcatDemuxer
-        ? buildConcatTranscodeArgs()
-        : buildSingleTranscodeArgs(fileNames[0]);
-
-      const execStart = performance.now();
-      metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
-      await ff.exec(transcodeArgs);
-      metrics.execMs = performance.now() - execStart;
-
-      const minimumDuration =
-        selectedChunks.length > 1
-          ? getExpectedMinimumDurationSeconds(selectedChunks.length, CHUNK_DURATION_SECONDS)
-          : 0;
-
-      const readAndValidateOutput = async () => {
-        const outputReadStart = performance.now();
-        const outputData = await ff.readFile('output.mp4');
-        const bytes =
-          outputData instanceof Uint8Array ? new Uint8Array(outputData) : new Uint8Array(0);
-        metrics.outputReadMs += performance.now() - outputReadStart;
-        const blob = new Blob([bytes.buffer], { type: 'video/mp4' });
-
-        const validateStart = performance.now();
-        const outputValidation = await validateBlob(blob, minimumDuration);
-        metrics.validateMs += performance.now() - validateStart;
-
-        return { bytes, blob, validation: outputValidation };
-      };
-
-      let outputResult = await readAndValidateOutput();
-
-      metrics.outputBytes = outputResult.bytes.byteLength;
-      lastOutputBlob = outputResult.blob;
-
-      if (lastOutputUrl) {
-        URL.revokeObjectURL(lastOutputUrl);
-      }
-      lastOutputUrl = URL.createObjectURL(lastOutputBlob);
-
-      const validation = outputResult.validation;
-      metrics.totalMs = performance.now() - processingStartedAt;
-
-      await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 100 });
-      await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
-      debugInfo('[Offscreen] Processing metrics', metrics);
-      ffmpegDurationHint = 0;
-
-      await cleanupFfmpegFiles(fileNames);
-
-      return {
-        ok: true,
-        outputUrl: lastOutputUrl,
-        outputMimeType: 'video/mp4',
-        fileName: buildDownloadFileName(currentManifest.exportBaseName ?? sessionId, 'video/mp4'),
-        validation,
-      };
-    } catch (error) {
-      metrics.totalMs = performance.now() - processingStartedAt;
-      await emitEvent(OffscreenEventType.PROCESS_METRICS, { metrics });
-      debugInfo('[Offscreen] Processing metrics (failed)', metrics);
-      await emitEvent(OffscreenEventType.ERROR, {
-        error: `Processing failed: ${toErrorMessage(error)}`,
-      });
-      return { ok: false, error: toErrorMessage(error) };
-    }
-  }
-
-  async function validateLatestOutput(): Promise<ValidationResult> {
-    if (!lastOutputBlob) {
-      return {
-        passed: false,
-        checks: {
-          size: false,
-          header: false,
-          duration: false,
-        },
-      };
-    }
-
-    return validateBlob(lastOutputBlob);
-  }
-
   function enqueueChunkWrite(index: number, blob: Blob) {
     writeQueue = writeQueue.then(async () => {
       if (writeError) return;
@@ -868,61 +573,6 @@ export default defineUnlistedScript(() => {
         }
       })();
     }, 2500);
-  }
-
-  async function readManifest(sessionId: string): Promise<SessionManifest> {
-    return await opfsBridge.readManifest(sessionId);
-  }
-
-  async function readChunkData(sessionId: string, chunkIndex: number): Promise<ArrayBuffer> {
-    return await opfsBridge.readChunk(sessionId, chunkIndex);
-  }
-
-  async function ensureFFmpeg() {
-    if (!FFmpegCtor) {
-      const module = await import('@ffmpeg/ffmpeg');
-      FFmpegCtor = module.FFmpeg;
-    }
-
-    if (!ffmpeg) {
-      ffmpeg = new FFmpegCtor();
-      ffmpeg.on('log', ({ message }) => {
-        const progress = parseProgressFromLog(message, ffmpegDurationHint);
-        if (progress !== null && progress > ffmpegLastProgress) {
-          ffmpegLastProgress = progress;
-          void emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress });
-        }
-      });
-    }
-
-    if (!ffmpegLoaded) {
-      const loadStart = performance.now();
-      await ffmpeg.load({
-        classWorkerURL: chrome.runtime.getURL('ffmpeg/worker.js'),
-        coreURL: chrome.runtime.getURL('ffmpeg-core.js'),
-        wasmURL: chrome.runtime.getURL('ffmpeg-core.wasm'),
-      });
-      ffmpegLoaded = true;
-      ffmpegLoadCount += 1;
-      ffmpegLastLoadMs = performance.now() - loadStart;
-      debugInfo('[Offscreen] FFmpeg loaded on cold path', {
-        ffmpegLoadCount,
-        ffmpegLastLoadMs,
-      });
-    }
-
-    return ffmpeg;
-  }
-
-  async function cleanupFfmpegFiles(fileNames: string[]) {
-    if (!ffmpegLoaded || !ffmpeg) return;
-
-    for (const fileName of fileNames) {
-      await ffmpeg.deleteFile(fileName).catch(() => {});
-    }
-
-    await ffmpeg.deleteFile('list.txt').catch(() => {});
-    await ffmpeg.deleteFile('output.mp4').catch(() => {});
   }
 
   async function cleanupMedia() {
@@ -1216,26 +866,10 @@ export default defineUnlistedScript(() => {
     return new Promise<void>((resolve) => setTimeout(resolve, ms));
   }
 
-  function webCodecsOpfsStreamName(manifest: SessionManifest): string {
-    return manifest.webCodecsOpfsStreamFile ?? 'webcodecs-stream.mp4';
-  }
-
-  async function validateBlob(blob: Blob, minimumDurationSeconds = 0): Promise<ValidationResult> {
-    const isWebm = blob.type.includes('webm');
-    const checks = {
-      size: blob.size > 50_000,
-      header: isWebm ? await hasWebmEbmlHeader(blob) : await hasMp4FtypHeader(blob),
-      duration: await checkDurationWithFallback(blob, minimumDurationSeconds),
-    };
-
-    return {
-      passed: Object.values(checks).every(Boolean),
-      checks,
-    };
-  }
-
-  async function probeDuration(blob: Blob): Promise<number> {
-    const mediaDuration = await new Promise<number>((resolve) => {
+  // Read media duration via an HTMLVideoElement metadata load. Injected into the
+  // Processor as its only `document`-bound dependency.
+  function probeVideoDuration(blob: Blob): Promise<number> {
+    return new Promise<number>((resolve) => {
       const video = document.createElement('video');
       const url = URL.createObjectURL(blob);
 
@@ -1250,71 +884,6 @@ export default defineUnlistedScript(() => {
       video.onerror = () => finalize(0);
       video.src = url;
     });
-
-    if (Number.isFinite(mediaDuration) && mediaDuration > 0) {
-      return mediaDuration;
-    }
-
-    // Fallback: some MP4 outputs are not duration-probable via HTMLVideoElement in offscreen context.
-    // Parse mvhd metadata directly to avoid false negatives in validation.
-    const mp4Duration = await probeMp4DurationFromMetadata(blob);
-    return Number.isFinite(mp4Duration) && mp4Duration > 0 ? mp4Duration : 0;
-  }
-
-  async function checkDurationWithFallback(blob: Blob, minimumDurationSeconds = 0): Promise<boolean> {
-    if (minimumDurationSeconds <= 0 && blob.size > 1_000_000) return true;
-
-    const isDurationValid = (value: number) =>
-      Number.isFinite(value) &&
-      value > 0 &&
-      (minimumDurationSeconds <= 0 || value >= minimumDurationSeconds);
-
-    const mediaDuration = await probeDuration(blob);
-    if (isDurationValid(mediaDuration)) {
-      return true;
-    }
-
-    const ffprobeDuration = await probeDurationViaFfprobe(blob);
-    return isDurationValid(ffprobeDuration);
-  }
-
-  async function probeDurationViaFfprobe(blob: Blob): Promise<number> {
-    let inputFile = '';
-    let outputFile = '';
-
-    try {
-      const ff = await ensureFFmpeg();
-      const nonce = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-      inputFile = `probe-${nonce}.mp4`;
-      outputFile = `probe-${nonce}.txt`;
-
-      await ff.writeFile(inputFile, new Uint8Array(await blob.arrayBuffer()));
-      const returnCode = await ff.ffprobe([
-        '-v',
-        'error',
-        '-show_entries',
-        'format=duration',
-        '-of',
-        'default=noprint_wrappers=1:nokey=1',
-        inputFile,
-        '-o',
-        outputFile,
-      ]);
-
-      if (returnCode !== 0) return 0;
-
-      const output = await ff.readFile(outputFile, 'utf8');
-      const text = typeof output === 'string' ? output : new TextDecoder().decode(output);
-      const parsed = Number.parseFloat(text.trim());
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-    } catch {
-      return 0;
-    } finally {
-      if (ffmpegLoaded && ffmpeg) {
-        if (outputFile) await ffmpeg.deleteFile(outputFile).catch(() => {});
-        if (inputFile) await ffmpeg.deleteFile(inputFile).catch(() => {});
-      }
-    }
   }
 
   function createSyntheticTabCaptureStream() {
@@ -1839,14 +1408,9 @@ export default defineUnlistedScript(() => {
 
       const outMime = finalStats.outputMimeType;
 
-      // Create blob and URL
+      // Create blob and URL (the processor owns the shared output store)
       const blob = new Blob([outputBuffer], { type: outMime });
-
-      if (lastOutputUrl) {
-        URL.revokeObjectURL(lastOutputUrl);
-      }
-      lastOutputBlob = blob;
-      lastOutputUrl = URL.createObjectURL(blob);
+      const outputUrl = processor.adoptOutput(blob);
 
       // Validate the output
       const validation = await validateWebCodecsOutput(blob);
@@ -1871,7 +1435,7 @@ export default defineUnlistedScript(() => {
 
       return {
         ok: true,
-        outputUrl: lastOutputUrl,
+        outputUrl,
         outputMimeType: outMime,
         fileName: buildDownloadFileName(
           manifest?.exportBaseName ?? activeSessionId,
