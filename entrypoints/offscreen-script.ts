@@ -21,7 +21,6 @@ import {
   getRuntimeHintsFromNavigator,
   normalizeResolvedCaptureQuality,
   resolveCapturePreset,
-  toResolvedQualityLabel,
 } from '@/lib/capture-presets';
 import { OpfsBridge } from './offscreen/storage/opfs-bridge';
 import type { FFmpegClass, RawDownloadItem, SessionManifest } from './offscreen/types';
@@ -39,7 +38,28 @@ import {
 import {
   buildDownloadFileName,
   buildRawExportBaseName,
+  normalizeAudioSource,
+  normalizeMicDeviceId,
+  toErrorMessage,
 } from './background/utils';
+import {
+  buildCaptureFallbackReason,
+  formatPresetShortLabel,
+} from './offscreen/media/capture-fallback';
+import {
+  findMvhdDuration,
+  hasMp4FtypHeader,
+  hasWebmEbmlHeader,
+  isMp4ArrayBuffer,
+  probeMp4DurationFromMetadata,
+} from './offscreen/media/container-probe';
+import {
+  buildConcatTranscodeArgs,
+  buildSingleTranscodeArgs,
+  getExpectedMinimumDurationSeconds,
+  OUTPUT_VIDEO_CODEC,
+  parseProgressFromLog,
+} from './offscreen/processing/ffmpeg-args';
 import { classifyMicPermissionRequestError } from '@/lib/testing/mic-permission';
 import { isTestCaptureStreamId } from '@/lib/testing/capture-stream';
 import { normalizeTestOrphanFixtureSession } from '@/lib/testing/orphan-fixture';
@@ -47,11 +67,6 @@ import { normalizeTestOrphanFixtureSession } from '@/lib/testing/orphan-fixture'
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
 const PREFLIGHT_MIC_HOLD_MS = 60_000;
-const OUTPUT_VIDEO_CODEC = 'libx264';
-const OUTPUT_VIDEO_PRESET = 'fast';
-const OUTPUT_VIDEO_CRF = '22';
-const OUTPUT_FRAME_RATE = '30';
-const FFMPEG_AUDIO_BITRATE = '128k';
 
 export default defineUnlistedScript(() => {
   const opfsBridge = new OpfsBridge();
@@ -257,43 +272,6 @@ export default defineUnlistedScript(() => {
       await cleanupMedia().catch(() => {});
       return { ok: false, error: toNamedErrorMessage(error) };
     }
-  }
-
-  function normalizeAudioSource(value: unknown): AudioSource {
-    if (value === 'mic' || value === 'tab' || value === 'silent') {
-      return value;
-    }
-    return 'both';
-  }
-
-  function normalizeMicDeviceId(value: unknown): string | null {
-    if (typeof value !== 'string') return null;
-    const trimmed = value.trim();
-    if (!trimmed || trimmed === 'default') return null;
-    return trimmed;
-  }
-
-  function formatPresetShortLabel(preset: CaptureResolvedQuality) {
-    return toResolvedQualityLabel(preset).replace(' • ', ' ');
-  }
-
-  function buildCaptureFallbackReason(
-    requestedPreset: CaptureQuality,
-    autoSelectedPreset: CaptureQuality,
-    attemptedPreset: CaptureResolvedQuality,
-    fallbackChain: CaptureResolvedQuality[],
-    previousErrors: string[],
-  ): string | null {
-    if (previousErrors.length > 0) {
-      const initial = fallbackChain[0] ?? attemptedPreset;
-      return `Fell back from ${formatPresetShortLabel(initial)} to ${formatPresetShortLabel(
-        attemptedPreset,
-      )}.`;
-    }
-    if (requestedPreset === 'auto') {
-      return `Auto selected ${formatPresetShortLabel(autoSelectedPreset)} based on this device.`;
-    }
-    return null;
   }
 
   async function getTabStreamByIdWithFallback(streamId: string, captureQuality: CaptureQuality) {
@@ -748,64 +726,19 @@ export default defineUnlistedScript(() => {
       await emitEvent(OffscreenEventType.PROCESS_PROGRESS, { progress: 5 });
 
       const shouldRunConcatDemuxer = fileNames.length > 1;
-      const singleTranscodeArgs = [
-        '-i',
-        fileNames[0],
-        '-vsync',
-        'cfr',
-        '-r',
-        OUTPUT_FRAME_RATE,
-        '-c:v',
-        OUTPUT_VIDEO_CODEC,
-        '-preset',
-        OUTPUT_VIDEO_PRESET,
-        '-crf',
-        OUTPUT_VIDEO_CRF,
-        '-c:a',
-        'aac',
-        '-b:a',
-        FFMPEG_AUDIO_BITRATE,
-        '-movflags',
-        '+faststart',
-        '-pix_fmt',
-        'yuv420p',
-        'output.mp4',
-      ];
-      const concatTranscodeArgs = [
-        '-f',
-        'concat',
-        '-safe',
-        '0',
-        '-i',
-        'list.txt',
-        '-vsync',
-        'cfr',
-        '-r',
-        OUTPUT_FRAME_RATE,
-        '-c:v',
-        OUTPUT_VIDEO_CODEC,
-        '-preset',
-        OUTPUT_VIDEO_PRESET,
-        '-crf',
-        OUTPUT_VIDEO_CRF,
-        '-c:a',
-        'aac',
-        '-b:a',
-        FFMPEG_AUDIO_BITRATE,
-        '-movflags',
-        '+faststart',
-        '-pix_fmt',
-        'yuv420p',
-        'output.mp4',
-      ];
+      const transcodeArgs = shouldRunConcatDemuxer
+        ? buildConcatTranscodeArgs()
+        : buildSingleTranscodeArgs(fileNames[0]);
 
       const execStart = performance.now();
       metrics.encodeProfile = OUTPUT_VIDEO_CODEC;
-      await ff.exec(shouldRunConcatDemuxer ? concatTranscodeArgs : singleTranscodeArgs);
+      await ff.exec(transcodeArgs);
       metrics.execMs = performance.now() - execStart;
 
       const minimumDuration =
-        selectedChunks.length > 1 ? getExpectedMinimumDurationSeconds(selectedChunks.length) : 0;
+        selectedChunks.length > 1
+          ? getExpectedMinimumDurationSeconds(selectedChunks.length, CHUNK_DURATION_SECONDS)
+          : 0;
 
       const readAndValidateOutput = async () => {
         const outputReadStart = performance.now();
@@ -1524,12 +1457,6 @@ export default defineUnlistedScript(() => {
     return manifest.webCodecsOpfsStreamFile ?? 'webcodecs-stream.mp4';
   }
 
-  async function hasWebmEbmlHeader(blob: Blob) {
-    const header = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-    if (header.length < 4) return false;
-    return header[0] === 0x1a && header[1] === 0x45 && header[2] === 0xdf && header[3] === 0xa3;
-  }
-
   async function validateBlob(blob: Blob, minimumDurationSeconds = 0): Promise<ValidationResult> {
     const isWebm = blob.type.includes('webm');
     const checks = {
@@ -1542,13 +1469,6 @@ export default defineUnlistedScript(() => {
       passed: Object.values(checks).every(Boolean),
       checks,
     };
-  }
-
-  async function hasMp4FtypHeader(blob: Blob) {
-    const header = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
-    if (header.length < 8) return false;
-    const tag = String.fromCharCode(header[4], header[5], header[6], header[7]);
-    return tag === 'ftyp';
   }
 
   async function probeDuration(blob: Blob): Promise<number> {
@@ -1632,81 +1552,6 @@ export default defineUnlistedScript(() => {
         if (inputFile) await ffmpeg.deleteFile(inputFile).catch(() => {});
       }
     }
-  }
-
-  async function probeMp4DurationFromMetadata(blob: Blob): Promise<number> {
-    if (blob.size < 32) return 0;
-
-    const scanBytes = Math.min(blob.size, 4 * 1024 * 1024);
-    const buffer = await blob.slice(0, scanBytes).arrayBuffer();
-    const view = new DataView(buffer);
-    return findMvhdDuration(view, 0, view.byteLength);
-  }
-
-  function findMvhdDuration(view: DataView, start: number, end: number): number {
-    let offset = start;
-
-    while (offset + 8 <= end) {
-      let boxSize = view.getUint32(offset);
-      const type = readBoxType(view, offset + 4);
-      let headerSize = 8;
-
-      if (boxSize === 1) {
-        if (offset + 16 > end) return 0;
-        boxSize = readUint64(view, offset + 8);
-        headerSize = 16;
-      } else if (boxSize === 0) {
-        boxSize = end - offset;
-      }
-
-      if (boxSize < headerSize) return 0;
-      if (offset + boxSize > end) return 0;
-
-      if (type === 'moov') {
-        const nested = findMvhdDuration(view, offset + headerSize, offset + boxSize);
-        if (nested > 0) return nested;
-      } else if (type === 'mvhd') {
-        const payload = offset + headerSize;
-        if (payload + 20 > end) return 0;
-
-        const version = view.getUint8(payload);
-        if (version === 0) {
-          const timescale = view.getUint32(payload + 12);
-          const duration = view.getUint32(payload + 16);
-          if (timescale > 0 && duration > 0) {
-            return duration / timescale;
-          }
-        } else if (version === 1) {
-          if (payload + 32 > end) return 0;
-          const timescale = view.getUint32(payload + 20);
-          const duration = readUint64(view, payload + 24);
-          if (timescale > 0 && duration > 0) {
-            return duration / timescale;
-          }
-        }
-      }
-
-      offset += boxSize;
-    }
-
-    return 0;
-  }
-
-  function readBoxType(view: DataView, offset: number) {
-    if (offset + 4 > view.byteLength) return '';
-    return String.fromCharCode(
-      view.getUint8(offset),
-      view.getUint8(offset + 1),
-      view.getUint8(offset + 2),
-      view.getUint8(offset + 3),
-    );
-  }
-
-  function readUint64(view: DataView, offset: number) {
-    if (offset + 8 > view.byteLength) return 0;
-    const high = view.getUint32(offset);
-    const low = view.getUint32(offset + 4);
-    return high * 2 ** 32 + low;
   }
 
   function createSyntheticTabCaptureStream() {
@@ -1955,45 +1800,11 @@ export default defineUnlistedScript(() => {
     return '';
   }
 
-  function isMp4ArrayBuffer(data: ArrayBuffer) {
-    if (data.byteLength < 12) return false;
-    const view = new Uint8Array(data, 4, 4);
-    return (
-      view[0] === 0x66 && // f
-      view[1] === 0x74 && // t
-      view[2] === 0x79 && // y
-      view[3] === 0x70 // p
-    );
-  }
-
-  function parseProgressFromLog(logLine: string, durationHint: number): number | null {
-    if (!durationHint || !logLine.includes('time=')) return null;
-    const match = logLine.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
-    if (!match) return null;
-
-    const hh = Number(match[1]);
-    const mm = Number(match[2]);
-    const ss = Number(match[3]);
-    const seconds = hh * 3600 + mm * 60 + ss;
-    const progress = Math.floor((seconds / durationHint) * 100);
-    return Math.max(0, Math.min(99, progress));
-  }
-
-  function getExpectedMinimumDurationSeconds(chunkCount: number) {
-    if (chunkCount <= 1) return 0;
-    return Math.max(1, (chunkCount - 1) * CHUNK_DURATION_SECONDS * 0.75);
-  }
-
   async function sha256Hex(data: ArrayBuffer): Promise<string> {
     const digest = await crypto.subtle.digest('SHA-256', data);
     return Array.from(new Uint8Array(digest))
       .map((byte) => byte.toString(16).padStart(2, '0'))
       .join('');
-  }
-
-  function toErrorMessage(error: unknown) {
-    if (error instanceof Error) return error.message;
-    return typeof error === 'string' ? error : 'Unknown error';
   }
 
   function toNamedErrorMessage(error: unknown) {
