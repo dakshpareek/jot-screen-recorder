@@ -60,18 +60,28 @@ Last filename:
 await globalThis.__JOT_TEST_CONTROL_PLANE__.send({ type: "TEST_GET_LAST_FILENAME" });
 ```
 
-## Seed the active-tab fixture
-
-Use this when you want deterministic filename resolution without depending on
-the real active tab metadata:
+Capture fixture:
 
 ```js
 await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
-  type: "TEST_SET_ACTIVE_TAB",
-  tab: {
-    id: 101,
-    title: "Example Domain",
-    url: "https://example.com/",
+  type: "TEST_GET_CAPTURE_FIXTURE",
+});
+```
+
+## Seed the capture fixture
+
+Use this when you want deterministic filename resolution without depending on
+the real active-tab metadata:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_SET_CAPTURE_FIXTURE",
+  captureFixture: {
+    activeTab: {
+      id: 101,
+      title: "Example Domain",
+      url: "https://example.com/",
+    },
   },
 });
 ```
@@ -80,8 +90,10 @@ To return to the real tab flow before using the popup:
 
 ```js
 await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
-  type: "TEST_SET_ACTIVE_TAB",
-  tab: null,
+  type: "TEST_SET_CAPTURE_FIXTURE",
+  captureFixture: {
+    activeTab: null,
+  },
 });
 ```
 
@@ -141,14 +153,66 @@ For automated "granted" path checks, launch Chrome with:
 That gives the browser a mic device and auto-accepts the prompt, which makes the
 recording path deterministic. Keep the native prompt as a manual QA check.
 
-## Typical block-1 loop
+## Seed the orphan fixture
+
+Use this when you want deterministic orphan/recovery state without depending on
+an actual crash:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_SET_ORPHAN_FIXTURE",
+  orphanFixture: {
+    sessions: [
+      {
+        sessionId: "rec_20260630_101500",
+        startTime: Date.now() - 120000,
+        recordingQuality: "auto",
+        recordingResolvedQuality: "1080p30",
+        recordingKind: "webcodecs-opfs",
+        streamBytesWritten: 1,
+      },
+    ],
+  },
+});
+```
+
+Refresh the live orphan snapshot:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_REFRESH_ORPHANS",
+});
+```
+
+Drive the recovery path:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_RECOVER_ORPHAN",
+  sessionId: "rec_20260630_101500",
+});
+```
+
+Or discard it:
+
+```js
+await globalThis.__JOT_TEST_CONTROL_PLANE__.send({
+  type: "TEST_DISCARD_ORPHAN",
+  sessionId: "rec_20260630_101500",
+});
+```
+
+## Typical block-2 loop
 
 1. Enable the control plane.
 2. Read the initial snapshot.
-3. Reset and seed the tab and permission fixtures.
-4. Run the relevant runtime message or popup action.
-5. Read back the snapshot or permission state again.
-6. Confirm the result matches the expected fixture-driven outcome.
+3. Reset and seed the capture and permission fixtures.
+4. Call `TEST_PREPARE_START`, `TEST_START_RECORDING`, and `TEST_STOP_RECORDING`
+   as needed for the flow you are testing.
+5. Seed and refresh orphan state if you are testing recovery.
+6. Read back the snapshot, capture fixture, orphan fixture, last filename, or
+   permission state again.
+7. Confirm the result matches the expected fixture-driven outcome.
 
 ## Teardown
 

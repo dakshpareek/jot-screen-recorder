@@ -47,6 +47,12 @@ describe('background test control plane', () => {
   let runtimeListener: ((message: unknown, sender: chrome.runtime.MessageSender, sendResponse: (response?: unknown) => void) => boolean | void) | null = null;
   let persistedContextStore: PersistedContext | undefined;
   let sessionStore: Record<string, unknown>;
+  let seededOrphanSessions: Array<{
+    sessionId: string;
+    startTime: number;
+    chunkCount: number;
+    totalSize: number;
+  }> = [];
 
   const onMessageAddListenerMock = vi.fn();
   const onUpdatedAddListenerMock = vi.fn();
@@ -103,6 +109,7 @@ describe('background test control plane', () => {
     runtimeListener = null;
     persistedContextStore = undefined;
     sessionStore = {};
+    seededOrphanSessions = [];
 
     offscreenSendMock.mockReset();
     ensureReadyMock.mockReset();
@@ -190,7 +197,48 @@ describe('background test control plane', () => {
     });
     offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
       if (message.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
-        return { ok: true, sessions: [] };
+        return { ok: true, sessions: seededOrphanSessions };
+      }
+      if (message.type === RuntimeMessageType.OFFSCREEN_TEST_SEED_ORPHANS) {
+        const sessions = Array.isArray((message as { sessions?: unknown }).sessions)
+          ? ((message as { sessions: Array<{ sessionId?: string; startTime?: number; streamBytesWritten?: number }> }).sessions)
+              .map((session) => ({
+                sessionId: String(session.sessionId ?? ''),
+                startTime: Number(session.startTime ?? Date.now()),
+                chunkCount: Math.max(1, Number(session.streamBytesWritten ?? 1)),
+                totalSize: Math.max(1, Number(session.streamBytesWritten ?? 1)),
+              }))
+              .filter((session) => Boolean(session.sessionId))
+          : [];
+        seededOrphanSessions = sessions;
+        return { ok: true, sessions: seededOrphanSessions };
+      }
+      if (message.type === RuntimeMessageType.OFFSCREEN_CLEAR_SESSION) {
+        const sessionId = String((message as { sessionId?: string }).sessionId ?? '');
+        seededOrphanSessions = seededOrphanSessions.filter((session) => session.sessionId !== sessionId);
+        return { ok: true };
+      }
+      if (message.type === RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT) {
+        const sessionId = String((message as { sessionId?: string }).sessionId ?? '');
+        const known = seededOrphanSessions.find((session) => session.sessionId === sessionId);
+        if (!known) {
+          return { ok: false, error: 'Orphaned session not found' };
+        }
+        return {
+          ok: true,
+          chunks: [
+            {
+              index: 0,
+              size: 0,
+              status: 'missing',
+              expectedChecksum: null,
+              actualChecksum: null,
+              included: false,
+            },
+          ],
+          recordingQuality: 'auto',
+          recordingResolvedQuality: '1080p30',
+        };
       }
       if (message.type === RuntimeMessageType.OFFSCREEN_START_WEBCODECS) {
         return {
@@ -285,7 +333,7 @@ describe('background test control plane', () => {
     expect(response?.snapshot?.state).toBe('idle');
   });
 
-  it('returns snapshot and last filename readbacks from the background state', async () => {
+  it('returns snapshot, capture fixtures, and last filename readbacks from the background state', async () => {
     vi.useFakeTimers();
     try {
       const timestampMs = new Date(2026, 5, 29, 14, 30, 12).getTime();
@@ -300,37 +348,62 @@ describe('background test control plane', () => {
       expect(initialSnapshot?.snapshot?.state).toBe('idle');
       expect(initialSnapshot?.snapshot?.outputFileName).toBeNull();
 
+      const initialCaptureFixture = (await chrome.runtime.sendMessage({
+        type: RuntimeMessageType.TEST_GET_CAPTURE_FIXTURE,
+      })) as {
+        ok?: boolean;
+        captureFixture?: { activeTab?: { id?: number } | null };
+        activeTab?: { id?: number } | null;
+      };
+      expect(initialCaptureFixture?.ok).toBe(true);
+      expect(initialCaptureFixture?.captureFixture?.activeTab).toBeNull();
+
       const initialFilename = (await chrome.runtime.sendMessage({
         type: RuntimeMessageType.TEST_GET_LAST_FILENAME,
       })) as { ok?: boolean; outputFileName?: string | null };
       expect(initialFilename?.ok).toBe(true);
       expect(initialFilename?.outputFileName).toBeNull();
 
-      const activeTabResult = (await chrome.runtime.sendMessage({
-        type: RuntimeMessageType.TEST_SET_ACTIVE_TAB,
-        tab: {
-          id: 101,
-          title: 'ChatGPT - Google Chrome',
-          url: 'https://chatgpt.com/chat',
+      const captureFixtureResult = (await chrome.runtime.sendMessage({
+        type: RuntimeMessageType.TEST_SET_CAPTURE_FIXTURE,
+        captureFixture: {
+          activeTab: {
+            id: 101,
+            title: 'ChatGPT - Google Chrome',
+            url: 'https://chatgpt.com/chat',
+          },
         },
-      })) as { ok?: boolean; activeTab?: { id: number } | null };
-      expect(activeTabResult?.ok).toBe(true);
-      expect(activeTabResult?.activeTab?.id).toBe(101);
+      })) as {
+        ok?: boolean;
+        captureFixture?: { activeTab?: { id?: number; title?: string | null; url?: string | null } | null };
+        activeTab?: { id?: number } | null;
+      };
+      expect(captureFixtureResult?.ok).toBe(true);
+      expect(captureFixtureResult?.captureFixture?.activeTab?.id).toBe(101);
+      expect(captureFixtureResult?.activeTab?.id).toBe(101);
 
       const preflight = (await chrome.runtime.sendMessage({
-        type: RuntimeMessageType.PREPARE_START,
+        type: RuntimeMessageType.TEST_PREPARE_START,
         includeMic: false,
         quality: 'auto',
-      })) as { ok?: boolean };
+      })) as { ok?: boolean; snapshot?: { state?: string } };
       expect(preflight?.ok).toBe(true);
+      expect(preflight?.snapshot?.state).toBe('armed');
 
       const started = (await chrome.runtime.sendMessage({
-        type: RuntimeMessageType.START,
+        type: RuntimeMessageType.TEST_START_RECORDING,
         audioSource: 'tab',
         quality: 'auto',
       })) as { ok?: boolean; snapshot?: { state?: string; outputFileName?: string | null } };
       expect(started?.ok).toBe(true);
       expect(started?.snapshot?.state).toBe('recording');
+      expect(tabCaptureGetMediaStreamIdMock).not.toHaveBeenCalled();
+      expect(offscreenSendMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: RuntimeMessageType.OFFSCREEN_START_WEBCODECS,
+          streamId: expect.stringMatching(/^jot-test-capture:/),
+        }),
+      );
 
       const expectedStem = buildExportBaseName({
         timestampMs,
@@ -354,9 +427,10 @@ describe('background test control plane', () => {
       expect(inFlightFilename?.outputFileName).toBe(expectedFilename);
 
       const stopped = (await chrome.runtime.sendMessage({
-        type: RuntimeMessageType.STOP,
-      })) as { ok?: boolean };
+        type: RuntimeMessageType.TEST_STOP_RECORDING,
+      })) as { ok?: boolean; snapshot?: { state?: string } };
       expect(stopped?.ok).toBe(true);
+      expect(stopped?.snapshot?.state).toBe('done');
 
       const afterStopFilename = (await chrome.runtime.sendMessage({
         type: RuntimeMessageType.TEST_GET_LAST_FILENAME,
@@ -371,6 +445,17 @@ describe('background test control plane', () => {
       runtimeListener = null;
       (globalThis as { __JOT_TEST_CONTROL_PLANE_ENABLED__?: boolean }).__JOT_TEST_CONTROL_PLANE_ENABLED__ = true;
       await bootBackground();
+
+      const rehydratedCaptureFixture = (await chrome.runtime.sendMessage({
+        type: RuntimeMessageType.TEST_GET_CAPTURE_FIXTURE,
+      })) as {
+        ok?: boolean;
+        captureFixture?: { activeTab?: { id?: number } | null };
+        activeTab?: { id?: number } | null;
+      };
+      expect(rehydratedCaptureFixture?.ok).toBe(true);
+      expect(rehydratedCaptureFixture?.captureFixture?.activeTab?.id).toBe(101);
+      expect(rehydratedCaptureFixture?.activeTab?.id).toBe(101);
 
       const rehydratedFilename = (await chrome.runtime.sendMessage({
         type: RuntimeMessageType.TEST_GET_LAST_FILENAME,
@@ -397,11 +482,13 @@ describe('background test control plane', () => {
     })) as {
       ok?: boolean;
       permissionState?: { microphone?: string };
+      captureFixture?: { activeTab?: { id?: number } | null };
       activeTab?: { id?: number } | null;
     };
 
     expect(initial?.ok).toBe(true);
     expect(initial?.permissionState?.microphone).toBe('unset');
+    expect(initial?.captureFixture?.activeTab).toBeNull();
     expect(initial?.activeTab).toBeNull();
 
     const setPermission = (await chrome.runtime.sendMessage({
@@ -412,6 +499,7 @@ describe('background test control plane', () => {
     })) as {
       ok?: boolean;
       permissionState?: { microphone?: string };
+      captureFixture?: { activeTab?: { id?: number } | null };
       activeTab?: { id?: number } | null;
     };
 
@@ -420,18 +508,22 @@ describe('background test control plane', () => {
     expect(setPermission?.activeTab).toBeNull();
 
     const setActiveTab = (await chrome.runtime.sendMessage({
-      type: RuntimeMessageType.TEST_SET_ACTIVE_TAB,
-      tab: {
-        id: 101,
-        title: 'Example Domain',
-        url: 'https://example.com/',
+      type: RuntimeMessageType.TEST_SET_CAPTURE_FIXTURE,
+      captureFixture: {
+        activeTab: {
+          id: 101,
+          title: 'Example Domain',
+          url: 'https://example.com/',
+        },
       },
     })) as {
       ok?: boolean;
+      captureFixture?: { activeTab?: { id?: number } | null };
       activeTab?: { id?: number } | null;
     };
 
     expect(setActiveTab?.ok).toBe(true);
+    expect(setActiveTab?.captureFixture?.activeTab?.id).toBe(101);
     expect(setActiveTab?.activeTab?.id).toBe(101);
 
     const afterSet = (await chrome.runtime.sendMessage({
@@ -439,11 +531,13 @@ describe('background test control plane', () => {
     })) as {
       ok?: boolean;
       permissionState?: { microphone?: string };
+      captureFixture?: { activeTab?: { id?: number; title?: string | null } | null };
       activeTab?: { id?: number; title?: string | null } | null;
     };
 
     expect(afterSet?.ok).toBe(true);
     expect(afterSet?.permissionState?.microphone).toBe('prompt');
+    expect(afterSet?.captureFixture?.activeTab?.id).toBe(101);
     expect(afterSet?.activeTab?.id).toBe(101);
 
     vi.resetModules();
@@ -456,26 +550,32 @@ describe('background test control plane', () => {
     })) as {
       ok?: boolean;
       permissionState?: { microphone?: string };
+      captureFixture?: { activeTab?: { id?: number } | null };
       activeTab?: { id?: number } | null;
     };
 
     expect(rehydrated?.ok).toBe(true);
     expect(rehydrated?.permissionState?.microphone).toBe('prompt');
-    expect(rehydrated?.activeTab).toBeNull();
+    expect(rehydrated?.captureFixture?.activeTab?.id).toBe(101);
+    expect(rehydrated?.activeTab?.id).toBe(101);
 
     const reloadedActiveTab = (await chrome.runtime.sendMessage({
-      type: RuntimeMessageType.TEST_SET_ACTIVE_TAB,
-      tab: {
-        id: 202,
-        title: 'Google',
-        url: 'https://google.com/',
+      type: RuntimeMessageType.TEST_SET_CAPTURE_FIXTURE,
+      captureFixture: {
+        activeTab: {
+          id: 202,
+          title: 'Google',
+          url: 'https://google.com/',
+        },
       },
     })) as {
       ok?: boolean;
+      captureFixture?: { activeTab?: { id?: number } | null };
       activeTab?: { id?: number } | null;
     };
 
     expect(reloadedActiveTab?.ok).toBe(true);
+    expect(reloadedActiveTab?.captureFixture?.activeTab?.id).toBe(202);
     expect(reloadedActiveTab?.activeTab?.id).toBe(202);
 
     const reset = (await chrome.runtime.sendMessage({
@@ -483,11 +583,13 @@ describe('background test control plane', () => {
     })) as {
       ok?: boolean;
       permissionState?: { microphone?: string };
+      captureFixture?: { activeTab?: { id?: number } | null };
       activeTab?: { id?: number } | null;
     };
 
     expect(reset?.ok).toBe(true);
     expect(reset?.permissionState?.microphone).toBe('unset');
+    expect(reset?.captureFixture?.activeTab).toBeNull();
     expect(reset?.activeTab).toBeNull();
 
     const afterReset = (await chrome.runtime.sendMessage({
@@ -495,11 +597,142 @@ describe('background test control plane', () => {
     })) as {
       ok?: boolean;
       permissionState?: { microphone?: string };
+      captureFixture?: { activeTab?: { id?: number } | null };
       activeTab?: { id?: number } | null;
     };
 
     expect(afterReset?.ok).toBe(true);
     expect(afterReset?.permissionState?.microphone).toBe('unset');
+    expect(afterReset?.captureFixture?.activeTab).toBeNull();
     expect(afterReset?.activeTab).toBeNull();
+  });
+
+  it('seeds, refreshes, recovers, and discards orphan fixtures through the control plane', async () => {
+    await bootBackground();
+
+    const orphanSession = {
+      sessionId: 'rec_20260630_101500',
+      startTime: new Date(2026, 5, 30, 10, 15, 0).getTime(),
+      recordingQuality: 'auto' as const,
+      recordingResolvedQuality: '1080p30' as const,
+      recordingKind: 'webcodecs-opfs' as const,
+      streamBytesWritten: 1,
+    };
+
+    const seeded = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_SET_ORPHAN_FIXTURE,
+      orphanFixture: {
+        sessions: [orphanSession],
+      },
+    })) as {
+      ok?: boolean;
+      orphanFixture?: { sessions?: Array<{ sessionId?: string }> };
+      snapshot?: { orphanedSessions?: Array<{ sessionId?: string }> };
+    };
+
+    expect(seeded?.ok).toBe(true);
+    expect(seeded?.orphanFixture?.sessions).toHaveLength(1);
+    expect(seeded?.snapshot?.orphanedSessions).toHaveLength(1);
+
+    const readback = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_GET_ORPHAN_FIXTURE,
+    })) as {
+      ok?: boolean;
+      orphanFixture?: { sessions?: Array<{ sessionId?: string }> };
+    };
+
+    expect(readback?.ok).toBe(true);
+    expect(readback?.orphanFixture?.sessions).toHaveLength(1);
+    expect(readback?.orphanFixture?.sessions?.[0]?.sessionId).toBe(orphanSession.sessionId);
+
+    const refreshed = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_REFRESH_ORPHANS,
+    })) as {
+      ok?: boolean;
+      snapshot?: { state?: string; orphanedSessions?: Array<{ sessionId?: string }> };
+    };
+
+    expect(refreshed?.ok).toBe(true);
+    expect(refreshed?.snapshot?.state).toBe('idle');
+    expect(refreshed?.snapshot?.orphanedSessions).toHaveLength(1);
+    expect(refreshed?.snapshot?.orphanedSessions?.[0]?.sessionId).toBe(orphanSession.sessionId);
+
+    vi.resetModules();
+    runtimeListener = null;
+    (globalThis as { __JOT_TEST_CONTROL_PLANE_ENABLED__?: boolean }).__JOT_TEST_CONTROL_PLANE_ENABLED__ = true;
+    await bootBackground();
+
+    const rehydrated = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_GET_ORPHAN_FIXTURE,
+    })) as {
+      ok?: boolean;
+      orphanFixture?: { sessions?: Array<{ sessionId?: string }> };
+    };
+
+    expect(rehydrated?.ok).toBe(true);
+    expect(rehydrated?.orphanFixture?.sessions).toHaveLength(1);
+    expect(rehydrated?.orphanFixture?.sessions?.[0]?.sessionId).toBe(orphanSession.sessionId);
+
+    const recovered = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_RECOVER_ORPHAN,
+      sessionId: orphanSession.sessionId,
+    })) as {
+      ok?: boolean;
+      error?: string;
+      snapshot?: {
+        state?: string;
+        recoverySessionId?: string | null;
+        recoveryChunks?: Array<{ included?: boolean }>;
+        orphanedSessions?: Array<{ sessionId?: string }>;
+      };
+    };
+
+    expect(recovered?.ok).toBe(false);
+    expect(recovered?.snapshot?.state).toBe('recovery');
+    expect(recovered?.snapshot?.recoverySessionId).toBe(orphanSession.sessionId);
+    expect(recovered?.snapshot?.recoveryChunks).toHaveLength(1);
+    expect(recovered?.snapshot?.recoveryChunks?.[0]?.included).toBe(false);
+    expect(recovered?.snapshot?.orphanedSessions).toHaveLength(1);
+
+    const discarded = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_DISCARD_ORPHAN,
+      sessionId: orphanSession.sessionId,
+    })) as {
+      ok?: boolean;
+      snapshot?: {
+        state?: string;
+        recoverySessionId?: string | null;
+        recoveryChunks?: Array<unknown>;
+        orphanedSessions?: Array<{ sessionId?: string }>;
+      };
+      orphanFixture?: { sessions?: Array<{ sessionId?: string }> };
+    };
+
+    expect(discarded?.ok).toBe(true);
+    expect(discarded?.snapshot?.state).toBe('recovery');
+    expect(discarded?.snapshot?.recoverySessionId).toBeNull();
+    expect(discarded?.snapshot?.recoveryChunks).toHaveLength(0);
+    expect(discarded?.snapshot?.orphanedSessions).toHaveLength(0);
+    expect(discarded?.orphanFixture?.sessions).toHaveLength(0);
+
+    const reset = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_RESET_TEST_FIXTURES,
+    })) as {
+      ok?: boolean;
+      orphanFixture?: { sessions?: Array<{ sessionId?: string }> };
+    };
+
+    expect(reset?.ok).toBe(true);
+    expect(reset?.orphanFixture?.sessions).toHaveLength(0);
+
+    const resetSnapshot = (await chrome.runtime.sendMessage({
+      type: RuntimeMessageType.TEST_GET_SNAPSHOT,
+    })) as {
+      ok?: boolean;
+      snapshot?: { orphanedSessions?: Array<{ sessionId?: string }> };
+    };
+
+    expect(resetSnapshot?.ok).toBe(true);
+    expect(resetSnapshot?.snapshot?.orphanedSessions).toHaveLength(0);
   });
 });

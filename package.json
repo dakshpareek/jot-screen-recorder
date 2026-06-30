@@ -15,7 +15,8 @@
     "compile": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "postinstall": "wxt prepare"
+    "postinstall": "wxt prepare",
+    "test:live:control-plane": "pnpm build && node tests/live/cdp-control-plane-smoke.mjs"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",
@@ -32,6 +33,7 @@
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@wxt-dev/module-react": "1.1.5",
+    "chrome-remote-interface": "^0.34.0",
     "jsdom": "^29.0.1",
     "linkedom": "0.18.12",
     "typescript": "^5.9.3",

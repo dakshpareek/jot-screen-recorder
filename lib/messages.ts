@@ -11,10 +11,20 @@ export const RuntimeMessageType = {
 
   TEST_GET_SNAPSHOT: 'TEST_GET_SNAPSHOT',
   TEST_GET_LAST_FILENAME: 'TEST_GET_LAST_FILENAME',
+  TEST_GET_CAPTURE_FIXTURE: 'TEST_GET_CAPTURE_FIXTURE',
+  TEST_GET_ORPHAN_FIXTURE: 'TEST_GET_ORPHAN_FIXTURE',
   TEST_SET_ACTIVE_TAB: 'TEST_SET_ACTIVE_TAB',
+  TEST_SET_CAPTURE_FIXTURE: 'TEST_SET_CAPTURE_FIXTURE',
+  TEST_SET_ORPHAN_FIXTURE: 'TEST_SET_ORPHAN_FIXTURE',
   TEST_GET_PERMISSION_STATE: 'TEST_GET_PERMISSION_STATE',
   TEST_SET_PERMISSION_STATE: 'TEST_SET_PERMISSION_STATE',
   TEST_RESET_TEST_FIXTURES: 'TEST_RESET_TEST_FIXTURES',
+  TEST_PREPARE_START: 'TEST_PREPARE_START',
+  TEST_START_RECORDING: 'TEST_START_RECORDING',
+  TEST_STOP_RECORDING: 'TEST_STOP_RECORDING',
+  TEST_REFRESH_ORPHANS: 'TEST_REFRESH_ORPHANS',
+  TEST_RECOVER_ORPHAN: 'TEST_RECOVER_ORPHAN',
+  TEST_DISCARD_ORPHAN: 'TEST_DISCARD_ORPHAN',
 
   START: 'START',
   PREPARE_START: 'PREPARE_START',
@@ -44,6 +54,7 @@ export const RuntimeMessageType = {
   OFFSCREEN_RECOVERY_INSPECT: 'OFFSCREEN_RECOVERY_INSPECT',
   OFFSCREEN_STATUS: 'OFFSCREEN_STATUS',
   OFFSCREEN_DOWNLOAD_RAW_CHUNKS: 'OFFSCREEN_DOWNLOAD_RAW_CHUNKS',
+  OFFSCREEN_TEST_SEED_ORPHANS: 'OFFSCREEN_TEST_SEED_ORPHANS',
 
   OFFSCREEN_READY: 'OFFSCREEN_READY',
   OFFSCREEN_EVENT: 'OFFSCREEN_EVENT',
@@ -170,6 +181,24 @@ export type TestActiveTabFixture = {
   url?: string | null;
 };
 
+export type TestCaptureFixture = {
+  activeTab: TestActiveTabFixture | null;
+};
+
+export type TestOrphanFixtureSession = {
+  sessionId: string;
+  startTime: number;
+  recordingQuality?: CaptureQuality;
+  recordingResolvedQuality?: CaptureResolvedQuality;
+  recordingKind?: 'mediarecorder' | 'webcodecs-opfs';
+  mimeType?: string;
+  streamBytesWritten?: number;
+};
+
+export type TestOrphanFixture = {
+  sessions: TestOrphanFixtureSession[];
+};
+
 export type TestPermissionState = 'unset' | 'prompt' | 'granted' | 'denied';
 
 export type TestPermissionFixture = {
@@ -182,5 +211,7 @@ export type TestControlPlaneResponse = {
   snapshot?: RecordingSnapshot;
   outputFileName?: string | null;
   activeTab?: TestActiveTabFixture | null;
+  captureFixture?: TestCaptureFixture;
+  orphanFixture?: TestOrphanFixture;
   permissionState?: TestPermissionFixture;
 } | null;

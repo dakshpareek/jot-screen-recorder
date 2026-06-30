@@ -12,6 +12,7 @@ import {
   type CaptureResolvedQuality,
   type MicPreflightMessage,
   type OffscreenEventTypeValue,
+  type TestOrphanFixtureSession,
   type TestPermissionState,
 } from '@/lib/messages';
 import { debugInfo, debugWarn } from '@/lib/runtime-log';
@@ -39,6 +40,8 @@ import {
   buildRawExportBaseName,
 } from './background/utils';
 import { classifyMicPermissionRequestError } from '@/lib/testing/mic-permission';
+import { isTestCaptureStreamId } from '@/lib/testing/capture-stream';
+import { normalizeTestOrphanFixtureSession } from '@/lib/testing/orphan-fixture';
 
 const CHUNK_DURATION_SECONDS = 10;
 const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
@@ -55,6 +58,8 @@ export default defineUnlistedScript(() => {
   let recorder: MediaRecorder | null = null;
   let captureStream: MediaStream | null = null;
   let tabCaptureStream: MediaStream | null = null;
+  let syntheticTabCaptureCanvas: HTMLCanvasElement | null = null;
+  let syntheticTabCaptureInterval: ReturnType<typeof setInterval> | null = null;
   let micCaptureStream: MediaStream | null = null;
   let preflightMicStream: MediaStream | null = null;
   let preflightMicHoldTimer: ReturnType<typeof setTimeout> | null = null;
@@ -163,6 +168,16 @@ export default defineUnlistedScript(() => {
 
     if (msg.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
       void scanOrphanedSessions().then(sendResponse);
+      return true;
+    }
+
+    if (msg.type === RuntimeMessageType.OFFSCREEN_TEST_SEED_ORPHANS) {
+      const sessions = Array.isArray(msg.sessions)
+        ? msg.sessions
+            .map((session: unknown) => normalizeTestOrphanFixtureSession(session))
+            .filter(Boolean)
+        : [];
+      void seedOrphanedSessions(sessions as TestOrphanFixtureSession[]).then(sendResponse);
       return true;
     }
 
@@ -972,6 +987,32 @@ export default defineUnlistedScript(() => {
     };
   }
 
+  function buildSeededOrphanManifest(session: TestOrphanFixtureSession): SessionManifest {
+    return {
+      sessionId: session.sessionId,
+      startTime: session.startTime,
+      recordingQuality: normalizeCaptureQuality(session.recordingQuality),
+      recordingResolvedQuality: normalizeResolvedCaptureQuality(session.recordingResolvedQuality),
+      mimeType: typeof session.mimeType === 'string' ? session.mimeType : 'video/webm',
+      chunks: [],
+      totalDuration: 0,
+      status: 'recording',
+      recordingKind: session.recordingKind ?? 'webcodecs-opfs',
+      streamBytesWritten: Math.max(1, session.streamBytesWritten ?? 1),
+    };
+  }
+
+  async function seedOrphanedSessions(sessions: TestOrphanFixtureSession[]) {
+    for (const session of sessions) {
+      await opfsBridge.writeManifest(session.sessionId, buildSeededOrphanManifest(session));
+    }
+
+    return {
+      ok: true,
+      sessions: await opfsBridge.scanOrphans(),
+    };
+  }
+
   async function clearSessionData(sessionId: string) {
     if (!sessionId) {
       return { ok: false, error: 'Missing session id' };
@@ -1261,6 +1302,11 @@ export default defineUnlistedScript(() => {
     if (tabCaptureStream) {
       tabCaptureStream.getTracks().forEach((track) => track.stop());
     }
+    if (syntheticTabCaptureInterval) {
+      clearInterval(syntheticTabCaptureInterval);
+      syntheticTabCaptureInterval = null;
+    }
+    syntheticTabCaptureCanvas = null;
     if (micCaptureStream) {
       micCaptureStream.getTracks().forEach((track) => track.stop());
     }
@@ -1700,7 +1746,55 @@ export default defineUnlistedScript(() => {
     return high * 2 ** 32 + low;
   }
 
+  function createSyntheticTabCaptureStream() {
+    if (syntheticTabCaptureCanvas) {
+      return syntheticTabCaptureCanvas.captureStream(30);
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280;
+    canvas.height = 720;
+    const context = canvas.getContext('2d');
+    if (!context) {
+      throw new Error('Synthetic test capture canvas is unavailable');
+    }
+
+    let frame = 0;
+    const draw = () => {
+      const progress = (frame % 360) / 360;
+      const offset = Math.round(progress * 255);
+      context.fillStyle = `rgb(${18 + offset}, ${28 + offset / 2}, ${42 + offset / 3})`;
+      context.fillRect(0, 0, canvas.width, canvas.height);
+
+      context.fillStyle = 'rgba(255, 255, 255, 0.14)';
+      for (let i = 0; i < 14; i += 1) {
+        const x = ((frame * 11) + i * 120) % (canvas.width + 180) - 180;
+        context.fillRect(x, 60 + i * 40, 160, 10);
+      }
+
+      context.fillStyle = 'rgba(0, 0, 0, 0.28)';
+      context.fillRect(60, 120, canvas.width - 120, canvas.height - 240);
+
+      context.fillStyle = '#f9fafb';
+      context.font = 'bold 48px system-ui, sans-serif';
+      context.fillText('Jot test capture', 100, 210);
+      context.font = '28px system-ui, sans-serif';
+      context.fillText(`frame ${frame}`, 100, 270);
+      context.fillText(new Date().toISOString(), 100, 320);
+      frame += 1;
+    };
+
+    draw();
+    syntheticTabCaptureInterval = setInterval(draw, 1000 / 30);
+    syntheticTabCaptureCanvas = canvas;
+    return canvas.captureStream(30);
+  }
+
   async function getTabStreamByPreset(streamId: string, resolvedPreset: CaptureResolvedQuality) {
+    if (isTestCaptureStreamId(streamId)) {
+      return createSyntheticTabCaptureStream();
+    }
+
     const video = buildTabCaptureConstraints(streamId, resolvedPreset);
 
     const audio = {

@@ -17,6 +17,21 @@ evaluate JavaScript in the extension service worker context. That gives you the
 same class of access as the service-worker console in DevTools, but without
 needing to click through the DevTools UI.
 
+For the repeatable automated version of this flow, run:
+
+```bash
+pnpm test:live:control-plane
+```
+
+That script uses `chrome-remote-interface` to connect to the real extension
+service worker, enables the test control plane, seeds stable capture metadata,
+seeds deterministic orphan state, and runs `TEST_PREPARE_START`,
+`TEST_START_RECORDING`, `TEST_GET_LAST_FILENAME`, `TEST_STOP_RECORDING`,
+`TEST_REFRESH_ORPHANS`, `TEST_RECOVER_ORPHAN`, `TEST_DISCARD_ORPHAN`, and reset
+assertions against the live worker.
+CDP is only the remote-control channel; the extension still owns the background
+and offscreen recording path.
+
 Use it to:
 
 - enable the live test control plane
@@ -35,6 +50,11 @@ Use the CDP path when:
 - you need to check the worker and popup in the same live Chrome session
 
 Do not treat it as a replacement for the normal UI smoke tests.
+
+The automated CDP smoke also does not prove Chrome's real tab-capture permission
+gate, popup button wiring, real page pixels, or download UI. It proves that the
+real extension runtime can execute the deterministic test-only recording path in
+live Chrome.
 
 ## Prerequisites
 
@@ -93,6 +113,9 @@ await chrome.runtime.sendMessage({
   live fixture storage.
 - `RUN_MIC_CHECK` returns the expected mic-specific error for the current
   fixture state.
+- `TEST_GET_ORPHAN_FIXTURE`, `TEST_SET_ORPHAN_FIXTURE`, `TEST_REFRESH_ORPHANS`,
+  `TEST_RECOVER_ORPHAN`, and `TEST_DISCARD_ORPHAN` agree with the live recovery
+  path and OPFS-backed orphan state.
 - A reload or worker restart preserves the session-backed permission fixture.
 
 ## Debug notes

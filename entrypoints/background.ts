@@ -18,6 +18,7 @@ import type {
   RecoveryInspectResponse,
   StorageSignalMessage,
   SystemAudioSignalMessage,
+  TestOrphanFixture,
 } from '@/lib/messages';
 import { OffscreenEventType, RuntimeMessageType } from '@/lib/messages';
 import { debugWarn } from '@/lib/runtime-log';
@@ -45,12 +46,15 @@ import {
   normalizeSystemAudioStatus,
   toErrorMessage,
 } from './background/utils';
+import { buildTestCaptureStreamId } from '@/lib/testing/capture-stream';
 import { resolveMicrophonePermissionState } from '@/lib/testing/permission-fixture';
 import {
   getTestActiveTabFixture,
   handleTestControlPlaneMessage,
   installTestControlPlaneDebugHook,
+  installTestControlPlaneRuntimeHandlers,
 } from './background/testing/control-plane';
+import { isTestControlPlaneEnabled } from './background/testing/gate';
 
 type RawDownloadItem = {
   url: string;
@@ -98,6 +102,15 @@ const offscreenClient = new OffscreenClient();
 
 export default defineBackground(() => {
   installTestControlPlaneDebugHook(buildSnapshot, () => outputFileName);
+  installTestControlPlaneRuntimeHandlers({
+    prepareStart: handlePrepareStart,
+    start: handleStart,
+    stop: handleStop,
+    refreshOrphans: handleRefreshOrphans,
+    recoverOrphan: handleRecoverOrphan,
+    discardOrphan: handleDiscardOrphan,
+    syncOrphanFixture: syncOrphanFixture,
+  });
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message?.type) return;
@@ -412,6 +425,35 @@ async function refreshOrphanedSessions() {
   }
 }
 
+async function syncOrphanFixture(previousFixture: TestOrphanFixture, nextFixture: TestOrphanFixture) {
+  const previousSessionIds = new Set(previousFixture.sessions.map((session) => session.sessionId));
+  const nextSessionIds = new Set(nextFixture.sessions.map((session) => session.sessionId));
+
+  try {
+    await offscreenClient.ensureReadyWithRetry(delay);
+
+    for (const sessionIdToClear of previousSessionIds) {
+      if (nextSessionIds.has(sessionIdToClear)) continue;
+      await offscreenClient.send<{ ok?: boolean; error?: string }>({
+        type: RuntimeMessageType.OFFSCREEN_CLEAR_SESSION,
+        sessionId: sessionIdToClear,
+      });
+    }
+
+    if (nextFixture.sessions.length > 0) {
+      await offscreenClient.send<{ ok?: boolean; error?: string }>({
+        type: RuntimeMessageType.OFFSCREEN_TEST_SEED_ORPHANS,
+        sessions: nextFixture.sessions,
+      });
+    }
+  } catch (error) {
+    debugWarn('[Background] Failed to sync test orphan fixture:', error);
+  }
+
+  await refreshOrphanedSessions();
+  return { ok: true, snapshot: buildSnapshot() };
+}
+
 function buildSnapshot(): RecordingSnapshot {
   const elapsedSeconds =
     state === 'recording' && recordingStartTime
@@ -673,6 +715,17 @@ async function handleStart(
   try {
     const targetTab = await getStartTargetTab();
     const targetTabId = targetTab.id!;
+    const testCaptureFixture = isTestControlPlaneEnabled() ? await getTestActiveTabFixture() : null;
+    const useTestCaptureStream = testCaptureFixture?.id === targetTabId;
+    if (isTestControlPlaneEnabled()) {
+      if (useTestCaptureStream) {
+        try {
+          await chrome.tabs.update(targetTabId, { active: true });
+        } catch {
+          // Best-effort: the active-tab capture grant is only needed for test flows.
+        }
+      }
+    }
     const staleCaptureRecovery = await releaseStaleTabCapture(targetTabId);
     if (!staleCaptureRecovery.ok) {
       errorMessage = formatCodedStartError(
@@ -684,7 +737,9 @@ async function handleStart(
       return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
     }
 
-    let streamId = await getTabCaptureStreamId(targetTabId);
+    let streamId = useTestCaptureStream
+      ? buildTestCaptureStreamId(targetTabId)
+      : await getTabCaptureStreamId(targetTabId);
     if (!streamId) {
       errorMessage = formatCodedStartError(
         'TAB_CAPTURE_STREAM_UNAVAILABLE',
@@ -741,7 +796,9 @@ async function handleStart(
               error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${staleCaptureRecovery.detail ?? 'Unable to release stale tab capture'}`,
             };
           } else {
-            streamId = await getTabCaptureStreamId(targetTabId);
+            streamId = useTestCaptureStream
+              ? buildTestCaptureStreamId(targetTabId)
+              : await getTabCaptureStreamId(targetTabId);
             const fallback = await startMediaRecorder();
             result =
               fallback?.ok || !fallback
@@ -763,7 +820,9 @@ async function handleStart(
             error: `WebCodecs start failed (${webCodecsError}). MediaRecorder fallback also failed: ${staleCaptureRecovery.detail ?? 'Unable to release stale tab capture'}`,
           };
         } else {
-          streamId = await getTabCaptureStreamId(targetTabId);
+          streamId = useTestCaptureStream
+            ? buildTestCaptureStreamId(targetTabId)
+            : await getTabCaptureStreamId(targetTabId);
           const fallback = await startMediaRecorder();
           result =
             fallback?.ok || !fallback
@@ -1423,7 +1482,10 @@ async function handleRecoverOrphan(targetSessionId: string, chunkIndexes?: numbe
           included: chunk.status !== 'missing' && chunk.status === 'ok',
         }));
         errorMessage = 'Suspect chunks detected. Select chunks to include before processing.';
-        setState('recovery');
+        // Orphan recovery can be entered directly from the control plane while idle,
+        // so force the UI into recovery even when the state machine has not been
+        // pre-armed by a validating flow.
+        setState('recovery', { force: true });
         return {
           ok: false,
           error: errorMessage,
@@ -1694,7 +1756,7 @@ async function runProcessingPipeline(options?: {
 }
 
 async function getStartTargetTab(options?: { validateCapturable?: boolean }) {
-  const testActiveTab = getTestActiveTabFixture();
+  const testActiveTab = await getTestActiveTabFixture();
   if (testActiveTab) {
     if (options?.validateCapturable !== false && typeof testActiveTab.url === 'string' && testActiveTab.url.trim()) {
       const capturable = isTabUrlCapturable(testActiveTab.url);
