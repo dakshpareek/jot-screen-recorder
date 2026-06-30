@@ -16,6 +16,7 @@ import {
   type TestPermissionState,
 } from '@/lib/messages';
 import { debugInfo, debugWarn } from '@/lib/runtime-log';
+import { MessageRouter } from '@/lib/message-router';
 import {
   getRuntimeHintsFromNavigator,
   normalizeResolvedCaptureQuality,
@@ -105,9 +106,11 @@ export default defineUnlistedScript(() => {
   // Signal readiness early. If background is not listening yet, ping-based readiness still succeeds.
   void chrome.runtime.sendMessage({ type: RuntimeMessageType.OFFSCREEN_READY }).catch(() => {});
 
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg.type === RuntimeMessageType.OFFSCREEN_START) {
-      void startRecording(
+  const router = new MessageRouter();
+
+  router
+    .on(RuntimeMessageType.OFFSCREEN_START, (msg) =>
+      startRecording(
         String(msg.sessionId),
         String(msg.streamId ?? ''),
         normalizeAudioSource(msg.audioSource),
@@ -115,186 +118,146 @@ export default defineUnlistedScript(() => {
         normalizeCaptureQuality(msg.quality),
         String(msg.exportBaseName ?? ''),
         typeof msg.recordingStartTime === 'number' ? msg.recordingStartTime : undefined,
-      ).then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_STOP) {
-      void stopRecording().then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_PROCESS) {
+      ),
+    )
+    .on(RuntimeMessageType.OFFSCREEN_STOP, () => stopRecording())
+    .on(RuntimeMessageType.OFFSCREEN_PROCESS, (msg) => {
       const chunkIndexes = Array.isArray(msg.chunkIndexes)
         ? msg.chunkIndexes
             .map((value: unknown) => Number(value))
             .filter((value: number) => Number.isInteger(value) && value >= 0)
         : undefined;
-      void processRecording(String(msg.sessionId), chunkIndexes).then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_VALIDATE) {
-      void validateLatestOutput().then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.MIC_PREFLIGHT) {
-      const permissionState = normalizeMicPermissionState((msg as MicPreflightMessage).permissionState);
-      void runMicPreflight(normalizeMicDeviceId(msg.micDeviceId), permissionState).then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_RELEASE_PREFLIGHT_MIC) {
+      return processRecording(String(msg.sessionId), chunkIndexes);
+    })
+    .on(RuntimeMessageType.OFFSCREEN_VALIDATE, () => validateLatestOutput())
+    .on(RuntimeMessageType.MIC_PREFLIGHT, (msg) =>
+      runMicPreflight(
+        normalizeMicDeviceId(msg.micDeviceId),
+        normalizeMicPermissionState((msg as MicPreflightMessage).permissionState),
+      ),
+    )
+    .on(RuntimeMessageType.OFFSCREEN_RELEASE_PREFLIGHT_MIC, () => {
       releasePreflightMicStream();
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP) {
-      void forceCleanupCapture().then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_PAUSE) {
-      void pauseRecording().then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_RESUME) {
-      void resumeRecording().then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS) {
-      void scanOrphanedSessions().then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_TEST_SEED_ORPHANS) {
+      return { ok: true };
+    })
+    .on(RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP, () => forceCleanupCapture())
+    .on(RuntimeMessageType.OFFSCREEN_PAUSE, () => pauseRecording())
+    .on(RuntimeMessageType.OFFSCREEN_RESUME, () => resumeRecording())
+    .on(RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS, () => scanOrphanedSessions())
+    .on(RuntimeMessageType.OFFSCREEN_TEST_SEED_ORPHANS, (msg) => {
       const sessions = Array.isArray(msg.sessions)
         ? msg.sessions
             .map((session: unknown) => normalizeTestOrphanFixtureSession(session))
             .filter(Boolean)
         : [];
-      void seedOrphanedSessions(sessions as TestOrphanFixtureSession[]).then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_CLEAR_SESSION) {
-      void clearSessionData(String(msg.sessionId ?? '')).then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT) {
-      void inspectRecoveryChunks(String(msg.sessionId ?? '')).then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_DOWNLOAD_RAW_CHUNKS) {
-      void downloadRawChunks(String(msg.sessionId ?? '')).then(sendResponse);
-      return true;
-    }
-
-    if (msg.type === RuntimeMessageType.OFFSCREEN_STATUS) {
-      sendResponse({
-        alive: true,
-        isRecording: recorder?.state === 'recording',
-        isWebCodecsRecording: isWebCodecsRecording(),
-        chunkCount,
-        sessionId: activeSessionId,
-        hasOutput: Boolean(lastOutputUrl),
-      });
-      return;
-    }
-
+      return seedOrphanedSessions(sessions as TestOrphanFixtureSession[]);
+    })
+    .on(RuntimeMessageType.OFFSCREEN_CLEAR_SESSION, (msg) =>
+      clearSessionData(String(msg.sessionId ?? '')),
+    )
+    .on(RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT, (msg) =>
+      inspectRecoveryChunks(String(msg.sessionId ?? '')),
+    )
+    .on(RuntimeMessageType.OFFSCREEN_DOWNLOAD_RAW_CHUNKS, (msg) =>
+      downloadRawChunks(String(msg.sessionId ?? '')),
+    )
+    .on(RuntimeMessageType.OFFSCREEN_STATUS, () => ({
+      alive: true,
+      isRecording: recorder?.state === 'recording',
+      isWebCodecsRecording: isWebCodecsRecording(),
+      chunkCount,
+      sessionId: activeSessionId,
+      hasOutput: Boolean(lastOutputUrl),
+    }))
     // WebCodecs pipeline handlers
-    if (msg.type === RuntimeMessageType.WEBCODECS_CHECK_SUPPORT) {
-      void (async () => {
-        try {
-          const result = await checkWebCodecsSupport(normalizeCaptureQuality(msg.quality));
-          sendResponse(result);
-        } catch (error) {
-          debugWarn('[Offscreen] WebCodecs check error:', error);
-          sendResponse({
-            ok: false,
-            error: toErrorMessage(error),
-            videoSupported: false,
-            audioSupported: false,
-            hardwareAcceleration: false,
-            fallbackReason: toErrorMessage(error),
-          });
-        }
-      })();
-      return true;
+    .on(RuntimeMessageType.WEBCODECS_CHECK_SUPPORT, (msg) => handleCheckWebCodecsSupport(msg.quality))
+    .on(RuntimeMessageType.OFFSCREEN_START_WEBCODECS, (msg) => handleStartWebCodecs(msg))
+    .on(RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS, () => handleStopWebCodecs());
+
+  chrome.runtime.onMessage.addListener(router.dispatch);
+
+  async function handleCheckWebCodecsSupport(quality: unknown) {
+    try {
+      return await checkWebCodecsSupport(normalizeCaptureQuality(quality));
+    } catch (error) {
+      debugWarn('[Offscreen] WebCodecs check error:', error);
+      return {
+        ok: false,
+        error: toErrorMessage(error),
+        videoSupported: false,
+        audioSupported: false,
+        hardwareAcceleration: false,
+        fallbackReason: toErrorMessage(error),
+      };
     }
+  }
 
-    if (msg.type === RuntimeMessageType.OFFSCREEN_START_WEBCODECS) {
-      void (async () => {
-        try {
-          const streamId = String(msg.streamId ?? '');
-          const quality = normalizeCaptureQuality(msg.quality);
-          const sessionId = String(msg.sessionId ?? '');
-          const audioSource = normalizeAudioSource(msg.audioSource);
-          const micDeviceId = normalizeMicDeviceId(msg.micDeviceId);
+  async function handleStartWebCodecs(msg: {
+    streamId?: unknown;
+    quality?: unknown;
+    sessionId?: unknown;
+    audioSource?: unknown;
+    micDeviceId?: unknown;
+    exportBaseName?: unknown;
+    recordingStartTime?: unknown;
+  }) {
+    try {
+      const streamId = String(msg.streamId ?? '');
+      const quality = normalizeCaptureQuality(msg.quality);
+      const sessionId = String(msg.sessionId ?? '');
+      const audioSource = normalizeAudioSource(msg.audioSource);
+      const micDeviceId = normalizeMicDeviceId(msg.micDeviceId);
 
-          if (!streamId) {
-            sendResponse({ ok: false, error: 'Missing stream ID' });
-            return;
-          }
+      if (!streamId) {
+        return { ok: false, error: 'Missing stream ID' };
+      }
 
-          // Get the tab capture stream using the same method as MediaRecorder
-          const tabStreamResolution = await getTabStreamByIdWithFallback(streamId, quality);
-          const tabStream = tabStreamResolution.stream;
-          tabCaptureStream = tabStream;
+      // Get the tab capture stream using the same method as MediaRecorder
+      const tabStreamResolution = await getTabStreamByIdWithFallback(streamId, quality);
+      const tabStream = tabStreamResolution.stream;
+      tabCaptureStream = tabStream;
 
-          // Build capture stream with audio mixing (reuses the same logic as MediaRecorder path)
-          const stream = await buildCaptureStream(tabStream, audioSource, micDeviceId);
-          captureStream = stream;
+      // Build capture stream with audio mixing (reuses the same logic as MediaRecorder path)
+      const stream = await buildCaptureStream(tabStream, audioSource, micDeviceId);
+      captureStream = stream;
 
-          const result = await startWebCodecsRecording(
-            sessionId,
-            stream,
-            tabStreamResolution.requestedPreset,
-            tabStreamResolution.resolvedPreset,
-            tabStreamResolution.fallbackReason,
-            String(msg.exportBaseName ?? ''),
-            typeof msg.recordingStartTime === 'number' ? msg.recordingStartTime : undefined,
-          );
+      const result = await startWebCodecsRecording(
+        sessionId,
+        stream,
+        tabStreamResolution.requestedPreset,
+        tabStreamResolution.resolvedPreset,
+        tabStreamResolution.fallbackReason,
+        String(msg.exportBaseName ?? ''),
+        typeof msg.recordingStartTime === 'number' ? msg.recordingStartTime : undefined,
+      );
 
-          if (!result.ok) {
-            debugWarn('[Offscreen] WebCodecs start failed:', result.error);
-            await cleanupMedia();
-          }
+      if (!result.ok) {
+        debugWarn('[Offscreen] WebCodecs start failed:', result.error);
+        await cleanupMedia();
+      }
 
-          sendResponse(result);
-        } catch (error) {
-          console.error('[Offscreen] WebCodecs start error:', error);
-          await cleanupMedia();
-          sendResponse({ ok: false, error: toNamedErrorMessage(error) });
-        }
-      })();
-      return true;
+      return result;
+    } catch (error) {
+      console.error('[Offscreen] WebCodecs start error:', error);
+      await cleanupMedia();
+      return { ok: false, error: toNamedErrorMessage(error) };
     }
+  }
 
-    if (msg.type === RuntimeMessageType.OFFSCREEN_STOP_WEBCODECS) {
-      void (async () => {
-        try {
-          const result = await stopWebCodecsRecording();
+  async function handleStopWebCodecs() {
+    try {
+      const result = await stopWebCodecsRecording();
 
-          // Cleanup streams
-          await cleanupMedia();
+      // Cleanup streams
+      await cleanupMedia();
 
-          sendResponse(result);
-        } catch (error) {
-          cleanupWebCodecsPipeline();
-          await cleanupMedia().catch(() => {});
-          sendResponse({ ok: false, error: toNamedErrorMessage(error) });
-        }
-      })();
-      return true;
+      return result;
+    } catch (error) {
+      cleanupWebCodecsPipeline();
+      await cleanupMedia().catch(() => {});
+      return { ok: false, error: toNamedErrorMessage(error) };
     }
-  });
+  }
 
   function normalizeAudioSource(value: unknown): AudioSource {
     if (value === 'mic' || value === 'tab' || value === 'silent') {
