@@ -1,6 +1,4 @@
 import type {
-  RecoveryChunkCheck,
-  RecoveryChunkStatus,
   ProcessingMetrics,
   ValidationResult,
 } from '@/lib/recording';
@@ -23,7 +21,8 @@ import {
   resolveCapturePreset,
 } from '@/lib/capture-presets';
 import { OpfsBridge } from './offscreen/storage/opfs-bridge';
-import type { FFmpegClass, RawDownloadItem, SessionManifest } from './offscreen/types';
+import { RecoveryService } from './offscreen/recovery/recovery-service';
+import type { FFmpegClass, SessionManifest } from './offscreen/types';
 import {
   buildTabCaptureConstraints,
   getCaptureProfileByPreset,
@@ -37,7 +36,6 @@ import {
 } from './offscreen/webcodecs';
 import {
   buildDownloadFileName,
-  buildRawExportBaseName,
   normalizeAudioSource,
   normalizeMicDeviceId,
   toErrorMessage,
@@ -70,6 +68,12 @@ const PREFLIGHT_MIC_HOLD_MS = 60_000;
 
 export default defineUnlistedScript(() => {
   const opfsBridge = new OpfsBridge();
+  const recovery = new RecoveryService({
+    opfs: opfsBridge,
+    sha256: (data) => sha256Hex(data),
+    createObjectURL: (blob) => URL.createObjectURL(blob),
+    revokeObjectURL: (url) => URL.revokeObjectURL(url),
+  });
 
   let recorder: MediaRecorder | null = null;
   let captureStream: MediaStream | null = null;
@@ -115,8 +119,6 @@ export default defineUnlistedScript(() => {
   let mixMicGain: GainNode | null = null;
   let mixDestination: MediaStreamAudioDestinationNode | null = null;
   let storageMonitorInterval: ReturnType<typeof setInterval> | null = null;
-  let rawExportRevokeTimer: ReturnType<typeof setTimeout> | null = null;
-  const rawExportUrls = new Set<string>();
 
   // Signal readiness early. If background is not listening yet, ping-based readiness still succeeds.
   void chrome.runtime.sendMessage({ type: RuntimeMessageType.OFFSCREEN_READY }).catch(() => {});
@@ -158,23 +160,23 @@ export default defineUnlistedScript(() => {
     .on(RuntimeMessageType.OFFSCREEN_FORCE_CLEANUP, () => forceCleanupCapture())
     .on(RuntimeMessageType.OFFSCREEN_PAUSE, () => pauseRecording())
     .on(RuntimeMessageType.OFFSCREEN_RESUME, () => resumeRecording())
-    .on(RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS, () => scanOrphanedSessions())
+    .on(RuntimeMessageType.OFFSCREEN_SCAN_ORPHANS, () => recovery.scanOrphanedSessions())
     .on(RuntimeMessageType.OFFSCREEN_TEST_SEED_ORPHANS, (msg) => {
       const sessions = Array.isArray(msg.sessions)
         ? msg.sessions
             .map((session: unknown) => normalizeTestOrphanFixtureSession(session))
             .filter(Boolean)
         : [];
-      return seedOrphanedSessions(sessions as TestOrphanFixtureSession[]);
+      return recovery.seedOrphanedSessions(sessions as TestOrphanFixtureSession[]);
     })
     .on(RuntimeMessageType.OFFSCREEN_CLEAR_SESSION, (msg) =>
-      clearSessionData(String(msg.sessionId ?? '')),
+      recovery.clearSessionData(String(msg.sessionId ?? '')),
     )
     .on(RuntimeMessageType.OFFSCREEN_RECOVERY_INSPECT, (msg) =>
-      inspectRecoveryChunks(String(msg.sessionId ?? '')),
+      recovery.inspectRecoveryChunks(String(msg.sessionId ?? '')),
     )
     .on(RuntimeMessageType.OFFSCREEN_DOWNLOAD_RAW_CHUNKS, (msg) =>
-      downloadRawChunks(String(msg.sessionId ?? '')),
+      recovery.downloadRawChunks(String(msg.sessionId ?? '')),
     )
     .on(RuntimeMessageType.OFFSCREEN_STATUS, () => ({
       alive: true,
@@ -876,227 +878,6 @@ export default defineUnlistedScript(() => {
     return await opfsBridge.readChunk(sessionId, chunkIndex);
   }
 
-  async function scanOrphanedSessions() {
-    return {
-      ok: true,
-      sessions: await opfsBridge.scanOrphans(),
-    };
-  }
-
-  function buildSeededOrphanManifest(session: TestOrphanFixtureSession): SessionManifest {
-    return {
-      sessionId: session.sessionId,
-      startTime: session.startTime,
-      recordingQuality: normalizeCaptureQuality(session.recordingQuality),
-      recordingResolvedQuality: normalizeResolvedCaptureQuality(session.recordingResolvedQuality),
-      mimeType: typeof session.mimeType === 'string' ? session.mimeType : 'video/webm',
-      chunks: [],
-      totalDuration: 0,
-      status: 'recording',
-      recordingKind: session.recordingKind ?? 'webcodecs-opfs',
-      streamBytesWritten: Math.max(1, session.streamBytesWritten ?? 1),
-    };
-  }
-
-  async function seedOrphanedSessions(sessions: TestOrphanFixtureSession[]) {
-    for (const session of sessions) {
-      await opfsBridge.writeManifest(session.sessionId, buildSeededOrphanManifest(session));
-    }
-
-    return {
-      ok: true,
-      sessions: await opfsBridge.scanOrphans(),
-    };
-  }
-
-  async function clearSessionData(sessionId: string) {
-    if (!sessionId) {
-      return { ok: false, error: 'Missing session id' };
-    }
-
-    await opfsBridge.clearSession(sessionId);
-
-    return { ok: true };
-  }
-
-  async function inspectRecoveryChunks(sessionId: string) {
-    if (!sessionId) {
-      return { ok: false, error: 'Missing session id' };
-    }
-
-    try {
-      const manifestData = await readManifest(sessionId);
-      const requestedPreset = normalizeCaptureQuality(manifestData.recordingQuality);
-      const resolvedPreset = normalizeResolvedCaptureQuality(
-        manifestData.recordingResolvedQuality ?? manifestData.recordingQuality,
-      );
-
-      if (manifestData.recordingKind === 'webcodecs-opfs') {
-        try {
-          const data = await opfsBridge.readWebCodecsStream(
-            sessionId,
-            webCodecsOpfsStreamName(manifestData),
-          );
-          const checksum = await sha256Hex(data);
-          return {
-            ok: true,
-            chunks: [
-              {
-                index: 0,
-                size: data.byteLength,
-                status: data.byteLength > 1000 ? 'ok' : 'suspect',
-                expectedChecksum: null,
-                actualChecksum: checksum,
-                included: true,
-              },
-            ],
-            recordingQuality: requestedPreset,
-            recordingResolvedQuality: resolvedPreset,
-          };
-        } catch {
-          return {
-            ok: true,
-            chunks: [
-              {
-                index: 0,
-                size: 0,
-                status: 'missing',
-                expectedChecksum: null,
-                actualChecksum: null,
-                included: false,
-              },
-            ],
-            recordingQuality: requestedPreset,
-            recordingResolvedQuality: resolvedPreset,
-          };
-        }
-      }
-
-      const chunks = [...manifestData.chunks].sort((a, b) => a.index - b.index);
-      const checks: RecoveryChunkCheck[] = [];
-
-      for (const chunk of chunks) {
-        let status: RecoveryChunkStatus = 'ok';
-        let actualChecksum: string | null = null;
-        const expectedChecksum = chunk.checksum || null;
-        try {
-          const data = await readChunkData(sessionId, chunk.index);
-          actualChecksum = await sha256Hex(data);
-          if (!expectedChecksum || actualChecksum !== expectedChecksum) {
-            status = 'suspect';
-          }
-        } catch {
-          status = 'missing';
-        }
-
-        checks.push({
-          index: chunk.index,
-          size: chunk.size,
-          status,
-          expectedChecksum,
-          actualChecksum,
-          included: status !== 'missing',
-        });
-      }
-
-      return {
-        ok: true,
-        chunks: checks,
-        recordingQuality: requestedPreset,
-        recordingResolvedQuality: resolvedPreset,
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        error: toErrorMessage(error),
-      };
-    }
-  }
-
-  async function downloadRawChunks(sessionId: string) {
-    if (!sessionId) {
-      return { ok: false, error: 'Missing session id' };
-    }
-
-    try {
-      const manifestData = await readManifest(sessionId);
-
-      if (manifestData.recordingKind === 'webcodecs-opfs') {
-        try {
-          const streamFile = webCodecsOpfsStreamName(manifestData);
-          const data = await opfsBridge.readWebCodecsStream(sessionId, streamFile);
-          const baseName = buildRawExportBaseName(manifestData.exportBaseName, sessionId);
-          const items: RawDownloadItem[] = [];
-          const manifestBlob = new Blob([JSON.stringify(manifestData, null, 2)], {
-            type: 'application/json',
-          });
-          items.push({
-            url: URL.createObjectURL(manifestBlob),
-            filename: `${baseName}/manifest.json`,
-          });
-          const streamBlob = new Blob([data], {
-            type: manifestData.mimeType || 'video/mp4',
-          });
-          items.push({
-            url: URL.createObjectURL(streamBlob),
-            filename: `${baseName}/${streamFile}`,
-          });
-          scheduleRawExportUrlCleanup(items.map((item) => item.url));
-          return { ok: true, items };
-        } catch (error) {
-          return {
-            ok: false,
-            error: toErrorMessage(error),
-          };
-        }
-      }
-
-      const orderedChunks = [...manifestData.chunks].sort((a, b) => a.index - b.index);
-      if (!orderedChunks.length) {
-        return { ok: false, error: 'No chunks found for this session' };
-      }
-
-      const baseName = buildRawExportBaseName(manifestData.exportBaseName, sessionId);
-      const chunkExt = (manifestData.mimeType ?? '').includes('mp4') ? 'mp4' : 'webm';
-
-      const items: RawDownloadItem[] = [];
-      const manifestBlob = new Blob([JSON.stringify(manifestData, null, 2)], {
-        type: 'application/json',
-      });
-      items.push({
-        url: URL.createObjectURL(manifestBlob),
-        filename: `${baseName}/manifest.json`,
-      });
-
-      for (const chunk of orderedChunks) {
-        try {
-          const data = await readChunkData(sessionId, chunk.index);
-          const chunkBlob = new Blob([data], {
-            type: manifestData.mimeType || 'application/octet-stream',
-          });
-          items.push({
-            url: URL.createObjectURL(chunkBlob),
-            filename: `${baseName}/chunk-${chunk.index}.${chunkExt}`,
-          });
-        } catch {
-          // Skip missing chunks and continue exporting everything available.
-        }
-      }
-
-      if (!items.length) {
-        return { ok: false, error: 'No exportable files found for this session' };
-      }
-
-      scheduleRawExportUrlCleanup(items.map((item) => item.url));
-      return { ok: true, items };
-    } catch (error) {
-      return {
-        ok: false,
-        error: toErrorMessage(error),
-      };
-    }
-  }
-
   async function ensureFFmpeg() {
     if (!FFmpegCtor) {
       const module = await import('@ffmpeg/ffmpeg');
@@ -1433,24 +1214,6 @@ export default defineUnlistedScript(() => {
 
   function wait(ms: number) {
     return new Promise<void>((resolve) => setTimeout(resolve, ms));
-  }
-
-  function scheduleRawExportUrlCleanup(urls: string[]) {
-    for (const url of urls) {
-      rawExportUrls.add(url);
-    }
-
-    if (rawExportRevokeTimer) {
-      clearTimeout(rawExportRevokeTimer);
-    }
-
-    rawExportRevokeTimer = setTimeout(() => {
-      for (const url of rawExportUrls) {
-        URL.revokeObjectURL(url);
-      }
-      rawExportUrls.clear();
-      rawExportRevokeTimer = null;
-    }, 10 * 60 * 1000);
   }
 
   function webCodecsOpfsStreamName(manifest: SessionManifest): string {
