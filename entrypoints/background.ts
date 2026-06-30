@@ -21,6 +21,7 @@ import type {
   TestOrphanFixture,
 } from '@/lib/messages';
 import { OffscreenEventType, RuntimeMessageType } from '@/lib/messages';
+import { MessageRouter } from '@/lib/message-router';
 import { debugWarn } from '@/lib/runtime-log';
 import { OffscreenClient } from './background/services/offscreen-client';
 import {
@@ -112,188 +113,86 @@ export default defineBackground(() => {
     syncOrphanFixture: syncOrphanFixture,
   });
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (!message?.type) return;
+  const router = new MessageRouter();
 
-    if (typeof message.type === 'string' && message.type.startsWith('TEST_')) {
-      void handleTestControlPlaneMessage(message, buildSnapshot, () => outputFileName).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.GET_STATE) {
-      sendResponse(buildSnapshot());
-      return;
-    }
-
-    if (message.type === RuntimeMessageType.START) {
-      const requestedAudioSource = normalizeAudioSource(message.audioSource);
-      const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
-      const requestedQuality = normalizeCaptureQuality(message.quality);
-      void handleStart(requestedAudioSource, requestedMicDeviceId, requestedQuality).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.PREPARE_START) {
-      const includeMic = message.includeMic !== false;
-      const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
-      const requestedQuality = normalizeCaptureQuality(message.quality);
-      void handlePrepareStart(includeMic, requestedMicDeviceId, requestedQuality)
-        .then(sendResponse)
-        .catch((error) => {
-          errorMessage = toErrorMessage(error);
-          setState('preflight_error');
-          sendResponse({
-            ok: false,
-            error: errorMessage,
-            snapshot: buildSnapshot(),
-          });
-        });
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.RUN_MIC_CHECK) {
-      const requestedMicDeviceId = normalizeMicDeviceId(message.micDeviceId);
-      void handleRunMicCheck(requestedMicDeviceId).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.RELEASE_MIC_CHECK) {
-      void handleReleaseMicCheck().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.CANCEL_START) {
-      void handleCancelStart().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.STOP) {
-      void handleStop().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.DOWNLOAD) {
-      void handleDownload().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.RESET_TO_IDLE) {
-      void handleResetToIdle().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.DOWNLOAD_RAW_CHUNKS) {
-      void handleDownloadRawChunks(String(message.sessionId ?? '')).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.RECOVER_ORPHAN) {
+  router
+    .onMatch(
+      (type) => type.startsWith('TEST_'),
+      (message) => handleTestControlPlaneMessage(message, buildSnapshot, () => outputFileName),
+    )
+    .on(RuntimeMessageType.GET_STATE, () => buildSnapshot())
+    .on(RuntimeMessageType.START, (message) =>
+      handleStart(
+        normalizeAudioSource(message.audioSource),
+        normalizeMicDeviceId(message.micDeviceId),
+        normalizeCaptureQuality(message.quality),
+      ),
+    )
+    .on(RuntimeMessageType.PREPARE_START, (message) =>
+      handlePrepareStartRequest(
+        message.includeMic !== false,
+        normalizeMicDeviceId(message.micDeviceId),
+        normalizeCaptureQuality(message.quality),
+      ),
+    )
+    .on(RuntimeMessageType.RUN_MIC_CHECK, (message) =>
+      handleRunMicCheck(normalizeMicDeviceId(message.micDeviceId)),
+    )
+    .on(RuntimeMessageType.RELEASE_MIC_CHECK, () => handleReleaseMicCheck())
+    .on(RuntimeMessageType.CANCEL_START, () => handleCancelStart())
+    .on(RuntimeMessageType.STOP, () => handleStop())
+    .on(RuntimeMessageType.DOWNLOAD, () => handleDownload())
+    .on(RuntimeMessageType.RESET_TO_IDLE, () => handleResetToIdle())
+    .on(RuntimeMessageType.DOWNLOAD_RAW_CHUNKS, (message) =>
+      handleDownloadRawChunks(String(message.sessionId ?? '')),
+    )
+    .on(RuntimeMessageType.RECOVER_ORPHAN, (message) => {
       const chunkIndexes = Array.isArray(message.chunkIndexes)
         ? message.chunkIndexes
             .map((value: unknown) => Number(value))
             .filter((value: number) => Number.isInteger(value) && value >= 0)
         : undefined;
-      void handleRecoverOrphan(String(message.sessionId ?? ''), chunkIndexes).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.DISCARD_ORPHAN) {
-      void handleDiscardOrphan(String(message.sessionId ?? '')).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.REFRESH_ORPHANS) {
-      void handleRefreshOrphans().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.OPEN_MIC_SETTINGS) {
-      const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
-      const settingsUrl = `chrome://settings/content/siteDetails?site=${encodeURIComponent(extensionOrigin)}`;
-      void chrome.tabs.create({ url: settingsUrl }).then(() => {
-        sendResponse({ ok: true });
-      });
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.OFFSCREEN_EVENT) {
-      void handleOffscreenEvent(message as OffscreenEventMessage).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.MIC_MIX_FAILED) {
-      void handleMicMixFailed(message as MicMixFailedMessage).then(sendResponse);
-      return true;
-    }
-
-    if (
-      message.type === RuntimeMessageType.SYSTEM_AUDIO_OK ||
-      message.type === RuntimeMessageType.SYSTEM_AUDIO_SILENT ||
-      message.type === RuntimeMessageType.SYSTEM_AUDIO_ABSENT
-    ) {
-      void handleSystemAudioSignal(message as SystemAudioSignalMessage).then(sendResponse);
-      return true;
-    }
-
-    if (
-      message.type === RuntimeMessageType.LOW_STORAGE_WARNING ||
-      message.type === RuntimeMessageType.AUTO_STOP_LOW_STORAGE
-    ) {
-      void handleStorageSignal(message as StorageSignalMessage).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.WEBCODECS_FATAL_ERROR) {
-      void handleWebCodecsFatalError(message.error as string | undefined).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.OFFSCREEN_READY) {
+      return handleRecoverOrphan(String(message.sessionId ?? ''), chunkIndexes);
+    })
+    .on(RuntimeMessageType.DISCARD_ORPHAN, (message) =>
+      handleDiscardOrphan(String(message.sessionId ?? '')),
+    )
+    .on(RuntimeMessageType.REFRESH_ORPHANS, () => handleRefreshOrphans())
+    .on(RuntimeMessageType.OPEN_MIC_SETTINGS, () => handleOpenMicSettings())
+    .on(RuntimeMessageType.OFFSCREEN_EVENT, (message) =>
+      handleOffscreenEvent(message as OffscreenEventMessage),
+    )
+    .on(RuntimeMessageType.MIC_MIX_FAILED, (message) =>
+      handleMicMixFailed(message as MicMixFailedMessage),
+    )
+    .on(
+      [
+        RuntimeMessageType.SYSTEM_AUDIO_OK,
+        RuntimeMessageType.SYSTEM_AUDIO_SILENT,
+        RuntimeMessageType.SYSTEM_AUDIO_ABSENT,
+      ],
+      (message) => handleSystemAudioSignal(message as SystemAudioSignalMessage),
+    )
+    .on(
+      [RuntimeMessageType.LOW_STORAGE_WARNING, RuntimeMessageType.AUTO_STOP_LOW_STORAGE],
+      (message) => handleStorageSignal(message as StorageSignalMessage),
+    )
+    .on(RuntimeMessageType.WEBCODECS_FATAL_ERROR, (message) =>
+      handleWebCodecsFatalError(message.error as string | undefined),
+    )
+    .on(RuntimeMessageType.OFFSCREEN_READY, () => {
       offscreenClient.markReady();
-      sendResponse({ ok: true });
-      return;
-    }
+      return { ok: true };
+    })
+    .on(RuntimeMessageType.GET_ENCODER_SETTINGS, () => loadRecorderSettings())
+    .on(RuntimeMessageType.SET_ENCODER_SETTINGS, (message) =>
+      saveRecorderSettings(message.settings as Partial<RecorderSettings>),
+    )
+    .on(RuntimeMessageType.WEBCODECS_CHECK_SUPPORT, (message) =>
+      handleWebCodecsCheckSupport(message.quality as CaptureQuality | undefined),
+    );
 
-    if (message.type === RuntimeMessageType.GET_ENCODER_SETTINGS) {
-      void loadRecorderSettings().then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.SET_ENCODER_SETTINGS) {
-      void saveRecorderSettings(message.settings as Partial<RecorderSettings>).then(sendResponse);
-      return true;
-    }
-
-    if (message.type === RuntimeMessageType.WEBCODECS_CHECK_SUPPORT) {
-      void (async () => {
-        try {
-          await offscreenClient.ensureReadyWithRetry(delay);
-          const result = await offscreenClient.send<{
-            ok?: boolean;
-            videoSupported?: boolean;
-            audioSupported?: boolean;
-            hardwareAcceleration?: boolean;
-            fallbackReason?: string | null;
-            error?: string;
-          }>({
-            type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
-            quality: message.quality,
-          });
-          sendResponse(result ?? { ok: false, error: 'No response from offscreen' });
-        } catch (error) {
-          debugWarn('[Background] WebCodecs check failed:', error);
-          sendResponse({
-            ok: false,
-            error: toErrorMessage(error),
-            videoSupported: false,
-            audioSupported: false,
-            hardwareAcceleration: false,
-          });
-        }
-      })();
-      return true;
-    }
-  });
+  chrome.runtime.onMessage.addListener(router.dispatch);
 
   chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     void handleRecordingTabUpdated(tabId, changeInfo);
@@ -968,6 +867,58 @@ async function handlePrepareStart(
     errorMessage = toErrorMessage(error);
     setState('preflight_error');
     return { ok: false, error: errorMessage, snapshot: buildSnapshot() };
+  }
+}
+
+async function handlePrepareStartRequest(
+  includeMic = true,
+  micDeviceId: string | null = null,
+  quality: CaptureQuality = 'auto',
+) {
+  try {
+    return await handlePrepareStart(includeMic, micDeviceId, quality);
+  } catch (error) {
+    errorMessage = toErrorMessage(error);
+    setState('preflight_error');
+    return {
+      ok: false,
+      error: errorMessage,
+      snapshot: buildSnapshot(),
+    };
+  }
+}
+
+async function handleOpenMicSettings() {
+  const extensionOrigin = `chrome-extension://${chrome.runtime.id}`;
+  const settingsUrl = `chrome://settings/content/siteDetails?site=${encodeURIComponent(extensionOrigin)}`;
+  await chrome.tabs.create({ url: settingsUrl });
+  return { ok: true };
+}
+
+async function handleWebCodecsCheckSupport(quality: CaptureQuality | undefined) {
+  try {
+    await offscreenClient.ensureReadyWithRetry(delay);
+    const result = await offscreenClient.send<{
+      ok?: boolean;
+      videoSupported?: boolean;
+      audioSupported?: boolean;
+      hardwareAcceleration?: boolean;
+      fallbackReason?: string | null;
+      error?: string;
+    }>({
+      type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
+      quality,
+    });
+    return result ?? { ok: false, error: 'No response from offscreen' };
+  } catch (error) {
+    debugWarn('[Background] WebCodecs check failed:', error);
+    return {
+      ok: false,
+      error: toErrorMessage(error),
+      videoSupported: false,
+      audioSupported: false,
+      hardwareAcceleration: false,
+    };
   }
 }
 
