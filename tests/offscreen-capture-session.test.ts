@@ -96,6 +96,7 @@ function fakeOpfs() {
     writeChunk: vi.fn(async () => {}),
     writeManifest: vi.fn(async () => {}),
     writeWebCodecsRange: vi.fn(async () => {}),
+    readWebCodecsStream: vi.fn(async () => new ArrayBuffer(5000)),
   };
 }
 

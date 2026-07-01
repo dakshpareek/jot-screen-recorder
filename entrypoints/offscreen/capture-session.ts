@@ -41,7 +41,7 @@ const CHUNK_INTERVAL_MS = CHUNK_DURATION_SECONDS * 1000;
 const PREFLIGHT_MIC_HOLD_MS = 60_000;
 
 export interface CaptureSessionDeps {
-  opfs: Pick<OpfsBridge, 'writeChunk' | 'writeManifest' | 'writeWebCodecsRange'>;
+  opfs: Pick<OpfsBridge, 'writeChunk' | 'writeManifest' | 'writeWebCodecsRange' | 'readWebCodecsStream'>;
   getUserMedia(constraints: MediaStreamConstraints): Promise<MediaStream>;
   createAudioContext(): AudioContext;
   createMediaRecorder(stream: MediaStream, options: MediaRecorderOptions): MediaRecorder;
@@ -1163,7 +1163,7 @@ export class CaptureSession {
         opfsPersist: {
           writeRange: persistWrite,
           readComplete: () =>
-            Promise.reject(new Error('readComplete not used during active recording')),
+            this.deps.opfs.readWebCodecsStream(streamSessionId, opfsStreamFile),
         },
         onProgress: (stats) => {
           void this.emitEvent(OffscreenEventType.CHUNK_WRITTEN, {
