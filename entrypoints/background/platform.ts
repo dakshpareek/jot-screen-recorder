@@ -9,6 +9,8 @@ import { isTestControlPlaneEnabled } from './testing/gate';
 import type { RecordingSessionDeps } from './recording-session';
 
 const ACTIVE_TAB_CAPTURE_STATUSES = ['pending', 'active'] as const;
+const BLOCKED_TAB_CAPTURE_SCHEMES = new Set(['chrome:', 'chrome-extension:', 'devtools:', 'edge:', 'about:']);
+const BLOCKED_TAB_CAPTURE_HOSTS = new Set(['chromewebstore.google.com']);
 
 /**
  * Builds the Chrome / OS-backed implementation of the recording session's dependency
@@ -41,8 +43,9 @@ export function createPlatformDeps(offscreenClient: OffscreenClient): RecordingS
     isTestControlPlaneEnabled,
     getTestActiveTabFixture: () => getTestActiveTabFixture() as Promise<chrome.tabs.Tab | null>,
     queryActiveTab: async () => {
-      const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      return activeTab;
+      const activeTabs = await chrome.tabs.query({ active: true });
+      const capturableActiveTab = activeTabs.find((tab) => isCapturableTab(tab));
+      return capturableActiveTab ?? activeTabs[0];
     },
     activateTab: async (tabId) => {
       await chrome.tabs.update(tabId, { active: true });
@@ -51,6 +54,22 @@ export function createPlatformDeps(offscreenClient: OffscreenClient): RecordingS
     getCapturedTabInfo: (tabId) => getCapturedTabInfo(tabId),
     download: (options) => chrome.downloads.download(options),
   };
+}
+
+function isCapturableTab(tab: chrome.tabs.Tab): boolean {
+  if (typeof tab.url !== 'string' || !tab.url.trim()) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(tab.url);
+    if (BLOCKED_TAB_CAPTURE_SCHEMES.has(parsed.protocol)) {
+      return false;
+    }
+    return !BLOCKED_TAB_CAPTURE_HOSTS.has(parsed.hostname);
+  } catch {
+    return true;
+  }
 }
 
 function updateBadge(next: RecordingState) {

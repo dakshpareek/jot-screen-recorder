@@ -411,6 +411,43 @@ describe('background start fallback', () => {
     );
   });
 
+  it('prefers a capturable webpage over the popup tab when resolving the start target', async () => {
+    tabsQueryMock.mockResolvedValue([
+      { id: 101, url: 'chrome-extension://hknbhnckdfacgcdnmefhcagnhebjpbcc/popup.html' },
+      { id: 202, url: 'https://example.com/' },
+    ]);
+
+    await bootBackground();
+    offscreenSendMock.mockClear();
+
+    offscreenSendMock.mockImplementation(async (message: { type?: string }) => {
+      if (message.type === RuntimeMessageType.OFFSCREEN_START_WEBCODECS) {
+        return { ok: true, requestedPreset: 'auto', resolvedPreset: '1080p30' };
+      }
+      return { ok: true };
+    });
+
+    const prep = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.PREPARE_START,
+      includeMic: false,
+      quality: 'auto',
+    })) as { ok?: boolean };
+    expect(prep?.ok).toBe(true);
+
+    const start = (await dispatchRuntimeMessage({
+      type: RuntimeMessageType.START,
+      audioSource: 'tab',
+      quality: 'auto',
+    })) as { ok?: boolean; snapshot?: { state?: string } };
+
+    expect(start?.ok).toBe(true);
+    expect(start?.snapshot?.state).toBe('recording');
+    expect(tabCaptureGetMediaStreamIdMock).toHaveBeenCalledWith(
+      { targetTabId: 202 },
+      expect.any(Function),
+    );
+  });
+
   it('opens extension-specific microphone site settings', async () => {
     (globalThis as { chrome?: { runtime?: { id?: string } } }).chrome!.runtime!.id = 'test-extension-id';
 

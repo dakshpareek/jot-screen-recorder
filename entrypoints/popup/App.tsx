@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { RuntimeMessageType, type CaptureQuality, type EncoderBackend } from '@/lib/messages';
 import type { RecordingSnapshot, RecordingState } from '@/lib/recording';
-import { debugWarn } from '@/lib/runtime-log';
 import { MicToggleCard } from './components/MicToggleCard';
+import { useEncoderSettings } from './hooks/useEncoderSettings';
 import { useRecorderCommands } from './hooks/useRecorderCommands';
 import { useRecorderSnapshot } from './hooks/useRecorderSnapshot';
+import { useWebCodecsSupport } from './hooks/useWebCodecsSupport';
 import {
   ArmedScreen,
   DoneScreen,
@@ -71,11 +72,10 @@ export default function App() {
   const [processingStartedAtMs, setProcessingStartedAtMs] = useState<number | null>(null);
   const initializedRecoverySessionRef = useRef<string | null>(null);
 
-  const [encoderBackend, setEncoderBackend] = useState<EncoderBackend>('webcodecs');
-  const [webCodecsSupport, setWebCodecsSupport] = useState<{
-    supported: boolean;
-    hardwareAccelerated: boolean;
-  } | null>(null);
+  const { encoderBackend, setEncoderBackend } = useEncoderSettings();
+  const webCodecsSupport = useWebCodecsSupport(() => {
+    void setEncoderBackend('mediarecorder');
+  });
 
   useEffect(() => {
     if (snapshot.state !== 'recovery') {
@@ -107,55 +107,6 @@ export default function App() {
     }
     setProcessingStartedAtMs(null);
   }, [snapshot.state]);
-
-  // Load encoder settings + WebCodecs support on mount.
-  useEffect(() => {
-    async function loadEncoderSettings() {
-      try {
-        const settings = await chrome.runtime.sendMessage({
-          type: RuntimeMessageType.GET_ENCODER_SETTINGS,
-        });
-        if (settings?.encoderBackend === 'webcodecs' || settings?.encoderBackend === 'mediarecorder') {
-          setEncoderBackend(settings.encoderBackend);
-        }
-      } catch {
-        // Ignore errors loading settings
-      }
-    }
-    
-    async function checkSupport() {
-      try {
-        const result = await chrome.runtime.sendMessage({
-          type: RuntimeMessageType.WEBCODECS_CHECK_SUPPORT,
-          quality: 'auto',
-        });
-        if (result) {
-          const supported = result.videoSupported === true && result.audioSupported === true;
-          setWebCodecsSupport({
-            supported,
-            hardwareAccelerated: result.hardwareAcceleration === true,
-          });
-          if (!supported) {
-            setEncoderBackend('mediarecorder');
-            void chrome.runtime.sendMessage({
-              type: RuntimeMessageType.SET_ENCODER_SETTINGS,
-              settings: { encoderBackend: 'mediarecorder' },
-            }).catch(() => {});
-          }
-        } else {
-          setWebCodecsSupport({ supported: false, hardwareAccelerated: false });
-          setEncoderBackend('mediarecorder');
-        }
-      } catch (error) {
-        debugWarn('[Popup] WebCodecs check error:', error);
-        setWebCodecsSupport({ supported: false, hardwareAccelerated: false });
-        setEncoderBackend('mediarecorder');
-      }
-    }
-
-    void loadEncoderSettings();
-    void checkSupport();
-  }, []);
 
   async function handleStart(
     nextIncludeMicInput?: boolean | unknown,

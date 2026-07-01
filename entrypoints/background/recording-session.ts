@@ -424,15 +424,14 @@ export class RecordingSession {
         ? await this.deps.getTestActiveTabFixture()
         : null;
       const useTestCaptureStream = testCaptureFixture?.id === targetTabId;
-      if (this.deps.isTestControlPlaneEnabled()) {
-        if (useTestCaptureStream) {
-          try {
-            await this.deps.activateTab(targetTabId);
-          } catch {
-            // Best-effort: the active-tab capture grant is only needed for test flows.
-          }
-        }
+
+      try {
+        await this.deps.activateTab(targetTabId);
+      } catch {
+        // Best-effort: tabCapture works without focus in some contexts, but
+        // foregrounding the target tab avoids popup-window focus stealing.
       }
+
       const staleCaptureRecovery = await this.releaseStaleTabCapture(targetTabId);
       if (!staleCaptureRecovery.ok) {
         this.errorMessage = formatCodedStartError(
